@@ -4,6 +4,7 @@ import { logger } from './utils/logger.js';
 import * as workspace from './services/workspace.js';
 import * as quantCmd from './commands/quant.js';
 import * as statusCmd from './commands/status.js';
+import * as infoCmd from './commands/info.js';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.commands = new Collection();
@@ -28,6 +29,7 @@ async function main() {
   await workspace.init();
   client.commands.set(quantCmd.data.name, quantCmd);
   client.commands.set(statusCmd.data.name, statusCmd);
+  client.commands.set(infoCmd.data.name, infoCmd);
   await client.login(config.discord.token);
 }
 
