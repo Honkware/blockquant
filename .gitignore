@@ -1,3 +1,14 @@
 node_modules/
 .env
+tmp/
+logs/
+data/*.json
 *.log
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+unsloth_compiled_cache/
+*.zip
+scripts/windows/
