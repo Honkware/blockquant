@@ -1,0 +1,35 @@
+{
+  "name": "blockquant",
+  "version": "2.0.0",
+  "description": "Discord bot for ExLlamaV3 (EXL3) model quantization with queue management and HuggingFace integration",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "cross-env NODE_ENV=production node src/index.js",
+    "dev": "cross-env NODE_ENV=development node src/index.js",
+    "preflight": "node scripts/run-python.mjs scripts/preflight.py",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.7",
+    "p-queue": "^8.0.1",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.23.0",
+    "cross-env": "^7.0.3",
+    "eslint": "^9.23.0",
+    "globals": "^16.0.0",
+    "prettier": "^3.5.3",
+    "vitest": "^3.0.9"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
