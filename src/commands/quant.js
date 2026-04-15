@@ -39,7 +39,7 @@ export async function handleQuant(interaction) {
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
-  const profile = interaction.options.getString('profile') ?? 'balanced';
+  const profile = interaction.options.getString('profile') ?? 'auto';
   const headBitsOverride = interaction.options.getInteger('head_bits');
   const category = interaction.options.getString('category') ?? 'General';
   const userId = interaction.user.id;
@@ -66,10 +66,13 @@ export async function handleQuant(interaction) {
   };
 
   // ── Parse & validate BPW list ─────────────────────────────────────────────
-  const bpws = bpwInput
-    .split(',')
-    .map((s) => parseFloat(s.trim()))
-    .filter((n) => !isNaN(n));
+  const bpws = [...new Set(
+    bpwInput
+      .split(',')
+      .map((s) => s.trim())
+      .map((s) => parseFloat(s))
+      .filter((n) => !isNaN(n))
+  )].sort((a, b) => a - b);
   if (bpws.length === 0) {
     return interaction.editReply({
       embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
