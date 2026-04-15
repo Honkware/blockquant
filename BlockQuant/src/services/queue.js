@@ -84,6 +84,7 @@ export function resume() {
  * @property {string}   userId
  * @property {string}   [jobId]
  * @property {string}   [profile]
+ * @property {number}   [cost]
  * @property {Object}   [quantOptions]
  * @property {Object}   [precheckedRepos]
  * @property {(data: object) => void} onProgress
@@ -221,14 +222,27 @@ export function enqueue(jobConfig) {
         const bpw = jobConfig.bpws[i];
         const baseOffset = 0.15 + i * bpwWeight;
         const repoSuffix = exl3RepoName(modelName, bpw);
+
+        // Calculate effective per-BPW options before repo inspection so both
+        // the idempotency check and the manifest reflect the real quant settings.
+        const baseQuantOptions = jobConfig.quantOptions ?? {};
+        let bpwQuantOptions;
+        if (baseQuantOptions.isAuto) {
+          const autoParams = config.calculateAutoParams(bpw);
+          bpwQuantOptions = { ...baseQuantOptions, ...autoParams };
+        } else {
+          const headBits = baseQuantOptions.headBits ?? 6;
+          bpwQuantOptions = { ...baseQuantOptions, headBits };
+        }
+
         const prechecked = jobConfig.precheckedRepos?.[String(bpw)];
         const repoState =
           prechecked ??
           (await hf.inspectUploadRepo(repoSuffix, {
             sourceModel: modelId,
-            profile: jobConfig.profile ?? 'balanced',
+            profile: jobConfig.profile ?? 'auto',
             bpw,
-            quantOptions: jobConfig.quantOptions ?? {},
+            quantOptions: bpwQuantOptions,
           }));
 
         if (repoState.exists && repoState.settingsMatch) {
@@ -269,37 +283,20 @@ export function enqueue(jobConfig) {
 
         // Quantize
         const startTime = Date.now();
-        
-        // Calculate auto parameters for this BPW
-        const baseQuantOptions = jobConfig.quantOptions ?? {};
-        
-        let bpwQuantOptions;
+
         if (baseQuantOptions.isAuto) {
-          // Auto mode: calculate all parameters based on BPW
-          const autoParams = config.calculateAutoParams(bpw);
-          bpwQuantOptions = {
-            ...baseQuantOptions,
-            ...autoParams,
-          };
-          log.info(`Auto params for ${bpw} BPW:`, autoParams);
+          log.info(`Auto params for ${bpw} BPW:`, bpwQuantOptions);
           reportProgress({
             stage: 'Quantizing',
             progress: 0,
             overall: Math.round(baseOffset * 100),
-            message: `Auto: head_bits=${autoParams.headBits}, cal=${autoParams.calRows}x${autoParams.calCols}`,
+            message: `Auto: head_bits=${bpwQuantOptions.headBits}, cal=${bpwQuantOptions.calRows}x${bpwQuantOptions.calCols}`,
             currentBPW: bpw,
             bpwIndex: i,
             totalBPWs: jobConfig.bpws.length,
           });
-        } else {
-          // Fixed profile: use specified head_bits
-          const headBits = baseQuantOptions.headBits ?? 6;
-          bpwQuantOptions = {
-            ...baseQuantOptions,
-            headBits,
-          };
         }
-        
+
         const outputDir = await quantizer.quantize(
           bpw,
           modelName,
@@ -372,8 +369,8 @@ export function enqueue(jobConfig) {
           version: 1,
           generatedAt: new Date().toISOString(),
           sourceModel: modelId,
-          profile: jobConfig.profile ?? 'balanced',
-          quantOptions: jobConfig.quantOptions ?? {},
+          profile: jobConfig.profile ?? 'auto',
+          quantOptions: bpwQuantOptions,
           bpw,
           hfRepo: repoSuffix,
           hfRevision: null,

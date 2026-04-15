@@ -258,44 +258,14 @@ def detect_gguf_source(files, repo_id=None, token=None):
             )
         }
     
-    # Unknown GGUF files - inspect header to determine type
+    # Unknown GGUF files - skip header download since GGUF is unsupported regardless
     if unknown_files:
-        # Sort by file size (largest first - assume it's the main model)
-        unknown_files.sort(key=lambda x: len(x), reverse=True)
-        
-        # Try to detect from header if we have repo access
-        if repo_id and token:
-            for candidate in unknown_files[:3]:  # Check top 3 largest files
-                try:
-                    precision, can_convert, reason = detect_gguf_precision_from_file(
-                        repo_id, candidate, token
-                    )
-                    if precision == 'quantized':
-                        return {
-                            'isGguf': True,
-                            'ggufFile': candidate,
-                            'ggufPrecision': 'quantized',
-                            'canConvert': False,
-                            'rejectReason': reason
-                        }
-                    elif precision in ('bf16', 'fp16', 'q8_0'):
-                        return {
-                            'isGguf': True,
-                            'ggufFile': candidate,
-                            'ggufPrecision': precision,
-                            'canConvert': True,
-                            'rejectReason': None
-                        }
-                except Exception:
-                    continue
-        
-        # Fallback: return first unknown file with warning
         return {
             'isGguf': True,
             'ggufFile': unknown_files[0],
             'ggufPrecision': 'unknown',
-            'canConvert': True,
-            'rejectReason': None
+            'canConvert': False,
+            'rejectReason': 'GGUF files are not supported. Use a standard HuggingFace model repo with safetensors/bin weights.'
         }
     
     # Shouldn't reach here, but fallback

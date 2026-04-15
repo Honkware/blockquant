@@ -59,6 +59,14 @@ async function writeCacheIndex(index) {
   await writeFile(CACHE_INDEX_FILE, JSON.stringify(index, null, 2));
 }
 
+let cacheIndexQueue = Promise.resolve();
+
+/** Serialize cache-index read-modify-write operations to prevent races. */
+function enqueueCacheWrite(fn) {
+  cacheIndexQueue = cacheIndexQueue.catch(() => {}).then(fn);
+  return cacheIndexQueue;
+}
+
 async function dirSizeBytes(dirPath) {
   let total = 0;
   let entries = [];
@@ -169,15 +177,17 @@ export async function restoreCachedModel(modelId, hooks = {}) {
   await rm(DIRS.model, { recursive: true, force: true });
   await mkdir(DIRS.model, { recursive: true });
   await cp(src, DIRS.model, { recursive: true, force: true });
-  const index = await readCacheIndex();
-  index[modelId] = {
-    ...(index[modelId] ?? {}),
-    modelId,
-    path: src,
-    lastUsedAt: Date.now(),
-    sizeBytes: await dirSizeBytes(src),
-  };
-  await writeCacheIndex(index);
+  await enqueueCacheWrite(async () => {
+    const index = await readCacheIndex();
+    index[modelId] = {
+      ...(index[modelId] ?? {}),
+      modelId,
+      path: src,
+      lastUsedAt: Date.now(),
+      sizeBytes: index[modelId]?.sizeBytes ?? await dirSizeBytes(src),
+    };
+    await writeCacheIndex(index);
+  });
   log.info(`Cache hit: restored ${modelId}`);
   return true;
 }
@@ -189,18 +199,31 @@ export async function cacheCurrentModel(modelId) {
   await rm(target, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
   await cp(DIRS.model, target, { recursive: true, force: true });
-  const sizeBytes = await dirSizeBytes(target);
-  const index = await readCacheIndex();
-  index[modelId] = {
-    modelId,
-    path: target,
-    cachedAt: Date.now(),
-    lastUsedAt: Date.now(),
-    sizeBytes,
-  };
-  await writeCacheIndex(index);
+  await enqueueCacheWrite(async () => {
+    const index = await readCacheIndex();
+    index[modelId] = {
+      modelId,
+      path: target,
+      cachedAt: Date.now(),
+      lastUsedAt: Date.now(),
+      sizeBytes: index[modelId]?.sizeBytes ?? 0,
+    };
+    await writeCacheIndex(index);
+  });
   await pruneCache('post-cache');
   log.info(`Cached model: ${modelId}`);
+  // Compute accurate size asynchronously to avoid blocking the pipeline
+  dirSizeBytes(target)
+    .then((sizeBytes) =>
+      enqueueCacheWrite(async () => {
+        const idx = await readCacheIndex();
+        if (idx[modelId]) {
+          idx[modelId] = { ...idx[modelId], sizeBytes };
+          await writeCacheIndex(idx);
+        }
+      })
+    )
+    .catch((err) => log.debug(`Failed to update cache size for ${modelId}: ${err.message}`));
 }
 
 export async function getCacheStats() {

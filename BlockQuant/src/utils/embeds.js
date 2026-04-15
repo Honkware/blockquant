@@ -91,6 +91,30 @@ export function jobComplete({ url, userId, results }) {
     return `${icon}  **${r.bpw} bpw** — ${r.duration} — ${link}`;
   });
 
+  const FIELD_LIMIT = 1024;
+  const resultFields = [];
+  let chunk = [];
+  let chunkLen = 0;
+  for (const line of lines) {
+    const sep = chunkLen === 0 ? 0 : 1;
+    if (chunkLen + sep + line.length > FIELD_LIMIT && chunk.length > 0) {
+      resultFields.push({
+        name: resultFields.length === 0 ? 'Results' : '\u200b',
+        value: chunk.join('\n'),
+        inline: false,
+      });
+      chunk = [];
+      chunkLen = 0;
+    }
+    chunk.push(line);
+    chunkLen += (chunkLen === 0 ? 0 : 1) + line.length;
+  }
+  resultFields.push({
+    name: resultFields.length === 0 ? 'Results' : '\u200b',
+    value: chunk.join('\n') || 'No results',
+    inline: false,
+  });
+
   return new EmbedBuilder()
     .setTitle('✅ Quantization Complete')
     .setColor(COLORS.success)
@@ -102,7 +126,7 @@ export function jobComplete({ url, userId, results }) {
         value: `Successful: **${pushed}/${sorted.length}**${reused ? ` • Reused: **${reused}**` : ''}`,
         inline: false,
       },
-      { name: 'Results', value: lines.join('\n') || 'No results', inline: false }
+      ...resultFields
     )
     .setTimestamp();
 }
