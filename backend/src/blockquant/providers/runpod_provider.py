@@ -862,7 +862,11 @@ class RunPodProvider(Provider):
     }
 
     def _lookup_live_price(self) -> float | None:
-        """Live-fetch the price for self.gpu_type. Cached per instance."""
+        """Live-fetch the price for self.gpu_type. Cached per instance.
+
+        Picks the price tier matching ``self.cloud_type`` so the CLI's
+        ``--tune`` mode reports honest numbers when SECURE is selected.
+        """
         if self._gpu_price_cache is not None:
             return self._gpu_price_cache.get(self.gpu_type)
         rp = _ensure_runpod()
@@ -871,8 +875,10 @@ class RunPodProvider(Provider):
             # Only get_gpu(id) returns pricing; get_gpus() is list-view only.
             g = rp.get_gpu(self.gpu_type)
             if g:
-                # Prefer community on-demand; fall back to secure, then lowest.
-                price = g.get("communityPrice") or g.get("securePrice")
+                if self.cloud_type == "SECURE":
+                    price = g.get("securePrice") or g.get("communityPrice")
+                else:
+                    price = g.get("communityPrice") or g.get("securePrice")
                 if not price:
                     lp = g.get("lowestPrice")
                     if isinstance(lp, dict):

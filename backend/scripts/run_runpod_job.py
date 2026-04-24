@@ -74,7 +74,58 @@ def main():
     )
     parser.add_argument("--keep-pod", action="store_true", help="Don't terminate pod after completion")
     parser.add_argument("--poll-interval", type=int, default=15, help="Progress poll interval in seconds")
+    # Speedup tuning surface
+    parser.add_argument(
+        "--profile",
+        choices=["fast", "balanced", "quality"],
+        default="balanced",
+        help=(
+            "Speedup preset. Sets cloud + cal_rows + GPU preference. "
+            "Per-knob flags below override the preset."
+        ),
+    )
+    parser.add_argument(
+        "--cal-rows", type=int, default=None,
+        help="Override calibration rows (preset: fast=128 / balanced=250 / quality=512).",
+    )
+    parser.add_argument(
+        "--cal-cols", type=int, default=None,
+        help="Override calibration sequence length (default 2048).",
+    )
+    parser.add_argument(
+        "--network-volume-id", default="",
+        help="Mount a RunPod network volume for the work_dir (~5-10%% I/O speedup).",
+    )
+    parser.add_argument(
+        "--data-center-id", default="",
+        help="Pin the pod to a data center (required when --network-volume-id is set).",
+    )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Print resolved config + cost estimate and exit. Does not launch a pod.",
+    )
     args = parser.parse_args()
+
+    # ---- Resolve --profile + per-knob overrides -------------------------
+    # Only apply preset's cloud/GPU when the user didn't pass theirs.
+    cli_passed_cloud = "--cloud" in sys.argv
+    cli_passed_gpu = "--gpu" in sys.argv
+    cli_passed_fallback = "--gpu-fallback" in sys.argv
+
+    profile_cfg = RunPodProvider.resolve_profile(
+        args.profile,
+        cal_rows=args.cal_rows,
+        cal_cols=args.cal_cols,
+    )
+    cal_rows = profile_cfg["cal_rows"]
+    cal_cols = profile_cfg["cal_cols"]
+    if not cli_passed_cloud:
+        args.cloud = profile_cfg["cloud_type"]
+    if not cli_passed_gpu and not cli_passed_fallback:
+        # Promote the profile's GPU list into --gpu + --gpu-fallback.
+        prefs = profile_cfg["gpu_preference"]
+        args.gpu = prefs[0]
+        args.gpu_fallback = ",".join(prefs[1:])
 
     if not args.hf_token:
         print("ERROR: HF_TOKEN required (set env var or pass --hf-token)")
@@ -82,6 +133,47 @@ def main():
     if not args.runpod_api_key:
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
+
+    # ---- --tune: read-only diagnostic ---------------------------------
+    if args.tune:
+        # Look up live pricing for the preferred GPU so the cost band is honest.
+        try:
+            tune_provider = RunPodProvider(
+                api_key=args.runpod_api_key,
+                gpu_type=args.gpu,
+                cloud_type=args.cloud,
+            )
+            rate = tune_provider.get_cost_per_hour()
+        except Exception as e:
+            rate = 0.0
+            print(f"(could not look up live price: {e})")
+        # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
+        # NVL with cal_rows=250 — use that as the baseline.
+        baseline_h = 3.7
+        wt_factor = RunPodProvider.PROFILES[args.profile]["_walltime_factor"]
+        # If user picked SXM, knock another ~10% off; SECURE adds ~5% more
+        # consistency (fewer slowdowns) so net wash with COMMUNITY+SXM.
+        gpu_speedup = 0.9 if "HBM3" in args.gpu else 1.0
+        eta_low_h = baseline_h * wt_factor * gpu_speedup * 0.85
+        eta_high_h = baseline_h * wt_factor * gpu_speedup * 1.10
+        cost_low = eta_low_h * rate
+        cost_high = eta_high_h * rate
+
+        print()
+        print(f"  PROFILE: {args.profile}  ({RunPodProvider.PROFILES[args.profile]['_summary']})")
+        print(f"  GPU:     {args.gpu}   ${rate:.2f}/hr ({args.cloud.lower()})")
+        print(f"  CAL:     {cal_rows} rows × {cal_cols} cols")
+        if args.network_volume_id:
+            print(f"  VOL:     {args.network_volume_id} (DC: {args.data_center_id or 'unset!'})")
+        else:
+            print(f"  VOL:     none (use --network-volume-id <id> for ~5-10% I/O speedup)")
+        print(f"  IMAGE:   {args.image or '(default RunPod pytorch base — bootstraps in-pod)'}")
+        print(f"  ETA:     ~{eta_low_h:.1f}h - ~{eta_high_h:.1f}h walltime  "
+              f"(cost band: ${cost_low:.0f} - ${cost_high:.0f})")
+        print()
+        print(f"  LAUNCH:  re-run without --tune to start")
+        print()
+        return
 
     # Header line consumed by log_dashboard.py's parser.
     print(
@@ -107,6 +199,8 @@ def main():
             cloud_type=args.cloud,
             install_flash_attn=args.install_flash_attn,
             image=args.image,
+            network_volume_id=args.network_volume_id,
+            data_center_id=args.data_center_id,
         )
         rate = attempt.get_cost_per_hour()
         print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {args.cloud})...", flush=True)
@@ -160,6 +254,8 @@ def main():
             hf_token=args.hf_token,
             hf_org=args.hf_org,
             head_bits=args.head_bits,
+            cal_rows=cal_rows,
+            cal_cols=cal_cols,
         )
         if launch_result.get("status") != "started":
             print(f"ERROR: run_pipeline failed: {launch_result}")

@@ -449,6 +449,48 @@ def test_get_cost_per_hour_static_fallback_on_error(mock_ensure, mock_ssh_key):
     assert provider.get_cost_per_hour() == 1.99
 
 
+# ---------------------------------------------------------------------------
+# resolve_profile — preset + override merging
+# ---------------------------------------------------------------------------
+
+def test_resolve_profile_known_presets_have_required_keys():
+    for name in ("fast", "balanced", "quality"):
+        cfg = RunPodProvider.resolve_profile(name)
+        assert "cloud_type" in cfg
+        assert "gpu_preference" in cfg and isinstance(cfg["gpu_preference"], list)
+        assert "cal_rows" in cfg and isinstance(cfg["cal_rows"], int)
+        assert "cal_cols" in cfg and isinstance(cfg["cal_cols"], int)
+
+
+def test_resolve_profile_unknown_raises():
+    with pytest.raises(KeyError, match="Unknown profile"):
+        RunPodProvider.resolve_profile("ludicrous")
+
+
+def test_resolve_profile_explicit_override_wins():
+    cfg = RunPodProvider.resolve_profile("fast", cal_rows=512)
+    assert cfg["cal_rows"] == 512  # override
+    assert cfg["cal_cols"] == 2048  # preset
+
+
+def test_resolve_profile_none_override_keeps_preset():
+    cfg = RunPodProvider.resolve_profile("balanced", cal_rows=None, cal_cols=None)
+    assert cfg["cal_rows"] == 250
+    assert cfg["cal_cols"] == 2048
+
+
+def test_resolve_profile_quality_uses_secure_cloud():
+    cfg = RunPodProvider.resolve_profile("quality")
+    assert cfg["cloud_type"] == "SECURE"
+    assert cfg["cal_rows"] >= 250  # always meets-or-exceeds balanced
+
+
+def test_resolve_profile_internal_keys_excluded():
+    """Profile metadata keys (_walltime_factor etc) shouldn't leak."""
+    cfg = RunPodProvider.resolve_profile("balanced")
+    assert all(not k.startswith("_") for k in cfg)
+
+
 @patch("blockquant.providers.runpod_provider._ensure_runpod")
 def test_get_cost_per_hour_unknown_gpu(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
