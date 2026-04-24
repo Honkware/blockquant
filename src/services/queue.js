@@ -9,7 +9,7 @@ import * as hf from './huggingface.js';
 import * as quantizer from './quantizer.js';
 import { formatDuration } from '../utils/format.js';
 import { AppError } from '../errors/taxonomy.js';
-import { exl3RepoName, formatExl3Revision, exl3TreeUrl } from '../utils/hfExl3.js';
+import { exl3RepoName, exl3TreeUrl } from '../utils/hfExl3.js';
 
 const log = getLogger('queue');
 
@@ -220,8 +220,7 @@ export function enqueue(jobConfig) {
 
         const bpw = jobConfig.bpws[i];
         const baseOffset = 0.15 + i * bpwWeight;
-        const repoSuffix = exl3RepoName(modelName);
-        const revision = formatExl3Revision(bpw);
+        const repoSuffix = exl3RepoName(modelName, bpw);
         const prechecked = jobConfig.precheckedRepos?.[String(bpw)];
         const repoState =
           prechecked ??
@@ -230,12 +229,11 @@ export function enqueue(jobConfig) {
             profile: jobConfig.profile ?? 'balanced',
             bpw,
             quantOptions: jobConfig.quantOptions ?? {},
-            revision,
           }));
 
         if (repoState.exists && repoState.settingsMatch) {
           const repoBaseUrl = repoState.url || `https://huggingface.co/${repoState.repoId}`;
-          const existingUrl = exl3TreeUrl(repoBaseUrl, revision) ?? repoBaseUrl;
+          const existingUrl = exl3TreeUrl(repoBaseUrl) ?? repoBaseUrl;
           reportProgress({
             stage: 'Reusing',
             progress: 100,
@@ -250,7 +248,6 @@ export function enqueue(jobConfig) {
             duration: '0s (reused)',
             url: repoState.url || `https://huggingface.co/${repoState.repoId}`,
             treeUrl: existingUrl,
-            revision,
             pushed: true,
             reused: true,
             error: null,
@@ -265,7 +262,7 @@ export function enqueue(jobConfig) {
         ) {
           throw new AppError(
             'HF_UPLOAD_FAILED',
-            `Upload target ${repoState.repoId}@${revision} already has a manifest with different settings (${repoState.reason ?? 'manifest mismatch'}).`
+            `Upload target ${repoState.repoId} already has a manifest with different settings (${repoState.reason ?? 'manifest mismatch'}).`
           );
         }
 
@@ -296,7 +293,6 @@ export function enqueue(jobConfig) {
           sourceModel: modelId,
           bpw,
           repoSuffix,
-          revision,
         });
 
         // Upload
@@ -318,8 +314,7 @@ export function enqueue(jobConfig) {
                 bpwIndex: i,
                 totalBPWs: jobConfig.bpws.length,
               });
-            },
-            { revision }
+            }
           );
         } catch (err) {
           log.error(`Upload failed for ${bpw} bpw`, { error: err.message });
@@ -328,14 +323,13 @@ export function enqueue(jobConfig) {
 
         const treeUrl =
           uploadResult?.tree_url ??
-          exl3TreeUrl(uploadResult?.url ?? null, revision);
+          exl3TreeUrl(uploadResult?.url ?? null);
 
         results.push({
           bpw,
           duration,
           url: uploadResult?.url ?? null,
           treeUrl,
-          revision,
           pushed: !!uploadResult?.url,
           error: uploadResult?.error ?? null,
         });
@@ -348,7 +342,6 @@ export function enqueue(jobConfig) {
           quantOptions: jobConfig.quantOptions ?? {},
           bpw,
           hfRepo: repoSuffix,
-          hfRevision: revision,
           duration,
           upload: {
             pushed: !!uploadResult?.url,

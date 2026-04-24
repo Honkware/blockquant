@@ -8,7 +8,7 @@ import * as quantizer from '../services/quantizer.js';
 import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
-import { exl3RepoName, formatExl3Revision } from '../utils/hfExl3.js';
+import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 
 const log = getLogger('cmd:quant');
@@ -176,19 +176,17 @@ export async function handleQuant(interaction) {
 
   // ── Pre-check upload targets for idempotency (EXL3 local only) ────────────
   const modelName = modelId.split('/').pop();
-  const repoName = exl3RepoName(modelName);
   let precheckedRepos = {};
   let alreadyUploaded = [];
   if (format === 'exl3') {
     try {
       for (const bpw of bpws) {
-        const revision = formatExl3Revision(bpw);
+        const repoName = exl3RepoName(modelName, bpw);
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           profile,
           bpw,
           quantOptions,
-          revision,
         });
         precheckedRepos[String(bpw)] = state;
         if (
@@ -200,7 +198,7 @@ export async function handleQuant(interaction) {
             embeds: [
               embeds.error(
                 'Existing Repo Conflict',
-                `\`${state.repoId}\` (branch \`${revision}\`) already has a manifest with different quant settings (${state.reason ?? 'manifest mismatch'}).`
+                `\`${state.repoId}\` already has a manifest with different quant settings (${state.reason ?? 'manifest mismatch'}).`
               ),
             ],
           });
@@ -430,7 +428,6 @@ export async function handleQuant(interaction) {
         duration: `${(apiResult?.total_wall_time ?? 0).toFixed(1)}s`,
         url: o.hf_url,
         treeUrl: o.hf_url,
-        revision: o.hf_revision || (format === 'exl3' ? formatExl3Revision(parseFloat(o.variant)) : o.variant),
         pushed: !!o.hf_url,
         reused: false,
         error: null,

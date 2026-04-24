@@ -18,11 +18,14 @@ export async function isApiAvailable() {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const resp = await fetch(`${API_URL}/health`, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    return data.status === 'ok';
+    try {
+      const resp = await fetch(`${API_URL}/health`, { signal: controller.signal });
+      if (!resp.ok) return false;
+      const data = await resp.json();
+      return data.status === 'ok';
+    } finally {
+      clearTimeout(timeout);
+    }
   } catch {
     return false;
   }

@@ -68,15 +68,29 @@ export function jobComplete({ url, userId, results }) {
     return `${icon}  **${r.bpw} bpw** — ${r.duration} — ${link}`;
   });
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle('✅ Quantization Complete')
     .setColor(COLORS.success)
     .setDescription(`Requested by <@${userId}>`)
-    .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
-      { name: 'Results', value: lines.join('\n') || 'No results', inline: false }
-    )
-    .setTimestamp();
+    .addFields({ name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false });
+
+  // Chunk result lines into fields of ≤1024 characters each
+  const FIELD_LIMIT = 1024;
+  let chunk = '';
+  let fieldIndex = 0;
+  for (const line of lines) {
+    const candidate = chunk ? `${chunk}\n${line}` : line;
+    if (candidate.length > FIELD_LIMIT) {
+      embed.addFields({ name: fieldIndex === 0 ? 'Results' : '\u200b', value: chunk || '\u200b', inline: false });
+      chunk = line;
+      fieldIndex++;
+    } else {
+      chunk = candidate;
+    }
+  }
+  embed.addFields({ name: fieldIndex === 0 ? 'Results' : '\u200b', value: chunk || 'No results', inline: false });
+
+  return embed.setTimestamp();
 }
 
 export function jobFailed({ url, userId, error }) {

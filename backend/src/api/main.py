@@ -9,7 +9,7 @@ proxy that handles auth.
 """
 import os
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from blockquant.models import QuantConfig, JobStatusResponse
 
 import api.dashboard as dashboard
@@ -28,15 +28,15 @@ app.include_router(dashboard.router)
 class QuantRequest(BaseModel):
     model_id: str
     format: str = "exl3"
-    variants: list[str] = ["4.0"]
+    variants: list[str] = Field(default_factory=lambda: ["4.0"])
     # Supported: "local" | "runpod". Modal + Lambda are shelved under
     # experimental/ until re-validated.
     provider: str = "local"
     hf_org: str = ""
     workspace: str | None = None
     parallel_mode: bool = False
-    high_quality_bpws: list[str] = []
-    head_bits_8_bpws: list[str] = []
+    high_quality_bpws: list[str] = Field(default_factory=list)
+    head_bits_8_bpws: list[str] = Field(default_factory=list)
     verify_quality: bool = True
     # RunPod settings
     runpod_api_key: str = ""

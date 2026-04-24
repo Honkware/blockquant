@@ -352,7 +352,7 @@ export async function uploadModel(folderPath, repoName, onProgress, options = {}
     try {
       const result = JSON.parse(lines[i]);
       if (result.url) {
-        const treeUrl = result.tree_url ?? exl3TreeUrl(result.url, revision);
+        const treeUrl = result.tree_url ?? exl3TreeUrl(result.url);
         log.info(`Upload success: ${result.url}`);
         return { ...result, tree_url: treeUrl };
       }

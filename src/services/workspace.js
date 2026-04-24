@@ -59,6 +59,14 @@ async function writeCacheIndex(index) {
   await writeFile(CACHE_INDEX_FILE, JSON.stringify(index, null, 2));
 }
 
+let cacheIndexQueue = Promise.resolve();
+
+/** Serialize cache-index read-modify-write to prevent concurrent corruption. */
+function enqueueCacheIndexOp(fn) {
+  cacheIndexQueue = cacheIndexQueue.catch(() => {}).then(fn);
+  return cacheIndexQueue;
+}
+
 async function dirSizeBytes(dirPath) {
   let total = 0;
   let entries = [];
@@ -153,15 +161,18 @@ export async function restoreCachedModel(modelId, hooks = {}) {
   await rm(DIRS.model, { recursive: true, force: true });
   await mkdir(DIRS.model, { recursive: true });
   await cp(src, DIRS.model, { recursive: true, force: true });
-  const index = await readCacheIndex();
-  index[modelId] = {
-    ...(index[modelId] ?? {}),
-    modelId,
-    path: src,
-    lastUsedAt: Date.now(),
-    sizeBytes: await dirSizeBytes(src),
-  };
-  await writeCacheIndex(index);
+  const sizeBytes = await dirSizeBytes(src);
+  await enqueueCacheIndexOp(async () => {
+    const index = await readCacheIndex();
+    index[modelId] = {
+      ...(index[modelId] ?? {}),
+      modelId,
+      path: src,
+      lastUsedAt: Date.now(),
+      sizeBytes,
+    };
+    await writeCacheIndex(index);
+  });
   log.info(`Cache hit: restored ${modelId}`);
   return true;
 }
@@ -174,15 +185,17 @@ export async function cacheCurrentModel(modelId) {
   await mkdir(target, { recursive: true });
   await cp(DIRS.model, target, { recursive: true, force: true });
   const sizeBytes = await dirSizeBytes(target);
-  const index = await readCacheIndex();
-  index[modelId] = {
-    modelId,
-    path: target,
-    cachedAt: Date.now(),
-    lastUsedAt: Date.now(),
-    sizeBytes,
-  };
-  await writeCacheIndex(index);
+  await enqueueCacheIndexOp(async () => {
+    const index = await readCacheIndex();
+    index[modelId] = {
+      modelId,
+      path: target,
+      cachedAt: Date.now(),
+      lastUsedAt: Date.now(),
+      sizeBytes,
+    };
+    await writeCacheIndex(index);
+  });
   await pruneCache('post-cache');
   log.info(`Cached model: ${modelId}`);
 }
@@ -201,50 +214,52 @@ export async function getCacheStats() {
 export async function clearCache() {
   await rm(DIRS.cache, { recursive: true, force: true });
   await mkdir(DIRS.cache, { recursive: true });
-  await writeCacheIndex({});
+  await enqueueCacheIndexOp(() => writeCacheIndex({}));
 }
 
 export async function pruneCache(reason = 'manual') {
   if (!config.MODEL_CACHE_ENABLED) return { removed: 0, reason };
-  const index = await readCacheIndex();
-  const models = Object.values(index).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
-  const now = Date.now();
-  const ttlMs = config.MODEL_CACHE_TTL_HOURS <= 0 ? 0 : config.MODEL_CACHE_TTL_HOURS * 3600 * 1000;
-  const keep = {};
-  const removed = [];
-  let totalBytes = 0;
+  return enqueueCacheIndexOp(async () => {
+    const index = await readCacheIndex();
+    const models = Object.values(index).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+    const now = Date.now();
+    const ttlMs = config.MODEL_CACHE_TTL_HOURS <= 0 ? 0 : config.MODEL_CACHE_TTL_HOURS * 3600 * 1000;
+    const keep = {};
+    const removed = [];
+    let totalBytes = 0;
 
-  for (const model of models) {
-    const expired = ttlMs > 0 && now - (model.lastUsedAt ?? model.cachedAt ?? 0) > ttlMs;
-    if (expired) {
-      removed.push(model.modelId);
-      await rm(model.path, { recursive: true, force: true }).catch(() => {});
-      continue;
+    for (const model of models) {
+      const expired = ttlMs > 0 && now - (model.lastUsedAt ?? model.cachedAt ?? 0) > ttlMs;
+      if (expired) {
+        removed.push(model.modelId);
+        await rm(model.path, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      keep[model.modelId] = model;
+      totalBytes += model.sizeBytes ?? 0;
     }
-    keep[model.modelId] = model;
-    totalBytes += model.sizeBytes ?? 0;
-  }
 
-  let ordered = Object.values(keep).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
-  while (
-    ordered.length > config.MODEL_CACHE_MAX_ENTRIES ||
-    totalBytes > config.MODEL_CACHE_MAX_BYTES
-  ) {
-    const victim = ordered.shift();
-    if (!victim) break;
-    removed.push(victim.modelId);
-    totalBytes -= victim.sizeBytes ?? 0;
-    delete keep[victim.modelId];
-    await rm(victim.path, { recursive: true, force: true }).catch(() => {});
-  }
+    let ordered = Object.values(keep).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+    while (
+      ordered.length > config.MODEL_CACHE_MAX_ENTRIES ||
+      totalBytes > config.MODEL_CACHE_MAX_BYTES
+    ) {
+      const victim = ordered.shift();
+      if (!victim) break;
+      removed.push(victim.modelId);
+      totalBytes -= victim.sizeBytes ?? 0;
+      delete keep[victim.modelId];
+      await rm(victim.path, { recursive: true, force: true }).catch(() => {});
+    }
 
-  await writeCacheIndex(keep);
-  if (removed.length > 0) {
-    log.info(
-      `Pruned ${removed.length} cache entr${removed.length === 1 ? 'y' : 'ies'} (${reason})`
-    );
-  }
-  return { removed: removed.length, reason };
+    await writeCacheIndex(keep);
+    if (removed.length > 0) {
+      log.info(
+        `Pruned ${removed.length} cache entr${removed.length === 1 ? 'y' : 'ies'} (${reason})`
+      );
+    }
+    return { removed: removed.length, reason };
+  });
 }
 
 export { DIRS };
