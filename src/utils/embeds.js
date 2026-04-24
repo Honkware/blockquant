@@ -79,10 +79,12 @@ export function jobComplete({ url, userId, results }) {
   let chunk = '';
   let fieldIndex = 0;
   for (const line of lines) {
-    const candidate = chunk ? `${chunk}\n${line}` : line;
+    // Truncate a single line that exceeds the limit on its own
+    const safeLine = line.length > FIELD_LIMIT ? truncate(line, FIELD_LIMIT) : line;
+    const candidate = chunk ? `${chunk}\n${safeLine}` : safeLine;
     if (candidate.length > FIELD_LIMIT) {
       embed.addFields({ name: fieldIndex === 0 ? 'Results' : '\u200b', value: chunk || '\u200b', inline: false });
-      chunk = line;
+      chunk = safeLine;
       fieldIndex++;
     } else {
       chunk = candidate;
