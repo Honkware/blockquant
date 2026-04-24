@@ -20,13 +20,12 @@ export const commands = [
     .addStringOption((opt) =>
       opt
         .setName('profile')
-        .setDescription('Quantization profile (default: Auto - scales head_bits with BPW)')
+        .setDescription('Quantization profile')
         .setRequired(false)
         .addChoices(
-          { name: '🤖 Auto (recommended)', value: 'auto' },
-          { name: '⚡ Fast', value: 'fast' },
-          { name: '⚖️ Balanced', value: 'balanced' },
-          { name: '✨ Quality', value: 'quality' }
+          { name: 'Fast', value: 'fast' },
+          { name: 'Balanced', value: 'balanced' },
+          { name: 'Quality', value: 'quality' }
         )
     )
     .addIntegerOption((opt) =>
@@ -36,6 +35,16 @@ export const commands = [
         .setRequired(false)
         .setMinValue(2)
         .setMaxValue(16)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('format')
+        .setDescription('Quantization format (default: exl3)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'EXL3 (ExLlamaV3)', value: 'exl3' },
+          { name: 'GGUF (llama.cpp)', value: 'gguf' }
+        )
     )
     .addStringOption((opt) =>
       opt
@@ -50,6 +59,16 @@ export const commands = [
           { name: '🎭 Roleplay', value: 'Roleplay' },
           { name: '📊 General Purpose', value: 'General' }
         )
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('provider')
+        .setDescription('GPU provider (default: local RTX 4090)')
+        .setRequired(false)
+        .addChoices(
+          { name: '🏠 Local (RTX 4090)', value: 'local' },
+          { name: '🚀 RunPod (H100/A100)', value: 'runpod' },
+        )
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),
@@ -62,7 +81,23 @@ export const commands = [
       opt.setName('user').setDescription('User to check (defaults to you)').setRequired(false)
     ),
 
-  new SlashCommandBuilder().setName('leaderboard').setDescription('Show the top EXP earners'),
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('Show leaderboards')
+    .addStringOption((opt) =>
+      opt
+        .setName('type')
+        .setDescription('Which leaderboard')
+        .setRequired(false)
+        .addChoices(
+          { name: 'EXP Earners', value: 'exp' },
+          { name: 'Quantized Models', value: 'models' }
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName('history')
+    .setDescription('Show recent quantization jobs'),
 
   new SlashCommandBuilder()
     .setName('give')

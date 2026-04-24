@@ -10,7 +10,7 @@ let writeQueue = Promise.resolve();
 
 /** Serialize writes so concurrent saves don't corrupt files. */
 function enqueue(fn) {
-  writeQueue = writeQueue.catch(() => {}).then(fn);
+  writeQueue = writeQueue.then(fn).catch(fn);
   return writeQueue;
 }
 

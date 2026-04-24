@@ -1,0 +1,40 @@
+# BlockQuant backend — Python deps.
+#
+# Lower bounds only ("X>=Y") so users can pin tighter in their own projects.
+# The provider layer + remote quant scripts pick up the user's torch + CUDA;
+# this file does NOT pin a specific torch wheel because that's a per-machine
+# decision (cu118 vs cu121 vs cu124 vs ROCm).
+
+# Core service
+fastapi>=0.100
+uvicorn>=0.23
+celery>=5.3
+redis>=5.0
+pydantic>=2.0
+python-dotenv>=1.0
+
+# HuggingFace
+huggingface-hub>=0.21.0
+transformers>=4.40
+tokenizers>=0.20
+safetensors>=0.4
+datasets>=2.0
+
+# Quant runtime + image deps (used by the local provider + the EXL3 stack)
+torch>=2.0
+numpy>=1.24
+Pillow>=10.0
+marisa-trie>=1.2.0
+
+# RunPod provider
+runpod>=1.9
+paramiko>=3.0
+
+# CLI / logging niceties
+rich>=13.0
+tenacity>=8.0
+requests>=2.31
+
+# Tests
+pytest>=8.0
+pytest-asyncio>=0.23

@@ -9,7 +9,7 @@ import * as hf from './huggingface.js';
 import * as quantizer from './quantizer.js';
 import { formatDuration } from '../utils/format.js';
 import { AppError } from '../errors/taxonomy.js';
-import { exl3RepoName, exl3TreeUrl } from '../utils/hfExl3.js';
+import { exl3RepoName, formatExl3Revision, exl3TreeUrl } from '../utils/hfExl3.js';
 
 const log = getLogger('queue');
 
@@ -84,7 +84,6 @@ export function resume() {
  * @property {string}   userId
  * @property {string}   [jobId]
  * @property {string}   [profile]
- * @property {number}   [cost]
  * @property {Object}   [quantOptions]
  * @property {Object}   [precheckedRepos]
  * @property {(data: object) => void} onProgress
@@ -105,7 +104,6 @@ export function enqueue(jobConfig) {
 
   const promise = queue.add(async () => {
     const results = [];
-    let preserveOutputForRetry = false;
     const modelId = hf.parseModelId(jobConfig.url);
     const modelName = path.basename(modelId.split('/').pop());
     const jobId = jobConfig.jobId ?? null;
@@ -182,7 +180,8 @@ export function enqueue(jobConfig) {
             stage: 'Cached',
             progress: 10,
             overall: 4,
-            message: 'Copying cached model into workspace (slow on WSL + NTFS — not frozen)...',
+            message:
+              'Copying cached model into workspace (slow on WSL + NTFS — not frozen)...',
           });
         },
       });
@@ -207,7 +206,7 @@ export function enqueue(jobConfig) {
         });
       }
 
-      // ── 3. Validate & Cache ─────────────────────────────────────
+      // ── 3. Validate ──────────────────────────────────────────────
       await workspace.validateModelDir();
       if (!restored) {
         await workspace.cacheCurrentModel(modelId);
@@ -221,33 +220,22 @@ export function enqueue(jobConfig) {
 
         const bpw = jobConfig.bpws[i];
         const baseOffset = 0.15 + i * bpwWeight;
-        const repoSuffix = exl3RepoName(modelName, bpw);
-
-        // Calculate effective per-BPW options before repo inspection so both
-        // the idempotency check and the manifest reflect the real quant settings.
-        const baseQuantOptions = jobConfig.quantOptions ?? {};
-        let bpwQuantOptions;
-        if (baseQuantOptions.isAuto) {
-          const autoParams = config.calculateAutoParams(bpw);
-          bpwQuantOptions = { ...baseQuantOptions, ...autoParams };
-        } else {
-          const headBits = baseQuantOptions.headBits ?? 6;
-          bpwQuantOptions = { ...baseQuantOptions, headBits };
-        }
-
+        const repoSuffix = exl3RepoName(modelName);
+        const revision = formatExl3Revision(bpw);
         const prechecked = jobConfig.precheckedRepos?.[String(bpw)];
         const repoState =
           prechecked ??
           (await hf.inspectUploadRepo(repoSuffix, {
             sourceModel: modelId,
-            profile: jobConfig.profile ?? 'auto',
+            profile: jobConfig.profile ?? 'balanced',
             bpw,
-            quantOptions: bpwQuantOptions,
+            quantOptions: jobConfig.quantOptions ?? {},
+            revision,
           }));
 
         if (repoState.exists && repoState.settingsMatch) {
           const repoBaseUrl = repoState.url || `https://huggingface.co/${repoState.repoId}`;
-          const existingUrl = exl3TreeUrl(repoBaseUrl) ?? repoBaseUrl;
+          const existingUrl = exl3TreeUrl(repoBaseUrl, revision) ?? repoBaseUrl;
           reportProgress({
             stage: 'Reusing',
             progress: 100,
@@ -262,7 +250,7 @@ export function enqueue(jobConfig) {
             duration: '0s (reused)',
             url: repoState.url || `https://huggingface.co/${repoState.repoId}`,
             treeUrl: existingUrl,
-            revision: null,
+            revision,
             pushed: true,
             reused: true,
             error: null,
@@ -277,26 +265,12 @@ export function enqueue(jobConfig) {
         ) {
           throw new AppError(
             'HF_UPLOAD_FAILED',
-            `Upload target ${repoState.repoId} already has a manifest with different settings (${repoState.reason ?? 'manifest mismatch'}).`
+            `Upload target ${repoState.repoId}@${revision} already has a manifest with different settings (${repoState.reason ?? 'manifest mismatch'}).`
           );
         }
 
         // Quantize
         const startTime = Date.now();
-
-        if (baseQuantOptions.isAuto) {
-          log.info(`Auto params for ${bpw} BPW:`, bpwQuantOptions);
-          reportProgress({
-            stage: 'Quantizing',
-            progress: 0,
-            overall: Math.round(baseOffset * 100),
-            message: `Auto: head_bits=${bpwQuantOptions.headBits}, cal=${bpwQuantOptions.calRows}x${bpwQuantOptions.calCols}`,
-            currentBPW: bpw,
-            bpwIndex: i,
-            totalBPWs: jobConfig.bpws.length,
-          });
-        }
-
         const outputDir = await quantizer.quantize(
           bpw,
           modelName,
@@ -313,7 +287,7 @@ export function enqueue(jobConfig) {
             });
           },
           controller.signal,
-          bpwQuantOptions
+          jobConfig.quantOptions
         );
 
         const duration = formatDuration(Date.now() - startTime);
@@ -322,6 +296,7 @@ export function enqueue(jobConfig) {
           sourceModel: modelId,
           bpw,
           repoSuffix,
+          revision,
         });
 
         // Upload
@@ -344,7 +319,7 @@ export function enqueue(jobConfig) {
                 totalBPWs: jobConfig.bpws.length,
               });
             },
-            {}
+            { revision }
           );
         } catch (err) {
           log.error(`Upload failed for ${bpw} bpw`, { error: err.message });
@@ -353,14 +328,14 @@ export function enqueue(jobConfig) {
 
         const treeUrl =
           uploadResult?.tree_url ??
-          exl3TreeUrl(uploadResult?.url ?? null);
+          exl3TreeUrl(uploadResult?.url ?? null, revision);
 
         results.push({
           bpw,
           duration,
           url: uploadResult?.url ?? null,
           treeUrl,
-          revision: null,
+          revision,
           pushed: !!uploadResult?.url,
           error: uploadResult?.error ?? null,
         });
@@ -369,11 +344,11 @@ export function enqueue(jobConfig) {
           version: 1,
           generatedAt: new Date().toISOString(),
           sourceModel: modelId,
-          profile: jobConfig.profile ?? 'auto',
-          quantOptions: bpwQuantOptions,
+          profile: jobConfig.profile ?? 'balanced',
+          quantOptions: jobConfig.quantOptions ?? {},
           bpw,
           hfRepo: repoSuffix,
-          hfRevision: null,
+          hfRevision: revision,
           duration,
           upload: {
             pushed: !!uploadResult?.url,
@@ -411,10 +386,6 @@ export function enqueue(jobConfig) {
       jobConfig.onComplete(results);
     } catch (err) {
       log.error('Job failed', { error: err.message, stack: err.stack });
-      if (err instanceof AppError && err.code === 'HF_UPLOAD_FAILED') {
-        preserveOutputForRetry = true;
-        log.warn('Keeping quantized output for upload retry after HF upload failure');
-      }
       if (jobId) {
         await db.patchJob(jobId, (job) => ({
           ...job,
@@ -436,7 +407,7 @@ export function enqueue(jobConfig) {
       jobConfig.onError(err);
     } finally {
       if (jobId) activeJobs.delete(jobId);
-      await workspace.cleanup({ keepOutput: preserveOutputForRetry });
+      await workspace.cleanup();
       setTimeout(() => {
         const waiting = queue?.size ?? 0;
         const active = queue?.pending ?? 0;

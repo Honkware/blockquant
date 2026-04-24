@@ -1,230 +1,192 @@
-# BlockQuant v2.0
+# BlockQuant
 
-Discord bot for quantizing HuggingFace models to **EXL3** format using [ExLlamaV3](https://github.com/turboderp-org/exllamav3), with automatic upload to HuggingFace Hub.
-This branch runs in **HF-model-only** mode (GGUF conversion is not in the active pipeline).
+Quantize HuggingFace LLMs to **EXL3** (and GGUF) on your own GPU or in the
+cloud, and publish them to HuggingFace — from a Discord slash command or a
+plain CLI.
 
-## Features
+BlockQuant wraps [ExLlamaV3](https://github.com/turboderp-org/exllamav3) with
+a FastAPI + Celery backend, a Discord front-end, a pluggable provider layer,
+and a live browser dashboard that renders the model's mixture-of-experts as
+it quantizes in real time.
 
-- `/quant` — Submit a model for quantization with selectable BPW (bits-per-weight)
-- Live progress updates in a dedicated Discord thread
-- Pre-flight validation (HF token, model existence, write access) before any work starts
-- Automatic HuggingFace repo creation & upload
-- EXP system — users earn EXP by chatting, spend it on quantization jobs
-- Admin commands for queue management and EXP grants
-- Persistent jobs with restart recovery and idempotent EXP charge/refund ledger
-- Local model cache reuse with prune controls
-- Graceful shutdown with workspace cleanup
-- Winston-based structured logging
+---
 
-## Prerequisites
+## What's in the box
 
-- **Node.js** ≥ 20
-- **Python** ≥ 3.10 with CUDA-capable PyTorch
-- **ExLlamaV3** cloned separately and installed:
-  ```bash
-  git clone https://github.com/turboderp-org/exllamav3.git
-  cd exllamav3
-  python3 -m pip install --user -r requirements.txt
-  python3 -m pip install --user -e .
-  cd ..
-  ```
-- **Hugging Face helper script dependencies**:
-  ```bash
-  python3 -m pip install --user -r scripts/requirements.txt
-  ```
+| Layer | What it does |
+|---|---|
+| **Discord bot** (`src/`) | `/quant` command, live progress thread, EXP charging, queue + history |
+| **FastAPI + Celery** (`backend/src/api/`, `backend/src/blockquant/`) | Job orchestration, pipeline stages, progress reporting |
+| **Providers** (`backend/src/blockquant/providers/`) | `local` (your RTX 4090) and `runpod` (H100 / A100 cloud). Lambda + Modal are shelved — see `experimental/README.md` |
+| **CLI** (`backend/scripts/run_runpod_job.py`) | One-shot RunPod job without the Discord bot |
+| **Live dashboard** (`backend/scripts/log_dashboard.py`) | Browser UI that tails the quant log and visualises the 48×256 expert matrix being compressed |
 
-## Setup
+## Supported paths (actually validated)
 
-```bash
-# 1. Clone and install Node deps
-git clone <this-repo>
-cd BlockQuant
-npm install
+- **Local** — runs on your own NVIDIA GPU via ExLlamaV3's `convert.py`.
+- **RunPod** — provisions a pod, bootstraps the stack, quantizes, uploads to HF, tears down. Tested end-to-end on H100 NVL with a 35B MoE.
 
-# 2. Configure environment
-cp .env.example .env
-# Edit .env with your Discord bot token, HF token, etc.
-# Set EXLLAMAV3_DIR to your external exllamav3 clone path.
+**Shelved** (not shipped as supported): Modal, Lambda. See
+[`experimental/README.md`](experimental/README.md) for the un-shelving
+checklist.
 
-# 3. Install Python deps (required)
-python3 -m pip install --user -r scripts/requirements.txt
+---
 
-# 4. Run
-npm start        # production
-npm run dev      # development (debug logging)
-```
+## Quickstart — local GPU
 
-## Tooling
+Prereqs: Node 20+, Python 3.10+, NVIDIA GPU with recent CUDA, an
+[ExLlamaV3 clone](https://github.com/turboderp-org/exllamav3), Redis.
 
 ```bash
-npm run lint         # lint JavaScript
-npm run format:check # check formatting
-npm run test         # run unit tests
-npm run preflight    # run Python preflight script
+git clone https://github.com/Honkware/blockquant.git
+cd blockquant
+
+# Vendored upstream — kept out of this repo
+git clone https://github.com/turboderp-org/exllamav3.git
+
+# Python backend
+cd backend && python -m venv venv && ./venv/bin/pip install -r requirements.txt
+
+# Node bot
+cd .. && npm install
+
+# Config
+cp .env.example .env && $EDITOR .env
+# Minimum: BOT_TOKEN, CLIENT_ID, GUILD_ID, HF_TOKEN, EXLLAMAV3_DIR
+
+# Run (in three terminals)
+./backend/venv/bin/redis-server
+./backend/venv/bin/python -m celery -A scheduler.tasks worker --loglevel=info -P solo
+./backend/venv/bin/python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+node src/index.js
 ```
 
-## Reliability and Security
+Then in Discord: `/quant url:meta-llama/Llama-3.1-8B-Instruct bpw:4.5 provider:local`.
 
-- **Persistent jobs:** queue state checkpoints are stored in `data/jobs.json`.
-- **Startup recovery:** queued/running/interrupted jobs are recovered on boot.
-- **Cache reuse:** downloaded source models are cached under `tmp/workdir/cache`.
-- **Retries/timeouts:** HF and quantization subprocesses are governed by `.env` timeout/retry settings.
-- **Secret hygiene:** logs and user-facing errors are redacted for token-like values.
+## Quickstart — RunPod cloud
 
-## Project Structure
+Prereqs: above, plus a [RunPod](https://runpod.io) account and an SSH key
+pair at `~/.ssh/id_rsa{,.pub}` (the public key is injected into every pod
+via `env[PUBLIC_KEY]` — no need to pre-register it).
+
+```bash
+# Add to .env
+RUNPOD_API_KEY=...  # from runpod.io console
+
+# CLI — bypass the Discord bot entirely
+./backend/venv/bin/python backend/scripts/run_runpod_job.py \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --variants 4.5 \
+  --gpu "NVIDIA H100 80GB HBM3" \
+  --gpu-fallback "NVIDIA H100 NVL,NVIDIA H100 PCIe,NVIDIA A100-SXM4-80GB" \
+  --hf-org ""  # blank = upload to your personal HF account
+
+# Optional live dashboard
+./backend/venv/bin/python backend/scripts/log_dashboard.py \
+  --port 8088 \
+  --log backend/logs/runpod-qwen35b-4.5.log
+# → open http://localhost:8088
+```
+
+On first `create_pod` failure (out of stock), the CLI walks through the
+`--gpu-fallback` list automatically. Bootstrap and a 35B-class quant land at
+~4h on H100 NVL for ~$10 community-cloud.
+
+## Live dashboard
+
+`log_dashboard.py` is a single-file FastAPI app. It tails the quant log, runs
+a small **LogParser** that emits typed events from regex rules, derives
+stats (tensor rate, seconds per layer, runtime, spend) anchored on log
+timestamps + file mtime so they survive a refresh, and streams the state to
+the browser via Server-Sent Events.
+
+The centerpiece of the UI is a live visualisation of the 48-layer × 256-expert
+grid for the model being quantized — cells settle from cream (pending) →
+vermillion (measuring) → sage (quantized) in real time.
+
+---
+
+## Slash commands
+
+| Command | Description | Access |
+|---|---|---|
+| `/quant` | Submit a quant job (local or RunPod) | All |
+| `/queue` | Check queue status | All |
+| `/health` | Bot health + Celery status | All |
+| `/score` | Check EXP balance | All |
+| `/leaderboard` | Top EXP earners / quantized models | All |
+| `/history` | Recent jobs | All |
+| `/give` | Grant EXP | Admin |
+| `/pause` \| `/resume` | Control the job queue | Admin |
+| `/cache` | Local model cache ops | Admin |
+| `/diag` | Detailed diagnostics | Admin |
+
+## Pipeline stages
+
+1. **Download** — HF snapshot pulled to workspace
+2. **Convert** — GGUF only (EXL3 uses HF directly)
+3. **Quantize** — ExLlamaV3 `convert.py`, streaming progress
+4. **Verify** — load-test each variant
+5. **Quality** *(optional, EXL3 only)* — KL-div + PPL vs FP16 baseline via `exllamav3/eval/model_diff.py`
+6. **Report** — model-card README with measured quality
+7. **Upload** — one repo per bpw: `{org}/{model}-exl3-{bpw}bpw`
+
+Cloud providers run stages 1–5 remotely; the dashboard reads their tailed
+log. Local provider runs stages in-process.
+
+## Project layout
 
 ```
 BlockQuant/
-├── src/
-│   ├── index.js              # Entry point — bot bootstrap
-│   ├── config.js             # Validated env config
-│   ├── logger.js             # Winston logger
-│   ├── commands/
-│   │   ├── definitions.js    # SlashCommandBuilder definitions
-│   │   ├── router.js         # Command → handler dispatch
-│   │   ├── quant.js          # /quant handler
-│   │   ├── info.js           # /score, /leaderboard, /queue
-│   │   └── admin.js          # /give, /pause, /resume
-│   ├── services/
-│   │   ├── db.js             # JSON file persistence
-│   │   ├── workspace.js      # Filesystem workspace management
-│   │   ├── huggingface.js    # HF download/upload/preflight
-│   │   ├── quantizer.js      # ExLlamaV3 convert.py runner
-│   │   └── queue.js          # PQueue job orchestration
-│   └── utils/
-│       ├── embeds.js         # Discord embed builders
-│       └── format.js         # Progress bars, duration formatting
-├── scripts/
-│   ├── preflight.py          # HF token & model validation
-│   ├── download_model.py     # Model downloader
-│   ├── upload_model.py       # Model uploader
-│   ├── generate_quant_readme.py # HF model card writer
-│   ├── check_repo.py         # Post-upload verification
-│   └── requirements.txt      # Python deps
-├── tests/
-│   └── format.test.js
-├── data/                     # Auto-created JSON databases
-├── logs/                     # Auto-created log files
-├── .env.example
-├── .gitignore
-└── package.json
+├── src/                       Discord bot (Node.js)
+├── backend/
+│   ├── src/
+│   │   ├── api/main.py        FastAPI: /api/v1/quant, /health
+│   │   └── blockquant/
+│   │       ├── pipeline.py    6-stage orchestrator
+│   │       ├── models.py      QuantConfig + friends
+│   │       ├── providers/     local, runpod, base ABC
+│   │       └── stages/        download/convert/quantize/verify/quality/report/upload
+│   ├── scripts/
+│   │   ├── run_runpod_job.py  CLI
+│   │   ├── log_dashboard.py   Browser dashboard
+│   │   ├── rename_hf_repo_on_complete.py  Post-upload HF repo rename
+│   │   ├── cleanup_pods.py / list_pods.py / list_gpus.py   Ops utilities
+│   │   └── requirements.txt
+│   └── tests/providers/       27 mock-based tests for RunPod
+├── experimental/              Shelved providers (Modal, Lambda) — not supported
+├── docs/internal/             Planning / cost / migration notes (not user-facing)
+└── .env.example
 ```
 
-## Slash Commands
+## Contributing
 
-| Command        | Description               | Access |
-| -------------- | ------------------------- | ------ |
-| `/quant`       | Submit a quantization job | All    |
-| `/queue`       | Check queue status        | All    |
-| `/health`      | Check bot health summary  | All    |
-| `/score`       | Check EXP balance         | All    |
-| `/leaderboard` | Top 10 EXP earners        | All    |
-| `/give`        | Grant/deduct EXP          | Admin  |
-| `/pause`       | Pause the job queue       | Admin  |
-| `/resume`      | Resume the job queue      | Admin  |
-| `/diag`        | Detailed diagnostics      | Admin  |
-| `/cache`       | Cache status/prune/clear  | Admin  |
+New provider? Subclass `backend/src/blockquant/providers/base.Provider`.
+The ABC defines three required methods (`launch`, `terminate`, `run`) plus
+seven optional hooks with safe defaults — so you only implement what your
+backend actually needs. Look at `runpod_provider.py` for the reference
+shape (SSH + SFTP + retry-on-transient-network-error throughout).
 
-## How Quantization Works
+All new providers must have a matching test file under
+`backend/tests/providers/` modelled on `test_runpod_provider.py`.
 
-1. **Pre-flight** — Validates HF token has write access and the source model exists
-2. **Download** — `snapshot_download()` pulls the model to a temp workspace
-3. **Validate** — Checks for `config.json` and weight files
-4. **Quantize** — Runs ExLlamaV3 `convert.py` (single-step EXL3 conversion, profile-aware)
-5. **Upload** — `upload_folder()` pushes the quantized model to HuggingFace
-6. **Manifest** — `blockquant-manifest.json` is written into output artifacts
-7. **Cleanup** — Active workspace is wiped after each job (cache retained)
+## Security
 
-Each BPW in a job follows steps 4-5 sequentially. If any step fails, EXP is refunded and the user is notified.
+The FastAPI server has **no authentication** by design — it binds to
+`127.0.0.1` and is reached only by the local Discord bot or CLI. If you
+expose port 8000 publicly, anyone reaching it can submit quant jobs
+against your RunPod credits. Put a reverse proxy with auth in front if
+you need a public surface.
 
-## Differences from v1 (ExLlamaV2)
+The RunPod provider uses paramiko's `AutoAddPolicy` for SSH host keys.
+This is intentional — each pod is ephemeral and gets a fresh key, so
+strict checking would require throwing the integrity check away anyway.
+The pod's identity is verified through the RunPod API (the `pod_id` we
+asked for) and traffic is encrypted over SSH.
 
-- **Single-step conversion** — No separate measurement pass; ExLlamaV3 computes Hessians on-the-fly
-- **EXL3 format** — Based on QTIP, significantly better quality/size ratio
-- **Simpler CLI** — `-i input -o output -w workdir -b bpw` is all you need
-- **Pre-flight checks** — Token and model validation before any GPU work
-- **Modular architecture** — Commands, services, and utilities are cleanly separated
+Report security issues privately to the maintainer rather than via a
+public issue.
 
-## Quantization Guide
+## License
 
-### Understanding BPW (Bits Per Weight)
-
-BPW determines the compression level and quality of your quantized model:
-
-| BPW | Quality | Use Case | Relative Size |
-|-----|---------|----------|---------------|
-| 3.0–3.5 | ⚠️ Low | VRAM-constrained only | ~40% of FP16 |
-| **4.0–4.5** | ✅ Good | **Sweet spot** — most popular | ~50% of FP16 |
-| **5.0–5.5** | ✅ Great | High quality | ~60% of FP16 |
-| 6.0–6.5 | ⭐ Excellent | Near-lossless | ~70% of FP16 |
-| 8.0 | ⭐ Premium | Minimal loss | ~90% of FP16 |
-
-### Auto Mode (Recommended)
-
-BlockQuant uses **Auto mode** by default, which intelligently adjusts parameters based on your chosen BPW:
-
-```
-/quant url: meta-llama/Llama-3.1-8B bpw: 4.0,5.0
-```
-
-Auto mode automatically sets:
-- **head_bits** — Precision for the output layer (lm_head)
-- **cal_rows/cal_cols** — Calibration data size for better quality
-
-| BPW | head_bits | Calibration | Description |
-|-----|-----------|-------------|-------------|
-| ≤3.5 | 6 | 200×2048 | Fast, minimal VRAM |
-| 4.0–4.5 | 6 | 250×2048 | **Balanced (default)** |
-| 5.0–5.5 | 8 | 300×2560 | High quality |
-| 6.0+ | 8 | 300×2560 | Higher lm_head precision |
-
-### Manual Profiles
-
-Override auto settings with profiles (optional):
-
-```
-/quant url: model bpw: 4.0 profile: quality   # Fixed head_bits=8
-/quant url: model bpw: 4.0 profile: fast      # Fast conversion
-```
-
-| Profile | head_bits | Best For |
-|---------|-----------|----------|
-| `auto` | Scales with BPW | Most users (recommended) |
-| `fast` | 6 | Quick conversion |
-| `balanced` | 6 | Original behavior |
-| `quality` | 8 | Maximum quality |
-
-> **Note:** Admins can override head_bits directly with `head_bits: 4-16`.
-
-### Technical Notes
-
-**head_bits differences:**
-Based on community testing (ExLlamaV2/V3), the difference between head_bits=6 and head_bits=8 is typically less than 1% in perplexity. The Auto mode uses head_bits=6 for most BPWs as the quality gain from head_bits=8 is minimal compared to the VRAM cost.
-
-**Calibration data:**
-The default calibration size (250 rows × 2048 columns) works well for most models. Increasing calibration data (e.g., to 300×2560) may marginally improve quality for high-BPW quants but significantly increases conversion time.
-
-**Source format:**
-EXL3 uses QTIP quantization. The calibration data is used to compute Hessians on-the-fly during conversion, unlike EXL2 which required a separate measurement pass.
-
-### Recommended Workflows
-
-**For VRAM-constrained (24GB GPU):**
-```
-/quant url: model bpw: 3.5        # Fits 70B models
-```
-
-**For balanced quality/size (most popular):**
-```
-/quant url: model bpw: 4.0,4.5    # ~90% quality, half the size
-```
-
-**For high-quality outputs:**
-```
-/quant url: model bpw: 5.0,6.0    # 95-98% quality
-```
-
-**Multiple variants at once:**
-```
-/quant url: model bpw: 3.5,4.0,4.5,5.0
-```
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,31 @@
+[project]
+name = "blockquant-backend"
+version = "0.1.0"
+description = "BlockQuant Python backend — multi-format quantization pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface-hub>=0.21.0",
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "tenacity>=8.0",
+    "requests>=2.31",
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "celery>=5.3",
+    "redis>=5.0",
+    # ML / quantization runtime deps
+    "torch>=2.0",
+    "numpy>=1.24",
+    "tokenizers>=0.20",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "Pillow>=10.0",
+    "marisa-trie>=1.2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "black", "ruff"]
+gguf = ["llama-cpp-python>=0.3.0"]
+
+[project.scripts]
+bq-pipeline = "blockquant.__main__:main"

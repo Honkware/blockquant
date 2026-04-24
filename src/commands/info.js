@@ -23,6 +23,40 @@ export async function handleScore(interaction) {
 }
 
 export async function handleLeaderboard(interaction) {
+  const type = interaction.options.getString('type') || 'exp';
+
+  if (type === 'models') {
+    // Fetch from API dashboard
+    const API_URL = process.env.BLOCKQUANT_API_URL || 'http://localhost:8000';
+    try {
+      const resp = await fetch(`${API_URL}/dashboard/api/leaderboard?limit=10`);
+      if (!resp.ok) throw new Error('API error');
+      const data = await resp.json();
+
+      if (!data || data.length === 0) {
+        return interaction.reply({
+          embeds: [embeds.info('🏆 Quantization Leaderboard', 'No models quantized yet!')],
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      const lines = data.map((m, i) => {
+        const medal = ['🥇', '🥈', '🥉'][i] ?? `**${i + 1}.**`;
+        return `${medal} **${m.model_id}** — ${m.quant_count} quant(s) (${m.top_variant})`;
+      });
+
+      return interaction.reply({
+        embeds: [embeds.info('🏆 Top Quantized Models', lines.join('\n'))],
+      });
+    } catch (err) {
+      return interaction.reply({
+        embeds: [embeds.info('🏆 Leaderboard', `Failed to fetch: ${err.message}`)],
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+  }
+
+  // Default: EXP leaderboard
   const users = await db.loadUsers();
   const sorted = Object.entries(users)
     .sort(([, a], [, b]) => (b.exp ?? 0) - (a.exp ?? 0))
@@ -44,6 +78,40 @@ export async function handleLeaderboard(interaction) {
     embeds: [embeds.info('🏆 Leaderboard', lines.join('\n'))],
     allowedMentions: { users: [] },
   });
+}
+
+export async function handleHistory(interaction) {
+  const API_URL = process.env.BLOCKQUANT_API_URL || 'http://localhost:8000';
+  try {
+    const resp = await fetch(`${API_URL}/dashboard/api/recent?limit=5`);
+    if (!resp.ok) throw new Error('API error');
+    const jobs = await resp.json();
+
+    if (!jobs || jobs.length === 0) {
+      return interaction.reply({
+        embeds: [embeds.info('📜 History', 'No jobs yet!')],
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    const lines = jobs.map((j, i) => {
+      const status = j.success === true ? '✅' : j.success === false ? '❌' : '⏳';
+      const time = j.wall_time_seconds ? `${j.wall_time_seconds.toFixed(0)}s` : '—';
+      const model = j.model_id || 'unknown';
+      const variants = Array.isArray(j.variants) ? j.variants.join(',') : j.variants;
+      return `${status} **${model}** @ ${variants} (${time})`;
+    });
+
+    await interaction.reply({
+      embeds: [embeds.info('📜 Recent Jobs', lines.join('\n'))],
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (err) {
+    await interaction.reply({
+      embeds: [embeds.info('📜 History', `Failed to fetch: ${err.message}`)],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
 export async function handleQueueStatus(interaction) {

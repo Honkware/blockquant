@@ -10,33 +10,17 @@ const COLORS = {
   pending: 0xeb459e, // fuchsia
 };
 
-const STAGE_META = {
-  Preparing: { icon: '🧰', label: 'Preparing workspace' },
-  Cached: { icon: '🗂️', label: 'Restoring from cache' },
-  Downloading: { icon: '⬇️', label: 'Downloading source model' },
-  Quantizing: { icon: '⚙️', label: 'Quantizing model weights' },
-  Compiling: { icon: '🧱', label: 'Compiling EXL3 artifacts' },
-  Uploading: { icon: '☁️', label: 'Uploading to Hugging Face' },
-  Reusing: { icon: '♻️', label: 'Reusing existing upload' },
-};
-
-function stageLine(stage) {
-  const meta = STAGE_META[stage] ?? { icon: '🔄', label: stage || 'Working' };
-  return `${meta.icon} ${meta.label}`;
-}
-
 // ── Quant Job Embeds ────────────────────────────────────────────────────────
 
 export function jobQueued({ url, bpws, categories, userId }) {
-  const sorted = [...bpws].sort((a, b) => a - b);
   return new EmbedBuilder()
-    .setTitle('📦 Job Queued')
+    .setTitle('📦 Quantization Job Queued')
     .setColor(COLORS.info)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
       { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
-      { name: 'Variants', value: sorted.map((b) => `\`${b}\``).join('  '), inline: true },
-      { name: 'Categories', value: categories.join(', ') || 'General', inline: true }
+      { name: 'BPW', value: bpws.map((b) => `\`${b}\``).join('  '), inline: true },
+      { name: 'Categories', value: categories.join(', ') || 'None', inline: true }
     )
     .setTimestamp();
 }
@@ -52,35 +36,28 @@ export function jobProgress({
   bpwIndex,
   totalBPWs,
 }) {
-  const overallPct = Math.round(overall ?? progress ?? 0);
-  const stagePct = Math.round(progress ?? 0);
-  const bar = progressBar(overallPct);
+  const bar = progressBar(Math.round(overall ?? progress ?? 0));
   const bpwText =
     currentBPW != null
       ? `\`${currentBPW}\` bpw  (${(bpwIndex ?? 0) + 1}/${totalBPWs ?? '?'})`
       : '—';
-  const stageText = stageLine(stage);
-  const safeStatus = truncate((message || 'Processing...').replace(/\s+/g, ' ').trim(), 220);
 
   return new EmbedBuilder()
     .setTitle('⚙️ Quantization In Progress')
     .setColor(COLORS.pending)
-    .setDescription(`Requested by <@${userId}>\n${stageText}`)
+    .setDescription(`Requested by <@${userId}>`)
     .addFields(
       { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
-      { name: 'Current Variant', value: bpwText, inline: true },
-      { name: 'Stage Progress', value: `${stagePct}%`, inline: true },
-      { name: 'Overall Progress', value: bar, inline: false },
-      { name: 'Status', value: safeStatus || 'Processing...', inline: false }
+      { name: 'Stage', value: stage ?? 'Working…', inline: true },
+      { name: 'Current', value: bpwText, inline: true },
+      { name: 'Progress', value: bar, inline: false },
+      { name: 'Status', value: truncate(message || 'Processing…', 200), inline: false }
     )
     .setTimestamp();
 }
 
 export function jobComplete({ url, userId, results }) {
-  const sorted = [...results].sort((a, b) => Number(a.bpw) - Number(b.bpw));
-  const pushed = sorted.filter((r) => r.pushed).length;
-  const reused = sorted.filter((r) => r.reused).length;
-  const lines = sorted.map((r) => {
+  const lines = results.map((r) => {
     const icon = r.reused ? '♻️' : r.pushed ? '✅' : '❌';
     const href = r.treeUrl || r.url;
     const link = href
@@ -91,42 +68,13 @@ export function jobComplete({ url, userId, results }) {
     return `${icon}  **${r.bpw} bpw** — ${r.duration} — ${link}`;
   });
 
-  const FIELD_LIMIT = 1024;
-  const resultFields = [];
-  let chunk = [];
-  let chunkLen = 0;
-  for (const line of lines) {
-    const sep = chunkLen === 0 ? 0 : 1;
-    if (chunkLen + sep + line.length > FIELD_LIMIT && chunk.length > 0) {
-      resultFields.push({
-        name: resultFields.length === 0 ? 'Results' : '\u200b',
-        value: chunk.join('\n'),
-        inline: false,
-      });
-      chunk = [];
-      chunkLen = 0;
-    }
-    chunk.push(line);
-    chunkLen += (chunkLen === 0 ? 0 : 1) + line.length;
-  }
-  resultFields.push({
-    name: resultFields.length === 0 ? 'Results' : '\u200b',
-    value: chunk.join('\n') || 'No results',
-    inline: false,
-  });
-
   return new EmbedBuilder()
     .setTitle('✅ Quantization Complete')
     .setColor(COLORS.success)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
       { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
-      {
-        name: 'Summary',
-        value: `Successful: **${pushed}/${sorted.length}**${reused ? ` • Reused: **${reused}**` : ''}`,
-        inline: false,
-      },
-      ...resultFields
+      { name: 'Results', value: lines.join('\n') || 'No results', inline: false }
     )
     .setTimestamp();
 }

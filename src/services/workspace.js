@@ -25,14 +25,15 @@ function cacheDir(modelId) {
 
 async function validateDir(dirPath) {
   const files = await readdir(dirPath);
-  const hasWeights = files.some((f) => f.endsWith('.safetensors') || f.endsWith('.bin'));
+  const hasWeights = files.some(
+    (f) => f.endsWith('.safetensors') || f.endsWith('.bin') || f.endsWith('.gguf')
+  );
   if (!hasWeights) {
     throw new AppError(
       'WORKSPACE_INVALID',
       `No model weight files found in ${dirPath}. Download may have failed.`
     );
   }
-
   const hasConfig = files.some((f) => f === 'config.json');
   if (!hasConfig) {
     throw new AppError(
@@ -40,7 +41,6 @@ async function validateDir(dirPath) {
       `No config.json found in ${dirPath}. Is this a valid HuggingFace model?`
     );
   }
-
   return files;
 }
 
@@ -57,14 +57,6 @@ async function readCacheIndex() {
 async function writeCacheIndex(index) {
   await mkdir(DIRS.cache, { recursive: true });
   await writeFile(CACHE_INDEX_FILE, JSON.stringify(index, null, 2));
-}
-
-let cacheIndexQueue = Promise.resolve();
-
-/** Serialize cache-index read-modify-write operations to prevent races. */
-function enqueueCacheWrite(fn) {
-  cacheIndexQueue = cacheIndexQueue.catch(() => {}).then(fn);
-  return cacheIndexQueue;
 }
 
 async function dirSizeBytes(dirPath) {
@@ -125,28 +117,12 @@ export async function prepare() {
   log.info(`Workspace ready (${Date.now() - t0} ms)`);
 }
 
-/**
- * Clean up active job directories and keep cache for reuse.
- *
- * @param {{ keepModel?: boolean, keepWork?: boolean, keepOutput?: boolean }} [options]
- */
-export async function cleanup(options = {}) {
-  const keepModel = options.keepModel === true;
-  const keepWork = options.keepWork === true;
-  const keepOutput = options.keepOutput === true;
-
-  if (!keepModel) {
-    await rm(DIRS.model, { recursive: true, force: true }).catch(() => {});
-  }
-  if (!keepWork) {
-    await rm(DIRS.work, { recursive: true, force: true }).catch(() => {});
-  }
-  if (!keepOutput) {
-    await rm(DIRS.output, { recursive: true, force: true }).catch(() => {});
-  }
-  log.debug(
-    `Workspace cleaned (keepModel=${keepModel}, keepWork=${keepWork}, keepOutput=${keepOutput})`
-  );
+/** Clean up active job directories and keep cache for reuse. */
+export async function cleanup() {
+  await rm(DIRS.model, { recursive: true, force: true }).catch(() => {});
+  await rm(DIRS.work, { recursive: true, force: true }).catch(() => {});
+  await rm(DIRS.output, { recursive: true, force: true }).catch(() => {});
+  log.debug('Workspace cleaned');
 }
 
 /** Verify the model directory contains expected files after download. */
@@ -177,17 +153,15 @@ export async function restoreCachedModel(modelId, hooks = {}) {
   await rm(DIRS.model, { recursive: true, force: true });
   await mkdir(DIRS.model, { recursive: true });
   await cp(src, DIRS.model, { recursive: true, force: true });
-  await enqueueCacheWrite(async () => {
-    const index = await readCacheIndex();
-    index[modelId] = {
-      ...(index[modelId] ?? {}),
-      modelId,
-      path: src,
-      lastUsedAt: Date.now(),
-      sizeBytes: index[modelId]?.sizeBytes ?? await dirSizeBytes(src),
-    };
-    await writeCacheIndex(index);
-  });
+  const index = await readCacheIndex();
+  index[modelId] = {
+    ...(index[modelId] ?? {}),
+    modelId,
+    path: src,
+    lastUsedAt: Date.now(),
+    sizeBytes: await dirSizeBytes(src),
+  };
+  await writeCacheIndex(index);
   log.info(`Cache hit: restored ${modelId}`);
   return true;
 }
@@ -199,31 +173,18 @@ export async function cacheCurrentModel(modelId) {
   await rm(target, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
   await cp(DIRS.model, target, { recursive: true, force: true });
-  await enqueueCacheWrite(async () => {
-    const index = await readCacheIndex();
-    index[modelId] = {
-      modelId,
-      path: target,
-      cachedAt: Date.now(),
-      lastUsedAt: Date.now(),
-      sizeBytes: index[modelId]?.sizeBytes ?? 0,
-    };
-    await writeCacheIndex(index);
-  });
+  const sizeBytes = await dirSizeBytes(target);
+  const index = await readCacheIndex();
+  index[modelId] = {
+    modelId,
+    path: target,
+    cachedAt: Date.now(),
+    lastUsedAt: Date.now(),
+    sizeBytes,
+  };
+  await writeCacheIndex(index);
   await pruneCache('post-cache');
   log.info(`Cached model: ${modelId}`);
-  // Compute accurate size asynchronously to avoid blocking the pipeline
-  dirSizeBytes(target)
-    .then((sizeBytes) =>
-      enqueueCacheWrite(async () => {
-        const idx = await readCacheIndex();
-        if (idx[modelId]) {
-          idx[modelId] = { ...idx[modelId], sizeBytes };
-          await writeCacheIndex(idx);
-        }
-      })
-    )
-    .catch((err) => log.debug(`Failed to update cache size for ${modelId}: ${err.message}`));
 }
 
 export async function getCacheStats() {

@@ -235,36 +235,6 @@ export async function preflight(modelUrl) {
   }
 }
 
-/**
- * Verify Python dependencies used by HF helper scripts (preflight/download/upload).
- */
-export async function validateSetup() {
-  const checkScript = [
-    'import importlib.util, sys',
-    "mods = ['huggingface_hub', 'hf_xet', 'hf_transfer']",
-    "missing = [m for m in mods if importlib.util.find_spec(m) is None]",
-    'if missing:',
-    "    print(','.join(missing))",
-    '    sys.exit(1)',
-  ].join('\n');
-  try {
-    await runPython(['-c', checkScript], {
-      timeoutMs: 15000,
-      attempts: 1,
-      retryable: false,
-      env: { HF_TOKEN: config.HF_TOKEN },
-    });
-  } catch (err) {
-    const msg = String(err?.message ?? '');
-    const missing = msg.replace(/^Python exited \d+:\s*/i, '').trim() || 'unknown';
-    throw new AppError(
-      'AUTH_INVALID',
-      `Missing Python dependencies for Hugging Face scripts: ${missing}\n` +
-        `Run: python3 -m pip install --user -r ${path.join(config.ROOT_DIR, 'scripts', 'requirements.txt')}`
-    );
-  }
-}
-
 // ── Download ────────────────────────────────────────────────────────────────
 
 export async function downloadModel(modelUrl, onProgress) {
@@ -382,7 +352,7 @@ export async function uploadModel(folderPath, repoName, onProgress, options = {}
     try {
       const result = JSON.parse(lines[i]);
       if (result.url) {
-        const treeUrl = result.tree_url ?? exl3TreeUrl(result.url);
+        const treeUrl = result.tree_url ?? exl3TreeUrl(result.url, revision);
         log.info(`Upload success: ${result.url}`);
         return { ...result, tree_url: treeUrl };
       }

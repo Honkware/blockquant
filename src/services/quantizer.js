@@ -20,7 +20,7 @@ const log = getLogger('quantizer');
  * @param {string} modelName - e.g. "Llama-3.1-8B-Instruct"
  * @param {(stage: string, pct: number, msg: string) => void} onProgress
  * @param {AbortSignal} signal - Cancel support
- * @param {{headBits?: number, calRows?: number, calCols?: number, extraArgs?: string[]}} options
+ * @param {{headBits?: number, extraArgs?: string[]}} options
  * @returns {string} Path to the quantized output directory
  */
 export async function quantize(bpw, modelName, onProgress, signal, options = {}) {
@@ -47,15 +47,6 @@ export async function quantize(bpw, modelName, onProgress, signal, options = {})
     '--head_bits',
     headBits.toString(),
   ];
-  
-  // Add calibration parameters if specified
-  if (options.calRows != null) {
-    args.push('--cal_rows', options.calRows.toString());
-  }
-  if (options.calCols != null) {
-    args.push('--cal_cols', options.calCols.toString());
-  }
-  
   if (Array.isArray(options.extraArgs) && options.extraArgs.length > 0) {
     args.push(...options.extraArgs);
   }
@@ -64,7 +55,9 @@ export async function quantize(bpw, modelName, onProgress, signal, options = {})
   onProgress?.('Quantizing', 0, `Starting ${bpw} bpw`);
 
   await new Promise((resolve, reject) => {
-    const { pythonCmd, pythonArgs } = getPythonInvocation(args);
+    const isWindows = process.platform === 'win32';
+    const pythonCmd = config.PYTHON_BIN || (isWindows ? 'py' : 'python3');
+    const pythonArgs = isWindows && !config.PYTHON_BIN ? ['-3', ...args] : args;
 
     const exllamaCwd = path.dirname(convertScript);
     const proc = spawn(pythonCmd, pythonArgs, {
@@ -154,8 +147,7 @@ export async function cleanWorkDir(bpw) {
 }
 
 export async function validateSetup() {
-  const convertScript = await resolveConvertScriptPath();
-  await verifyPythonDeps(convertScript);
+  await resolveConvertScriptPath();
 }
 
 async function resolveConvertScriptPath() {
@@ -175,62 +167,4 @@ async function resolveConvertScriptPath() {
     'QUANT_SETUP_INVALID',
     `ExLlamaV3 convert.py not found. Checked:\n${candidates.join('\n')}\nFix EXLLAMAV3_DIR in .env or add exllamav3 next to the repo.`
   );
-}
-
-function getPythonInvocation(args) {
-  const isWindows = process.platform === 'win32';
-  const pythonCmd = config.PYTHON_BIN || (isWindows ? 'py' : 'python3');
-  const pythonArgs = isWindows && !config.PYTHON_BIN ? ['-3', ...args] : args;
-  return { pythonCmd, pythonArgs };
-}
-
-async function verifyPythonDeps(convertScript) {
-  const checkScript = [
-    'import importlib.util',
-    'import sys',
-    "mods = ['torch', 'flash_attn', 'tokenizers', 'marisa_trie', 'kbnf', 'formatron']",
-    "missing = [m for m in mods if importlib.util.find_spec(m) is None]",
-    'if missing:',
-    "    print(','.join(missing))",
-    '    sys.exit(1)',
-  ].join('\n');
-
-  await new Promise((resolve, reject) => {
-    const exllamaCwd = path.dirname(convertScript);
-    const { pythonCmd, pythonArgs } = getPythonInvocation(['-c', checkScript]);
-    const proc = spawn(pythonCmd, pythonArgs, {
-      cwd: exllamaCwd,
-      env: { ...process.env },
-    });
-
-    let out = '';
-    let err = '';
-    proc.stdout.on('data', (chunk) => {
-      out += chunk.toString();
-    });
-    proc.stderr.on('data', (chunk) => {
-      err += chunk.toString();
-    });
-
-    proc.on('error', (e) => {
-      reject(new AppError('QUANT_SETUP_INVALID', `Failed to run Python preflight check: ${e.message}`));
-    });
-
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      const missing = out.trim() || '(unknown modules)';
-      const details = err.trim();
-      reject(
-        new AppError(
-          'QUANT_SETUP_INVALID',
-          `Missing Python dependencies for ExLlamaV3: ${missing}\n` +
-            `Run: python3 -m pip install --user -r ${path.join(exllamaCwd, 'requirements.txt')}` +
-            (details ? `\nPython stderr:\n${details}` : '')
-        )
-      );
-    });
-  });
 }
