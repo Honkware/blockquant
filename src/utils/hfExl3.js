@@ -1,18 +1,22 @@
 /**
- * Hugging Face layout: one model repo per BPW, e.g. `{modelName}-8bpw-exl3`.
+ * Hugging Face layout: one repo per (model × bpw) — `{modelName}-exl3-{bpw}bpw`.
+ * This matches the RunPod backend convention: one upload target per variant,
+ * no branch differentiation required.
  */
 
-function formatBpwLabel(bpw) {
+export function formatExl3Revision(bpw) {
   const n = Number(bpw);
-  if (!Number.isFinite(n)) throw new TypeError(`Invalid bpw: ${bpw}`);
-  return Number.isInteger(n) ? String(n) : String(n).replace(/\.0+$/, '');
+  if (!Number.isFinite(n)) throw new TypeError(`Invalid bpw value: ${bpw} (expected finite number)`);
+  return `${n.toFixed(2)}bpw`;
 }
 
 export function exl3RepoName(modelName, bpw) {
-  if (bpw == null) return `${modelName}-exl3`;
-  return `${modelName}-${formatBpwLabel(bpw)}bpw-exl3`;
+  const n = Number(bpw);
+  if (!Number.isFinite(n)) throw new TypeError(`Invalid bpw value: ${bpw} (expected finite number)`);
+  return `${modelName}-exl3-${n.toFixed(2)}bpw`;
 }
 
 export function exl3TreeUrl(repoUrl) {
-  return repoUrl || null;
+  if (!repoUrl) return repoUrl;
+  return String(repoUrl).replace(/\/$/, '');
 }

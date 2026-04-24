@@ -1,14 +1,69 @@
+# Node
 node_modules/
+
+# Secrets
 .env
+.env.local
+.env.*.local
+
+# Scratch / runtime
 tmp/
 logs/
 data/*.json
 *.log
+
+# Python
+venv/
+.venv/
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.egg-info/
-unsloth_compiled_cache/
-*.zip
-scripts/windows/
+.coverage
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Model / build artefacts
+*.safetensors
+*.gguf
+*.bin
+work-*/
+output-*/
+
+# Docker / build
+*.tar
+dist/
+build/
+
+# Vendored upstreams — users clone these themselves (see SETUP.md)
+exllamav3/
+
+# Python venv aliases (just in case)
+env/
+.python-version
+
+# Local backups / scratch
+*.bak
+*.orig
+*.rej
+
+# Vendored Windows-only conveniences (users install Redis themselves)
+redis-win/
+tmp_pkg/
+
+# Lingering patch-encoding scratch files from the Modal era
+gen_patch_b64*.py
+gen_stub_b64*.py
+patch_b64*.txt
+stub_b64*.txt
+

@@ -1,0 +1,885 @@
+"""RunPod GPU provider — on-demand pods with SSH + tail-log progress.
+
+Design (matches Lambda provider so pipeline.py's poll loop works):
+
+    launch()           → create_pod(start_ssh=True, env={PUBLIC_KEY})
+    wait_for_active()  → poll get_pod() until public SSH port exposed
+    bootstrap()        → idempotent deps install (marker file)
+    run_pipeline()     → SFTP /root/quant.py, start via `nohup ... &`, return
+    get_progress()     → `tail -n 30 /root/bq.log`
+    is_pipeline_running() → `pgrep -f /root/quant.py`
+    get_result()       → read /root/bq-result.json
+    terminate()        → terminate_pod() (always in finally)
+
+Requirements:
+    1. RUNPOD_API_KEY env var.
+    2. SSH key pair at ~/.ssh/id_rsa{,.pub}. The public key is injected into
+       the pod via env["PUBLIC_KEY"] on create — no need to pre-register it
+       with `runpod ssh add-key`.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+from blockquant.providers.base import Provider
+from blockquant.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# Lazy imports so the module loads without SDKs present.
+_runpod = None
+_paramiko = None
+
+
+def _ensure_runpod():
+    global _runpod
+    if _runpod is None:
+        import runpod
+        _runpod = runpod
+    return _runpod
+
+
+def _ensure_paramiko():
+    global _paramiko
+    if _paramiko is None:
+        import paramiko
+        _paramiko = paramiko
+    return _paramiko
+
+
+# Remote paths — kept under /root so they survive bootstrap but are pod-local.
+REMOTE_SCRIPT = "/root/quant.py"
+REMOTE_LOG = "/root/bq.log"
+REMOTE_RESULT = "/root/bq-result.json"
+BOOTSTRAP_MARKER = "/root/.bq-bootstrapped"
+
+
+class RunPodProvider(Provider):
+    name = "runpod"
+
+    DEFAULT_SSH_KEY = Path.home() / ".ssh" / "id_rsa"
+
+    def __init__(
+        self,
+        api_key: str = "",
+        gpu_type: str = "NVIDIA H100 80GB HBM3",
+        cloud_type: str = "COMMUNITY",
+        container_disk_gb: int = 150,
+        volume_gb: int = 100,
+        ssh_key_path: str = "",
+        ssh_wait_timeout: int = 600,
+        network_volume_id: str = "",
+        data_center_id: str = "",
+        install_flash_attn: bool = False,
+    ):
+        api_key = api_key or os.environ.get("RUNPOD_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "RunPod API key required. Set RUNPOD_API_KEY env var or pass api_key."
+            )
+        _ensure_runpod().api_key = api_key
+        self.gpu_type = gpu_type
+        self.cloud_type = cloud_type
+        self.container_disk_gb = container_disk_gb
+        self.volume_gb = volume_gb
+        self.ssh_key_path = Path(ssh_key_path).expanduser() if ssh_key_path else self.DEFAULT_SSH_KEY
+        self.ssh_wait_timeout = ssh_wait_timeout
+        self.network_volume_id = network_volume_id
+        self.data_center_id = data_center_id
+        self.install_flash_attn = install_flash_attn
+        if not self.ssh_key_path.exists():
+            raise ValueError(
+                f"SSH private key not found at {self.ssh_key_path}. "
+                f"Generate one with: ssh-keygen -t rsa -b 4096 -f {self.ssh_key_path} -N ''"
+            )
+        pubkey_path = self.ssh_key_path.with_suffix(self.ssh_key_path.suffix + ".pub") \
+            if self.ssh_key_path.suffix else Path(str(self.ssh_key_path) + ".pub")
+        if not pubkey_path.exists():
+            raise ValueError(
+                f"SSH public key not found at {pubkey_path}. "
+                f"It is read and injected into the pod via env[PUBLIC_KEY]."
+            )
+        self._pubkey = pubkey_path.read_text(encoding="utf-8").strip()
+        self._pod_id: str | None = None
+        self._ssh_endpoint: dict | None = None
+        self._last_result: dict | None = None
+        self._gpu_price_cache: dict[str, float] | None = None
+        # Python interpreter inside the pod, discovered during bootstrap.
+        self._remote_py: str = "python3"
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def launch(self, config: dict) -> str:
+        rp = _ensure_runpod()
+        logger.info(f"Creating RunPod pod with GPU: {self.gpu_type}")
+
+        # RunPod's pytorch base (April 2026 tag scheme).
+        # torch 2.8, CUDA 12.9, Python 3.11, Ubuntu 22.04 — matches exllamav3 v0.0.30.
+        # Bootstrap skips the torch reinstall and uses whatever ships here.
+        image = "runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204"
+
+        # Always inject the public key so `start_ssh=True` actually works.
+        # (Without PUBLIC_KEY, RunPod's SSH daemon comes up with no authorized_keys.)
+        env = {"PUBLIC_KEY": self._pubkey}
+        env.update(config.get("env", {}) or {})
+
+        kwargs = dict(
+            name=f"blockquant-{int(time.time())}",
+            image_name=image,
+            gpu_type_id=self.gpu_type,
+            cloud_type=self.cloud_type,
+            container_disk_in_gb=self.container_disk_gb,
+            volume_in_gb=self.volume_gb,
+            support_public_ip=True,
+            start_ssh=True,
+            ports="22/tcp",
+            env=env,
+        )
+        if self.network_volume_id:
+            kwargs["network_volume_id"] = self.network_volume_id
+            # Network volumes are region-pinned.
+            if self.data_center_id:
+                kwargs["data_center_id"] = self.data_center_id
+
+        pod = rp.create_pod(**kwargs)
+        self._pod_id = pod["id"]
+        self._ssh_endpoint = None
+        self._last_result = None
+        logger.info(f"RunPod created: {self._pod_id}")
+        return self._pod_id
+
+    def terminate(self, instance_id: str):
+        rp = _ensure_runpod()
+        try:
+            rp.terminate_pod(instance_id)
+            logger.info(f"RunPod terminated: {instance_id}")
+        except Exception as e:
+            logger.warning(f"RunPod terminate failed: {e}")
+
+    def _get_pod_resilient(self, instance_id: str):
+        """rp.get_pod() with retry on transient network errors (TLS reset, etc.)."""
+        rp = _ensure_runpod()
+        for attempt in range(5):
+            try:
+                return rp.get_pod(instance_id)
+            except Exception as e:
+                # requests.ConnectionError, urllib3 ProtocolError, ssl errors, etc.
+                msg = str(e).lower()
+                transient = any(s in msg for s in (
+                    "connection reset", "connection aborted", "connectionreset",
+                    "remote host", "10054", "timed out", "temporarily unavailable",
+                    "eof occurred", "max retries",
+                ))
+                if not transient or attempt == 4:
+                    raise
+                wait = min(2 ** attempt, 15)
+                logger.warning(f"get_pod transient error, retry {attempt + 1}/5 in {wait}s: {e}")
+                time.sleep(wait)
+
+    def _get_ssh_endpoint(self, instance_id: str, timeout: int | None = None, interval: int = 5) -> dict:
+        if self._ssh_endpoint is not None:
+            return self._ssh_endpoint
+
+        timeout = timeout or self.ssh_wait_timeout
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            pod = self._get_pod_resilient(instance_id)
+            if pod is None:
+                raise RuntimeError(f"Pod {instance_id} not found")
+            status = pod.get("desiredStatus", "UNKNOWN")
+            if status in ("EXITED", "TERMINATED", "FAILED"):
+                raise RuntimeError(f"Pod {instance_id} reached terminal state: {status}")
+            runtime = pod.get("runtime")
+            if runtime:
+                ports = runtime.get("ports") or []
+                for p in ports:
+                    if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                        self._ssh_endpoint = {"host": p["ip"], "port": int(p["publicPort"])}
+                        logger.info(
+                            f"SSH endpoint ready: {self._ssh_endpoint['host']}:{self._ssh_endpoint['port']}"
+                        )
+                        return self._ssh_endpoint
+            time.sleep(interval)
+        raise TimeoutError(
+            f"Pod {instance_id} did not expose public SSH endpoint within {timeout}s"
+        )
+
+    def wait_for_active(self, instance_id: str, timeout: int | None = None, interval: int = 5) -> dict:
+        try:
+            ssh = self._get_ssh_endpoint(instance_id, timeout=timeout, interval=interval)
+            return {"status": "active", "id": instance_id, "ssh": ssh}
+        except TimeoutError as e:
+            return {"status": "timeout", "id": instance_id, "error": str(e)}
+        except RuntimeError as e:
+            return {"status": "failed", "id": instance_id, "error": str(e)}
+
+    # ------------------------------------------------------------------
+    # SSH
+    # ------------------------------------------------------------------
+
+    def _connect_ssh(self, instance_id: str, retries: int = 20):
+        """Open a paramiko SSH client with keepalive and exp-backoff retries."""
+        paramiko = _ensure_paramiko()
+        endpoint = self._get_ssh_endpoint(instance_id)
+        last_err = None
+        for attempt in range(retries):
+            client = paramiko.SSHClient()
+            # AutoAddPolicy is intentional: each RunPod pod is ephemeral and
+            # gets a fresh host key, so strict checking would require either
+            # known_hosts gymnastics or skipping the integrity check anyway.
+            # The pod's identity is verified via the API (we requested it,
+            # we know the pod_id), and traffic to it is over SSH (encrypted).
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client.connect(
+                    hostname=endpoint["host"],
+                    port=endpoint["port"],
+                    username="root",
+                    key_filename=str(self.ssh_key_path),
+                    timeout=60,
+                    banner_timeout=60,
+                )
+                # Keepalive is critical: RunPod's ingress silently drops idle
+                # exec channels on multi-hour runs otherwise.
+                transport = client.get_transport()
+                if transport is not None:
+                    transport.set_keepalive(30)
+                return client
+            except Exception as e:
+                last_err = e
+                wait = min(2 ** attempt, 10)
+                logger.debug(f"SSH connect {attempt + 1}/{retries} failed, retry in {wait}s: {e}")
+                client.close()
+                time.sleep(wait)
+        raise RuntimeError(
+            f"Unable to connect to SSH at {endpoint['host']}:{endpoint['port']} "
+            f"after {retries} attempts: {last_err}"
+        )
+
+    def _exec(self, client, command: str, timeout: int = 3600) -> dict:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        exit_code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        return {"stdout": out, "stderr": err, "code": exit_code}
+
+    def run(self, instance_id: str, command: str, retries: int = 4) -> dict:
+        """Run a command via SSH with reconnect-on-transient-error.
+
+        The poll-loop callers (get_progress, is_pipeline_running) hit this
+        every ~20s for hours; over a long run, paramiko's idle SSH channel
+        will eventually be reset by Windows TCP / RunPod ingress / antivirus.
+        Without retry, that single reset terminates the whole pod via the
+        outer finally block — losing hours of remote quant progress for a
+        recoverable network blip.
+        """
+        paramiko = _ensure_paramiko()
+        transient_excs = (
+            paramiko.SSHException,
+            EOFError,
+            OSError,
+            ConnectionResetError,
+        )
+        last_err = None
+        for attempt in range(retries):
+            try:
+                client = self._connect_ssh(instance_id)
+            except Exception as e:
+                # _connect_ssh has its own retry; if even that gave up,
+                # treat it as transient and bubble through the outer loop.
+                last_err = e
+                wait = min(2 ** attempt, 15)
+                logger.warning(
+                    f"SSH connect failed (run attempt {attempt + 1}/{retries}, "
+                    f"retry in {wait}s): {e}"
+                )
+                time.sleep(wait)
+                continue
+            try:
+                return self._exec(client, command, timeout=43200)
+            except transient_excs as e:
+                last_err = e
+                if attempt == retries - 1:
+                    raise
+                wait = min(2 ** attempt, 15)
+                logger.warning(
+                    f"SSH exec transient error (attempt {attempt + 1}/{retries}, "
+                    f"retry in {wait}s): {e}"
+                )
+                time.sleep(wait)
+                # Drop any cached endpoint so the next _connect_ssh re-resolves
+                # if the pod's port changed (rare, but defensible).
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        # Loop exhausted without returning — surface the last error.
+        raise RuntimeError(
+            f"run() exhausted {retries} retries on {instance_id}: {last_err}"
+        )
+
+    def _sftp_put_with_retry(self, instance_id: str, fn, retries: int = 5):
+        """Run a single SFTP operation with reconnect-on-transient-error.
+
+        `fn(sftp)` does the actual put / write. We open a fresh SSH+SFTP
+        per attempt so a stale connection from a previous error doesn't
+        carry over.
+        """
+        paramiko = _ensure_paramiko()
+        transient = (paramiko.SSHException, EOFError, OSError, ConnectionResetError)
+        last_err = None
+        for attempt in range(retries):
+            try:
+                client = self._connect_ssh(instance_id)
+            except Exception as e:
+                last_err = e
+                if attempt == retries - 1:
+                    raise
+                wait = min(2 ** attempt, 15)
+                logger.warning(f"SFTP connect retry {attempt + 1}/{retries} in {wait}s: {e}")
+                time.sleep(wait)
+                continue
+            try:
+                sftp = client.open_sftp()
+                try:
+                    return fn(sftp)
+                finally:
+                    sftp.close()
+            except transient as e:
+                last_err = e
+                if attempt == retries - 1:
+                    raise
+                wait = min(2 ** attempt, 15)
+                logger.warning(f"SFTP transient error retry {attempt + 1}/{retries} in {wait}s: {e}")
+                time.sleep(wait)
+            finally:
+                try: client.close()
+                except Exception: pass
+
+    def _upload_file(self, instance_id: str, local_path: Path, remote_path: str):
+        self._sftp_put_with_retry(
+            instance_id,
+            lambda sftp: sftp.put(str(local_path), remote_path),
+        )
+
+    def _upload_bytes(self, instance_id: str, data: bytes, remote_path: str):
+        def _put(sftp):
+            with sftp.file(remote_path, "wb") as f:
+                f.write(data)
+        self._sftp_put_with_retry(instance_id, _put)
+
+    def _upload_directory(self, instance_id: str, local_dir: Path, remote_dir: str):
+        """Upload a directory tree via SFTP with per-file retry + reconnect.
+
+        Long SFTP sessions can be killed mid-stream by transient network drops
+        (RunPod ingress, local Windows TCP, antivirus). On any SFTP/EOF error
+        we reopen the connection and retry just that file, up to 5 times each.
+        """
+        paramiko = _ensure_paramiko()
+        transient_errs = (
+            paramiko.SSHException,
+            EOFError,
+            OSError,
+            ConnectionResetError,
+        )
+
+        def _open():
+            c = self._connect_ssh(instance_id)
+            return c, c.open_sftp()
+
+        client, sftp = _open()
+        try:
+            try:
+                sftp.mkdir(remote_dir)
+            except IOError:
+                pass
+
+            for root, dirs, files in os.walk(local_dir):
+                rel_root = Path(root).relative_to(local_dir)
+                for d in dirs:
+                    remote_path = f"{remote_dir}/{rel_root}/{d}".replace("\\", "/")
+                    try:
+                        sftp.mkdir(remote_path)
+                    except IOError:
+                        pass
+
+                for f in files:
+                    local_path = Path(root) / f
+                    remote_path = f"{remote_dir}/{rel_root}/{f}".replace("\\", "/")
+                    for attempt in range(5):
+                        try:
+                            sftp.put(str(local_path), remote_path)
+                            break
+                        except transient_errs as e:
+                            if attempt == 4:
+                                raise
+                            wait = min(2 ** attempt, 15)
+                            logger.warning(
+                                f"SFTP put({remote_path}) failed (attempt {attempt + 1}/5, "
+                                f"retry in {wait}s): {e}"
+                            )
+                            try:
+                                sftp.close()
+                                client.close()
+                            except Exception:
+                                pass
+                            time.sleep(wait)
+                            client, sftp = _open()
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Bootstrap — idempotent
+    # ------------------------------------------------------------------
+
+    def _probe_remote_python(self, instance_id: str) -> str:
+        """Discover the python binary inside the pod that has torch importable.
+
+        The base image's torch is in a specific interpreter (often `python` on
+        the venv path, not `/usr/bin/python3.11`). We prefer an interpreter with
+        torch already installed; if none qualify, fall back to the first python
+        found so we can at least install our own stack.
+        """
+        probe = self.run(
+            instance_id,
+            # Try candidates in preference order. The one with torch wins.
+            # If none have torch, return the first one that exists at all.
+            "set -u; FIRST=''; WINNER=''; "
+            "for p in python python3 python3.12 python3.11 python3.10 python3.13; do "
+            "  command -v $p >/dev/null 2>&1 || continue; "
+            "  [ -z \"$FIRST\" ] && FIRST=$p; "
+            "  if $p -c 'import torch' >/dev/null 2>&1; then WINNER=$p; break; fi; "
+            "done; "
+            "echo ${WINNER:-$FIRST}",
+        )
+        py = probe["stdout"].strip() or "python3"
+        self._remote_py = py
+        return py
+
+    def bootstrap(self, instance_id: str, exllamav3_local_dir: Path | None = None) -> bool:
+        # Always probe so run_pipeline has the right interpreter, even on fast-path.
+        py = self._probe_remote_python(instance_id)
+        # Note whether the selected interpreter already has torch so it's visible in logs.
+        torch_check = self.run(
+            instance_id,
+            f"{py} -c 'import torch; print(torch.__version__)' 2>/dev/null || echo MISSING",
+        )
+        torch_ver = torch_check["stdout"].strip()
+        logger.info(f"Using remote interpreter: {py}  (torch: {torch_ver})")
+        print(f"      remote python: {py}  torch: {torch_ver}", flush=True)
+
+        # Fast-path: if a prior run on this pod already bootstrapped, skip.
+        check = self.run(instance_id, f"test -f {BOOTSTRAP_MARKER} && echo yes || echo no")
+        if check["stdout"].strip() == "yes":
+            logger.info("Pod already bootstrapped")
+            return True
+
+        # The base image ships torch + CUDA — only add what's missing.
+        # ninja-build + build-essential are required for exllamav3's JIT C++ extension.
+        logger.info("Installing system packages...")
+        result = self.run(
+            instance_id,
+            "apt-get update && apt-get install -y --no-install-recommends "
+            "git wget ca-certificates ninja-build build-essential",
+        )
+        if result["code"] != 0:
+            logger.error(f"System bootstrap failed: {result['stderr'][:2000]}")
+            return False
+
+        result = self.run(instance_id, f"{py} -m pip install --upgrade pip")
+        if result["code"] != 0:
+            logger.warning(f"pip upgrade warning: {result['stderr'][:200]}")
+
+        # If the selected interpreter has no torch, install it against the image's CUDA.
+        if torch_ver in ("", "MISSING"):
+            logger.info("No torch on selected interpreter — installing torch==2.6 cu124...")
+            print("      installing torch==2.6 (base image has no torch on this python)", flush=True)
+            result = self.run(
+                instance_id,
+                f"{py} -m pip install --no-cache-dir torch==2.6.0 "
+                f"--index-url https://download.pytorch.org/whl/cu124",
+            )
+            if result["code"] != 0:
+                logger.error(f"torch install failed: {result['stderr'][:2000]}")
+                return False
+
+        # huggingface_hub is needed early by the remote quant.py to download the model,
+        # and transformers/sentencepiece are used across the stack. These overlap with
+        # exllamav3's own requirements.txt but we install them first so a pre-upload
+        # failure is cheap to diagnose.
+        logger.info("Installing HF deps...")
+        result = self.run(
+            instance_id,
+            f"{py} -m pip install --no-cache-dir --upgrade "
+            "huggingface-hub transformers sentencepiece tqdm psutil",
+        )
+        if result["code"] != 0:
+            logger.error(f"HF deps install failed: {result['stderr'][:2000]}")
+            return False
+
+        if self.install_flash_attn:
+            logger.info("Installing flash-attn (falls back to SDPA if build fails)...")
+            # Let flash-attn pip-resolve the wheel that matches the image's torch.
+            result = self.run(
+                instance_id,
+                f"{py} -m pip install flash-attn --no-build-isolation",
+            )
+            if result["code"] != 0:
+                stderr_preview = result["stderr"][:300].encode("ascii", "replace").decode("ascii")
+                logger.warning(f"flash-attn install failed (will use SDPA fallback): {stderr_preview}")
+        else:
+            logger.info("Skipping flash-attn (SDPA is adequate for quantization calibration)")
+
+        if exllamav3_local_dir and exllamav3_local_dir.exists():
+            logger.info(f"Uploading local exllamav3 from {exllamav3_local_dir}...")
+            remote_dir = "/workspace/exllamav3"
+            self._upload_directory(instance_id, exllamav3_local_dir, remote_dir)
+            # Install upstream requirements minus flash_attn (we own that path
+            # separately via install_flash_attn). This picks up marisa_trie,
+            # rich, typing_extensions, pillow, pyyaml, and the exact
+            # formatron/pydantic/kbnf pins the code was tested against.
+            # Exclude torch AND flash_attn from the upstream upgrade.
+            # - torch: the base image's torch (e.g. 2.8.0+cu129) is matched to the
+            #   pod's NVIDIA driver. Letting pip pull torch>=2.6.0 from PyPI ends
+            #   up installing a cu13x build that the older driver rejects.
+            # - flash_attn: opt-in via install_flash_attn; SDPA is fine for quant.
+            logger.info("Installing exllamav3 requirements.txt (excluding torch + flash_attn)...")
+            result = self.run(
+                instance_id,
+                f"cd {remote_dir} && "
+                f"grep -v -E '^(flash_attn|flash-attn|torch)' requirements.txt > /tmp/exl3-reqs.txt && "
+                f"{py} -m pip install --no-cache-dir --upgrade -r /tmp/exl3-reqs.txt",
+            )
+            if result["code"] != 0:
+                logger.error(f"exllamav3 requirements install failed: {result['stderr'][:2000]}")
+                return False
+            result = self.run(
+                instance_id,
+                f"cd {remote_dir} && {py} -m pip install -e . --no-deps",
+            )
+        else:
+            logger.info("Installing exllamav3 from PyPI (with deps)...")
+            result = self.run(instance_id, f"{py} -m pip install --upgrade exllamav3")
+
+        # Formatron is chronically broken against current pydantic in many base images,
+        # and the exllamav3 top-level __init__ hard-imports FormatronFilter even for
+        # quant-only workflows that never touch generation. Test whether the import
+        # works; if not, neuter it with a stub so conversion still imports.
+        probe_formatron = self.run(
+            instance_id,
+            f"{py} -c 'from formatron.formatter import FormatterBuilder' 2>&1 || echo __FORMATRON_BROKEN__",
+        )
+        if "__FORMATRON_BROKEN__" in probe_formatron["stdout"]:
+            logger.warning("formatron import broken; stubbing FormatronFilter for quant-only use")
+            formatron_shim = (
+                "class FormatronFilter:\n"
+                "    def __init__(self, *a, **kw):\n"
+                "        raise RuntimeError('FormatronFilter stubbed out (formatron broken in env)')\n"
+            )
+            # Find the exllamav3 filter module regardless of local vs PyPI install.
+            locate = self.run(
+                instance_id,
+                f"{py} -c 'import exllamav3, os; "
+                "p = os.path.join(os.path.dirname(exllamav3.__file__), \"generator\", \"filter\", \"formatron.py\"); "
+                "print(p)' 2>/dev/null || true",
+            )
+            remote_formatron = locate["stdout"].strip().splitlines()
+            remote_formatron = remote_formatron[-1] if remote_formatron else ""
+            if not remote_formatron:
+                # Fall back to the known local-upload path.
+                remote_formatron = "/workspace/exllamav3/exllamav3/generator/filter/formatron.py"
+            self._upload_bytes(
+                instance_id, formatron_shim.encode("utf-8"), remote_formatron
+            )
+            logger.info(f"Stubbed {remote_formatron}")
+
+        if result["code"] != 0:
+            logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
+            return False
+
+        logger.info("Health check...")
+        result = self.run(
+            instance_id,
+            f"{py} -c \"import torch; print('[gpu]', torch.cuda.get_device_name(0)); "
+            "import exllamav3; print('[ok] exllamav3 imported')\"",
+        )
+        if result["code"] != 0:
+            logger.error(f"Health check failed: {result['stderr'][:2000]}")
+            return False
+        logger.info(f"Health check output:\n{result['stdout'].strip()}")
+
+        # Mark bootstrapped so a re-run on the same pod is cheap.
+        self.run(instance_id, f"touch {BOOTSTRAP_MARKER}")
+        logger.info("Bootstrap complete")
+        return True
+
+    # ------------------------------------------------------------------
+    # Pipeline — fire-and-forget; progress via tail-log
+    # ------------------------------------------------------------------
+
+    _QUANT_SCRIPT = r'''#!/usr/bin/env python3.11
+"""Remote quantization entrypoint. Writes final JSON to RESULT_PATH."""
+import json, os, sys, time, traceback
+from pathlib import Path
+
+CONFIG_PATH = "/root/bq-config.json"
+RESULT_PATH = "/root/bq-result.json"
+
+def emit_result(payload: dict):
+    try:
+        with open(RESULT_PATH, "w") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        print(f"[fatal] could not write result: {e}", flush=True)
+
+try:
+    cfg = json.loads(Path(CONFIG_PATH).read_text())
+    model_id = cfg["model_id"]
+    variants = cfg["variants"]
+    hf_token = cfg.get("hf_token", "")
+    hf_org = cfg.get("hf_org", "")
+    head_bits = int(cfg.get("head_bits", 8))
+
+    t0 = time.time()
+    import torch
+    print(f"[gpu] CUDA: {torch.cuda.is_available()} | {torch.cuda.get_device_name(0)} | "
+          f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB", flush=True)
+
+    from huggingface_hub import snapshot_download, HfApi, login as hf_login
+    workspace = Path("/workspace/blockquant")
+    workspace.mkdir(parents=True, exist_ok=True)
+    model_dir = workspace / "model"
+
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        hf_login(token=hf_token)
+
+    print(f"[download] {model_id} ...", flush=True)
+    snapshot_download(repo_id=model_id, local_dir=str(model_dir), token=hf_token or None)
+    print("[download] complete", flush=True)
+
+    # Qwen2VL preprocessor shim (same as original)
+    prep = model_dir / "preprocessor_config.json"
+    if not prep.exists():
+        prep.write_text(json.dumps({
+            "size": {"shortest_edge": 56, "longest_edge": 56},
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "image_processor_type": "Qwen2VLImageProcessorFast",
+        }))
+
+    from exllamav3.conversion.convert_model import parser, main, prepare
+    outputs = []
+    for variant in variants:
+        bpw = float(variant)
+        out_dir = workspace / f"output-{bpw}bpw"
+        work_dir = workspace / f"work-{bpw}"
+        if (out_dir / "config.json").exists():
+            print(f"[skip] {variant} exists at {out_dir}", flush=True)
+            outputs.append({"variant": variant, "path": str(out_dir)})
+            continue
+        print(f"[quantize] {variant} bpw ...", flush=True)
+        old_argv = sys.argv
+        sys.argv = [
+            "convert",
+            "-i", str(model_dir),
+            "-o", str(out_dir),
+            "-w", str(work_dir),
+            "-b", str(bpw),
+            "--head_bits", str(head_bits),
+            "--parallel_mode",
+        ]
+        try:
+            args = parser.parse_args()
+        finally:
+            sys.argv = old_argv
+        in_args, job_state, ok, err = prepare(args)
+        if not ok:
+            emit_result({"status": "failed", "error": f"prepare failed: {err}"})
+            sys.exit(1)
+        main(in_args, job_state)
+        print(f"[quantize] {variant} complete", flush=True)
+        outputs.append({"variant": variant, "path": str(out_dir)})
+
+    if hf_token:
+        print("[upload] to HuggingFace ...", flush=True)
+        api = HfApi(token=hf_token)
+        model_name = model_id.split("/")[-1]
+        # One repo per variant, suffix-encoded: {model}-{bpw}bpw-exl3.
+        # Matches the convention readers expect (bartowski, ArtusDev style)
+        # and makes the HF URL self-describing at a glance.
+        for out in outputs:
+            slug = f"{model_name}-exl3-{out['variant']}bpw"
+            repo_id = f"{hf_org}/{slug}" if hf_org else slug
+            print(f"[upload] {out['variant']} -> {repo_id} ...", flush=True)
+            api.upload_folder(
+                folder_path=out["path"],
+                repo_id=repo_id,
+                repo_type="model",
+            )
+            out["hf_repo_id"] = repo_id
+            out["hf_revision"] = "main"
+            out["hf_url"] = f"https://huggingface.co/{repo_id}"
+        print("[upload] complete", flush=True)
+
+    emit_result({
+        "status": "complete",
+        "outputs": outputs,
+        "total_time": time.time() - t0,
+    })
+    print("[done]", flush=True)
+except Exception as e:
+    traceback.print_exc()
+    emit_result({"status": "failed", "error": f"{type(e).__name__}: {e}"})
+    sys.exit(1)
+'''
+
+    def run_pipeline(
+        self,
+        instance_id: str,
+        model_id: str,
+        format: str,
+        variants: list[str],
+        hf_token: str = "",
+        hf_org: str = "",
+        head_bits: int = 8,
+        use_imatrix: bool = True,
+    ) -> dict:
+        """Start the remote quant script in the background. Returns immediately."""
+        # Reset any cached result from a prior call.
+        self._last_result = None
+
+        # 1. Config JSON (keeps secrets out of command lines / logs).
+        cfg = {
+            "model_id": model_id,
+            "variants": list(variants),
+            "hf_token": hf_token,
+            "hf_org": hf_org,
+            "head_bits": head_bits,
+        }
+        self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
+
+        # 2. The quant script itself.
+        self._upload_bytes(instance_id, self._QUANT_SCRIPT.encode("utf-8"), REMOTE_SCRIPT)
+        self.run(instance_id, f"chmod +x {REMOTE_SCRIPT}")
+
+        # 3. Fire-and-forget. setsid so the process survives our SSH channel.
+        launch_cmd = (
+            f"rm -f {REMOTE_RESULT} {REMOTE_LOG} && "
+            f"nohup setsid {self._remote_py} {REMOTE_SCRIPT} "
+            f"> {REMOTE_LOG} 2>&1 < /dev/null & echo $!"
+        )
+        result = self.run(instance_id, launch_cmd)
+        if result["code"] != 0:
+            return {"status": "failed", "error": f"launch failed: {result['stderr'][:2000]}"}
+        logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip()})")
+        return {"status": "started"}
+
+    def get_progress(self, instance_id: str, lines: int = 30) -> str:
+        """Return the tail of the remote log for progress reporting.
+
+        ``lines`` defaults to 30 for cheap routine polling; pass a larger
+        value (e.g. 500) for a final drain after the run completes so the
+        last batch of post-quantize + upload output is captured locally.
+        """
+        result = self.run(
+            instance_id,
+            f"tail -n {int(lines)} {REMOTE_LOG} 2>/dev/null || echo NO_LOG",
+        )
+        return result["stdout"]
+
+    def is_pipeline_running(self, instance_id: str) -> bool:
+        """True while the remote quant.py process is alive."""
+        result = self.run(
+            instance_id,
+            f"pgrep -f '{REMOTE_SCRIPT}' >/dev/null && echo running || echo done",
+        )
+        return result["stdout"].strip() == "running"
+
+    def get_result(self) -> dict | None:
+        """Return the parsed /root/bq-result.json from the most recent run."""
+        if self._last_result is not None:
+            return self._last_result
+        if self._pod_id is None:
+            return None
+        try:
+            fetched = self.run(
+                self._pod_id,
+                f"cat {REMOTE_RESULT} 2>/dev/null || echo ''",
+            )
+            raw = fetched["stdout"].strip()
+            if not raw:
+                return None
+            self._last_result = json.loads(raw)
+            return self._last_result
+        except Exception as e:
+            logger.warning(f"get_result() failed: {e}")
+            return None
+
+    def sync_outputs(self, instance_id: str, local_dir: Path, remote_rel_path: str = "") -> list[Path]:
+        # The remote script uploads directly to HuggingFace — nothing to sync.
+        logger.info("RunPod: outputs uploaded to HF by remote script, skipping local sync")
+        return []
+
+    # ------------------------------------------------------------------
+    # Cost — dynamic via SDK with hardcoded fallback
+    # ------------------------------------------------------------------
+
+    _STATIC_PRICES = {
+        "NVIDIA RTX A4000": 0.32,
+        "NVIDIA RTX A4500": 0.44,
+        "NVIDIA RTX A5000": 0.46,
+        "NVIDIA RTX A6000": 0.79,
+        "NVIDIA A40": 0.47,
+        "NVIDIA A100 80GB PCIe": 1.64,
+        "NVIDIA A100-SXM4-80GB": 1.89,
+        "NVIDIA H100 PCIe": 2.39,
+        "NVIDIA H100 80GB HBM3": 1.99,
+        "NVIDIA H100 NVL": 2.79,
+        "NVIDIA H200": 3.99,
+    }
+
+    def _lookup_live_price(self) -> float | None:
+        """Live-fetch the price for self.gpu_type. Cached per instance."""
+        if self._gpu_price_cache is not None:
+            return self._gpu_price_cache.get(self.gpu_type)
+        rp = _ensure_runpod()
+        self._gpu_price_cache = {}
+        try:
+            # Only get_gpu(id) returns pricing; get_gpus() is list-view only.
+            g = rp.get_gpu(self.gpu_type)
+            if g:
+                # Prefer community on-demand; fall back to secure, then lowest.
+                price = g.get("communityPrice") or g.get("securePrice")
+                if not price:
+                    lp = g.get("lowestPrice")
+                    if isinstance(lp, dict):
+                        price = lp.get("uninterruptablePrice")
+                if isinstance(price, (int, float)) and price > 0:
+                    self._gpu_price_cache[self.gpu_type] = float(price)
+                    return float(price)
+        except Exception as e:
+            logger.debug(f"Live GPU price lookup failed ({e}); using static table")
+        return None
+
+    def get_cost_per_hour(self) -> float:
+        live = self._lookup_live_price()
+        if live is not None:
+            return live
+        return self._STATIC_PRICES.get(self.gpu_type, 2.00)

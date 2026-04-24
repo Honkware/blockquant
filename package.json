@@ -8,6 +8,7 @@
     "start": "cross-env NODE_ENV=production node src/index.js",
     "dev": "cross-env NODE_ENV=development node src/index.js",
     "preflight": "node scripts/run-python.mjs scripts/preflight.py",
+    "hub:cleanup": "node scripts/run-python.mjs scripts/hub_cleanup.py",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier . --write",

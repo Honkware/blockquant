@@ -9,6 +9,7 @@ import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
+import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 
 const log = getLogger('cmd:quant');
 
@@ -39,9 +40,11 @@ export async function handleQuant(interaction) {
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
-  const profile = interaction.options.getString('profile') ?? 'auto';
+  const profile = interaction.options.getString('profile') ?? 'balanced';
   const headBitsOverride = interaction.options.getInteger('head_bits');
   const category = interaction.options.getString('category') ?? 'General';
+  const format = interaction.options.getString('format') ?? 'exl3';
+  const provider = interaction.options.getString('provider') ?? 'local';
   const userId = interaction.user.id;
   const isAdmin = config.ADMIN_IDS.includes(userId);
 
@@ -56,38 +59,58 @@ export async function handleQuant(interaction) {
       embeds: [embeds.error('Forbidden', 'Only admins can override `head_bits`.')],
     });
   }
-  
-  // Store profile and override for later calculation
-  // headBits will be calculated per BPW if profile is 'auto'
   const quantOptions = {
     headBits: headBitsOverride ?? config.QUANT_PROFILES[profile].headBits,
     profile,
-    isAuto: profile === 'auto' && headBitsOverride == null,
   };
 
-  // ── Parse & validate BPW list ─────────────────────────────────────────────
-  const bpws = [...new Set(
-    bpwInput
-      .split(',')
-      .map((s) => s.trim())
-      .map((s) => parseFloat(s))
-      .filter((n) => !isNaN(n))
-  )].sort((a, b) => a - b);
-  if (bpws.length === 0) {
+  // ── Parse & validate variant list ─────────────────────────────────────────
+  let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
+  if (variants.length === 0) {
     return interaction.editReply({
-      embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
+      embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0` or `q4_k_m,q5_k_m`')],
     });
   }
-  const invalid = bpws.filter((b) => b < 1.5 || b > 8.5);
-  if (invalid.length) {
-    return interaction.editReply({
-      embeds: [
-        embeds.error(
-          'BPW Out of Range',
-          `Values must be between 1.5–8.5. Got: ${invalid.join(', ')}`
-        ),
-      ],
-    });
+
+  let bpws;
+  if (format === 'gguf') {
+    const VALID_GGUF_VARIANTS = new Set([
+      'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m',
+      'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m',
+      'q6_k', 'q8_0', 'f16', 'bf16',
+    ]);
+    const invalid = variants.filter((v) => !VALID_GGUF_VARIANTS.has(v.toLowerCase()));
+    if (invalid.length) {
+      return interaction.editReply({
+        embeds: [
+          embeds.error(
+            'Invalid GGUF Variant',
+            `Unknown variant(s): ${invalid.join(', ')}. Valid: ${Array.from(VALID_GGUF_VARIANTS).join(', ')}`
+          ),
+        ],
+      });
+    }
+    variants = variants.map((v) => v.toLowerCase());
+    bpws = []; // BPW concept doesn't apply to GGUF in the same way
+  } else {
+    // EXL3: parse as floats
+    bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
+    if (bpws.length === 0) {
+      return interaction.editReply({
+        embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
+      });
+    }
+    const invalid = bpws.filter((b) => b < 1.5 || b > 8.5);
+    if (invalid.length) {
+      return interaction.editReply({
+        embeds: [
+          embeds.error(
+            'BPW Out of Range',
+            `Values must be between 1.5–8.5. Got: ${invalid.join(', ')}`
+          ),
+        ],
+      });
+    }
   }
 
   // ── Parse model URL ───────────────────────────────────────────────────────
@@ -139,82 +162,74 @@ export async function handleQuant(interaction) {
     });
   }
 
-  if (flight.isGguf) {
-    return interaction.editReply({
-      embeds: [
-        embeds.error(
-          'Unsupported Model Format',
-          'GGUF source models are disabled in this HF-only bot build. Use a standard Hugging Face model repo with `config.json` and safetensors/bin weights.'
-        ),
-      ],
-    });
-  }
-
-  // ── Runtime setup checks ───────────────────────────────────────────────────
-  try {
-    await hf.validateSetup();
-    await quantizer.validateSetup();
-  } catch (err) {
-    log.error('Runtime setup check failed', { error: err.message, userId });
-    return interaction.editReply({
-      embeds: [embeds.error('Quantizer Setup Error', toUserMessage(err) || err.message)],
-    });
-  }
-
-  // ── Pre-check upload targets for idempotency ──────────────────────────────
-  const modelName = modelId.split('/').pop();
-  const precheckedRepos = {};
-  const alreadyUploaded = [];
-  try {
-    for (const bpw of bpws) {
-      const repoName = exl3RepoName(modelName, bpw);
-      const state = await hf.inspectUploadRepo(repoName, {
-        sourceModel: modelId,
-        profile,
-        bpw,
-        quantOptions,
+  // ── Runtime setup checks (local EXL3 only) ────────────────────────────────
+  if (format === 'exl3') {
+    try {
+      await quantizer.validateSetup();
+    } catch (err) {
+      log.error('Quantizer setup check failed', { error: err.message, userId });
+      return interaction.editReply({
+        embeds: [embeds.error('Quantizer Setup Error', toUserMessage(err) || err.message)],
       });
-      precheckedRepos[String(bpw)] = state;
-      if (
-        state.exists &&
-        state.settingsMatch === false &&
-        state.reason !== 'manifest_missing'
-      ) {
-        return interaction.editReply({
-          embeds: [
-            embeds.error(
-              'Existing Repo Conflict',
-              `\`${state.repoId}\` already has a manifest with different quant settings (${state.reason ?? 'manifest mismatch'}).`
-            ),
-          ],
-        });
-      }
-      if (state.exists && state.settingsMatch) {
-        alreadyUploaded.push(`${bpw} bpw`);
-      }
     }
-  } catch (err) {
-    return interaction.editReply({
-      embeds: [embeds.error('Repo Pre-check Failed', toUserMessage(err))],
-    });
   }
 
-  if (alreadyUploaded.length === bpws.length) {
-    return interaction.editReply({
-      embeds: [
-        embeds.success(
-          'Already Quantized',
-          `Matching uploads already exist for all requested BPWs: ${alreadyUploaded.join(', ')}`
-        ),
-      ],
-    });
+  // ── Pre-check upload targets for idempotency (EXL3 local only) ────────────
+  const modelName = modelId.split('/').pop();
+  let precheckedRepos = {};
+  let alreadyUploaded = [];
+  if (format === 'exl3') {
+    try {
+      for (const bpw of bpws) {
+        const repoName = exl3RepoName(modelName, bpw);
+        const state = await hf.inspectUploadRepo(repoName, {
+          sourceModel: modelId,
+          profile,
+          bpw,
+          quantOptions,
+        });
+        precheckedRepos[String(bpw)] = state;
+        if (
+          state.exists &&
+          state.settingsMatch === false &&
+          state.reason !== 'manifest_missing'
+        ) {
+          return interaction.editReply({
+            embeds: [
+              embeds.error(
+                'Existing Repo Conflict',
+                `\`${state.repoId}\` already has a manifest with different quant settings (${state.reason ?? 'manifest mismatch'}).`
+              ),
+            ],
+          });
+        }
+        if (state.exists && state.settingsMatch) {
+          alreadyUploaded.push(`${bpw} bpw`);
+        }
+      }
+    } catch (err) {
+      return interaction.editReply({
+        embeds: [embeds.error('Repo Pre-check Failed', toUserMessage(err))],
+      });
+    }
+
+    if (alreadyUploaded.length === bpws.length) {
+      return interaction.editReply({
+        embeds: [
+          embeds.success(
+            'Already Quantized',
+            `Matching uploads already exist for all requested BPWs: ${alreadyUploaded.join(', ')}`
+          ),
+        ],
+      });
+    }
   }
 
   // ── EXP check ─────────────────────────────────────────────────────────────
   const users = await db.loadUsers();
   const user = users[userId] ?? { exp: 0, lastQuant: 0 };
-  const missingCount = bpws.length - alreadyUploaded.length;
-  const cost = missingCount * 10; // charge only for bpw variants that still need work
+  const missingCount = variants.length - alreadyUploaded.length;
+  const cost = missingCount * 10; // charge only for variants that still need work
   if (user.exp < cost) {
     return interaction.editReply({
       embeds: [
@@ -229,38 +244,14 @@ export async function handleQuant(interaction) {
   const jobId = randomUUID();
   const createdAt = Date.now();
 
-  // ── Create thread for live progress (fallback to channel if unavailable) ─
-  const channel =
-    interaction.channel ?? (await interaction.client.channels.fetch(interaction.channelId).catch(() => null));
+  // ── Create thread for live progress ───────────────────────────────────────
+  const thread = await interaction.channel.threads.create({
+    name: `⚡ ${modelId.split('/').pop()} [${interaction.user.username}]`,
+    autoArchiveDuration: 1440,
+  });
 
-  if (!channel) {
-    return interaction.editReply({
-      embeds: [embeds.error('Channel Error', 'Unable to resolve this channel for progress updates.')],
-    });
-  }
-
-  let thread = null;
-  if (channel.threads && typeof channel.threads.create === 'function') {
-    thread = await channel.threads.create({
-      name: `⚡ ${modelId.split('/').pop()} [${interaction.user.username}]`,
-      autoArchiveDuration: 1440,
-    });
-  }
-
-  const progressChannel = thread ?? channel;
-  if (typeof progressChannel.send !== 'function') {
-    return interaction.editReply({
-      embeds: [
-        embeds.error(
-          'Channel Error',
-          'This channel cannot receive progress messages. Use `/quant` in a server text channel.'
-        ),
-      ],
-    });
-  }
-
-  const progressMsg = await progressChannel.send({
-    embeds: [embeds.jobQueued({ url: modelId, bpws, categories: [category], userId })],
+  const progressMsg = await thread.send({
+    embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
   });
 
   await db.upsertJob({
@@ -270,13 +261,15 @@ export async function handleQuant(interaction) {
     userId,
     modelId,
     url: urlInput,
+    format,
+    variants,
     bpws,
     categories: [category],
     profile,
     quantOptions,
     cost,
     channelId: interaction.channelId,
-    threadId: thread?.id ?? null,
+    threadId: thread.id,
     progressMessageId: progressMsg.id,
     chargedAt: null,
     refundedAt: null,
@@ -300,28 +293,15 @@ export async function handleQuant(interaction) {
     });
   }
 
-  // Build auto configuration summary
-  let autoSummary = '';
-  if (quantOptions.isAuto && bpws.length > 0) {
-    const sampleBpw = bpws[0];
-    const autoParams = config.calculateAutoParams(sampleBpw);
-    autoSummary = `\n🤖 **Auto mode** selected: head_bits=${autoParams.headBits}, cal=${autoParams.calRows}x${autoParams.calCols}`;
-    if (bpws.length > 1) {
-      autoSummary += ` (per BPW)`;
-    }
-  } else if (profile !== 'auto') {
-    autoSummary = `\n⚙️ Profile: **${profile}** (head_bits=${quantOptions.headBits})`;
-  }
-
   await interaction.editReply({
     embeds: [
       embeds.success(
         '✅ Job Submitted',
-        `Follow progress in ${thread ?? progressChannel}.\nCost: **${cost}** EXP (balance: **${chargeResult.balance}**)${
+        `Follow progress in ${thread}.\nCost: **${cost}** EXP (balance: **${chargeResult.balance}**)${
           alreadyUploaded.length
             ? `\nReused existing uploads: **${alreadyUploaded.join(', ')}**`
             : ''
-        }${autoSummary}`
+        }`
       ),
     ],
   });
@@ -337,80 +317,143 @@ export async function handleQuant(interaction) {
     }
   });
 
-  // ── Enqueue job ───────────────────────────────────────────────────────────
-  queue.enqueue({
-    jobId,
-    url: urlInput,
-    bpws,
-    categories: [category],
-    profile,
-    quantOptions,
-    precheckedRepos,
-    userId,
-    cost,
+  // Shared completion handler
+  async function handleComplete(results) {
+    try {
+      await progressMsg.edit({ embeds: [embeds.jobComplete({ url: modelId, userId, results })] });
+      const pushedCount = results.filter((r) => r.pushed).length;
+      let completionNote;
+      if (pushedCount === results.length && pushedCount > 0) {
+        completionNote = `<@${userId}> Your quantization is done! 🎉`;
+      } else if (pushedCount > 0) {
+        completionNote = `<@${userId}> Quantization finished with partial upload success (${pushedCount}/${results.length}).`;
+      } else {
+        completionNote =
+          `<@${userId}> Quantization finished, but upload failed for all outputs. ` +
+          'Please retry upload or contact an admin.';
+      }
+      await thread.send(completionNote);
 
-    onProgress: (data) => updateEmbed(data),
+      // Save model record
+      const models = await db.loadModels();
+      models[modelId] = {
+        url: modelId,
+        categories: [category],
+        authors: [userId],
+        quantizedBPWs: results.filter((r) => r.pushed).map((r) => r.bpw ?? r.variant),
+        results,
+        completedAt: Date.now(),
+      };
+      await db.saveModels(models);
 
-    onComplete: async (results) => {
-      try {
-        await progressMsg.edit({ embeds: [embeds.jobComplete({ url: modelId, userId, results })] });
-        const pushedCount = results.filter((r) => r.pushed).length;
-        let completionNote;
-        if (pushedCount === results.length && pushedCount > 0) {
-          completionNote = `<@${userId}> Your quantization is done! 🎉`;
-        } else if (pushedCount > 0) {
-          completionNote = `<@${userId}> Quantization finished with partial upload success (${pushedCount}/${results.length}).`;
+      await db.patchJob(jobId, {
+        status: db.JOB_STATUS.completed,
+        completedAt: Date.now(),
+        partialResults: results,
+      });
+    } catch (err) {
+      log.error('Completion callback error', { error: err.message });
+    }
+  }
+
+  // Shared error handler
+  async function handleError(err) {
+    try {
+      const refund = await db.refundForJob({ jobId, userId, cost });
+      await progressMsg.edit({
+        embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })],
+      });
+      const refundMessage = refund.refunded
+        ? `Your **${cost}** EXP has been refunded.`
+        : 'No EXP refund was required for this job.';
+      await thread.send(`<@${userId}> Quantization failed. ${refundMessage}`);
+      await db.patchJob(jobId, {
+        status: db.JOB_STATUS.failed,
+        failedAt: Date.now(),
+        error: sanitizeErrorText(err.message),
+      });
+    } catch (e) {
+      log.error('Error callback error', { error: e.message });
+    }
+  }
+
+  // ── API vs Local branch ───────────────────────────────────────────────────
+  const useApi = format === 'gguf' || await isApiAvailable();
+
+  if (useApi) {
+    // ── API mode ─────────────────────────────────────────────────────────────
+    try {
+      const apiJob = await submitJob({
+        model_id: modelId,
+        format,
+        variants,
+        provider,
+        hf_org: config.HF_ORG,
+      });
+
+      await db.patchJob(jobId, {
+        status: db.JOB_STATUS.running,
+        startedAt: Date.now(),
+        apiJobId: apiJob.job_id,
+      });
+      updateEmbed({ stage: 'Queued', progress: 0, overall: 0, message: `API job ${apiJob.job_id} queued` });
+
+      const totalBPWs = bpws.length;
+      const apiResult = await pollJob(apiJob.job_id, (status, result, error, progress) => {
+        if (status === 'complete') {
+          updateEmbed({ stage: 'Complete', progress: 100, overall: 100, message: 'Done' });
+        } else if (status === 'failed') {
+          updateEmbed({ stage: 'Failed', progress: 0, overall: 0, message: error || 'Failed' });
         } else {
-          completionNote =
-            `<@${userId}> Quantization finished locally, but upload failed for all outputs. ` +
-            'Please retry upload or contact an admin.';
+          const stage = progress?.stage || status;
+          const msg = progress?.message || status;
+          const pct = progress?.percent ?? (status === 'running' ? 50 : 0);
+          updateEmbed({
+            stage,
+            progress: pct,
+            overall: pct,
+            message: msg,
+            currentBPW: bpws[0],
+            bpwIndex: 0,
+            totalBPWs,
+          });
         }
-        if (typeof progressChannel.send === 'function') {
-          await progressChannel.send(completionNote);
-        }
+      });
 
-        // Save model record
-        const models = await db.loadModels();
-        models[modelId] = {
-          url: modelId,
-          categories: [category],
-          authors: [userId],
-          quantizedBPWs: results.filter((r) => r.pushed).map((r) => r.bpw),
-          results,
-          completedAt: Date.now(),
-        };
-        await db.saveModels(models);
+      // Map API result to existing result shape
+      const outputs = apiResult?.outputs || [];
+      const results = outputs.map((o) => ({
+        bpw: o.variant,
+        variant: o.variant,
+        duration: `${(apiResult?.total_wall_time ?? 0).toFixed(1)}s`,
+        url: o.hf_url,
+        treeUrl: o.hf_url,
+        pushed: !!o.hf_url,
+        reused: false,
+        error: null,
+      }));
 
-        await db.patchJob(jobId, {
-          status: db.JOB_STATUS.completed,
-          completedAt: Date.now(),
-          partialResults: results,
-        });
-      } catch (err) {
-        log.error('Completion callback error', { error: err.message });
-      }
-    },
+      await handleComplete(results);
+    } catch (err) {
+      log.error('API job failed', { error: err.message });
+      await handleError(err);
+    }
+  } else {
+    // ── Local mode (fallback) ────────────────────────────────────────────────
+    queue.enqueue({
+      jobId,
+      url: urlInput,
+      bpws,
+      categories: [category],
+      profile,
+      quantOptions,
+      precheckedRepos,
+      userId,
+      cost,
 
-    onError: async (err) => {
-      try {
-        const refund = await db.refundForJob({ jobId, userId, cost });
-        await progressMsg.edit({
-          embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })],
-        });
-        const refundMessage = refund.refunded
-          ? `Your **${cost}** EXP has been refunded.`
-          : 'No EXP refund was required for this job.';
-        if (typeof progressChannel.send === 'function') {
-          await progressChannel.send(`<@${userId}> Quantization failed. ${refundMessage}`);
-        }
-        await db.patchJob(jobId, {
-          status: db.JOB_STATUS.failed,
-          failedAt: Date.now(),
-          error: sanitizeErrorText(err.message),
-        });
-      } catch (e) {
-        log.error('Error callback error', { error: e.message });
-      }
-    },
-  });
+      onProgress: (data) => updateEmbed(data),
+      onComplete: handleComplete,
+      onError: handleError,
+    });
+  }
 }

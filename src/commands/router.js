@@ -1,7 +1,7 @@
 import { getLogger } from '../logger.js';
 import { MessageFlags } from 'discord.js';
 import { handleQuant } from './quant.js';
-import { handleHealth, handleLeaderboard, handleQueueStatus, handleScore } from './info.js';
+import { handleHealth, handleLeaderboard, handleHistory, handleQueueStatus, handleScore } from './info.js';
 import { handleCache, handleDiag, handleGive, handlePause, handleResume } from './admin.js';
 import { toUserMessage } from '../errors/taxonomy.js';
 
@@ -13,6 +13,7 @@ const handlers = {
   health: handleHealth,
   score: handleScore,
   leaderboard: handleLeaderboard,
+  history: handleHistory,
   give: handleGive,
   pause: handlePause,
   resume: handleResume,

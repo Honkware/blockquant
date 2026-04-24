@@ -14,11 +14,11 @@ export function formatDuration(ms) {
 
 /** Build a text progress bar. */
 export function progressBar(pct, width = 20) {
+  const clampedPct = Math.max(0, Math.min(100, pct));
   const safeWidth = Math.max(0, Math.floor(width));
-  const safePct = Math.max(0, Math.min(100, pct));
-  const filled = Math.min(safeWidth, Math.round((safePct / 100) * safeWidth));
+  const filled = Math.round((clampedPct / 100) * safeWidth);
   const empty = safeWidth - filled;
-  return `${'█'.repeat(filled)}${'░'.repeat(empty)} ${safePct}%`;
+  return `${'█'.repeat(filled)}${'░'.repeat(empty)} ${Math.round(clampedPct)}%`;
 }
 
 /** Truncate a string with ellipsis. */

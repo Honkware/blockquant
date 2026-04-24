@@ -25,14 +25,15 @@ function cacheDir(modelId) {
 
 async function validateDir(dirPath) {
   const files = await readdir(dirPath);
-  const hasWeights = files.some((f) => f.endsWith('.safetensors') || f.endsWith('.bin'));
+  const hasWeights = files.some(
+    (f) => f.endsWith('.safetensors') || f.endsWith('.bin') || f.endsWith('.gguf')
+  );
   if (!hasWeights) {
     throw new AppError(
       'WORKSPACE_INVALID',
       `No model weight files found in ${dirPath}. Download may have failed.`
     );
   }
-
   const hasConfig = files.some((f) => f === 'config.json');
   if (!hasConfig) {
     throw new AppError(
@@ -40,7 +41,6 @@ async function validateDir(dirPath) {
       `No config.json found in ${dirPath}. Is this a valid HuggingFace model?`
     );
   }
-
   return files;
 }
 
@@ -61,8 +61,8 @@ async function writeCacheIndex(index) {
 
 let cacheIndexQueue = Promise.resolve();
 
-/** Serialize cache-index read-modify-write operations to prevent races. */
-function enqueueCacheWrite(fn) {
+/** Serialize cache-index read-modify-write to prevent concurrent corruption. */
+function enqueueCacheIndexOp(fn) {
   cacheIndexQueue = cacheIndexQueue.catch(() => {}).then(fn);
   return cacheIndexQueue;
 }
@@ -125,28 +125,12 @@ export async function prepare() {
   log.info(`Workspace ready (${Date.now() - t0} ms)`);
 }
 
-/**
- * Clean up active job directories and keep cache for reuse.
- *
- * @param {{ keepModel?: boolean, keepWork?: boolean, keepOutput?: boolean }} [options]
- */
-export async function cleanup(options = {}) {
-  const keepModel = options.keepModel === true;
-  const keepWork = options.keepWork === true;
-  const keepOutput = options.keepOutput === true;
-
-  if (!keepModel) {
-    await rm(DIRS.model, { recursive: true, force: true }).catch(() => {});
-  }
-  if (!keepWork) {
-    await rm(DIRS.work, { recursive: true, force: true }).catch(() => {});
-  }
-  if (!keepOutput) {
-    await rm(DIRS.output, { recursive: true, force: true }).catch(() => {});
-  }
-  log.debug(
-    `Workspace cleaned (keepModel=${keepModel}, keepWork=${keepWork}, keepOutput=${keepOutput})`
-  );
+/** Clean up active job directories and keep cache for reuse. */
+export async function cleanup() {
+  await rm(DIRS.model, { recursive: true, force: true }).catch(() => {});
+  await rm(DIRS.work, { recursive: true, force: true }).catch(() => {});
+  await rm(DIRS.output, { recursive: true, force: true }).catch(() => {});
+  log.debug('Workspace cleaned');
 }
 
 /** Verify the model directory contains expected files after download. */
@@ -177,14 +161,15 @@ export async function restoreCachedModel(modelId, hooks = {}) {
   await rm(DIRS.model, { recursive: true, force: true });
   await mkdir(DIRS.model, { recursive: true });
   await cp(src, DIRS.model, { recursive: true, force: true });
-  await enqueueCacheWrite(async () => {
+  const sizeBytes = await dirSizeBytes(src);
+  await enqueueCacheIndexOp(async () => {
     const index = await readCacheIndex();
     index[modelId] = {
       ...(index[modelId] ?? {}),
       modelId,
       path: src,
       lastUsedAt: Date.now(),
-      sizeBytes: index[modelId]?.sizeBytes ?? await dirSizeBytes(src),
+      sizeBytes,
     };
     await writeCacheIndex(index);
   });
@@ -199,31 +184,20 @@ export async function cacheCurrentModel(modelId) {
   await rm(target, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
   await cp(DIRS.model, target, { recursive: true, force: true });
-  await enqueueCacheWrite(async () => {
+  const sizeBytes = await dirSizeBytes(target);
+  await enqueueCacheIndexOp(async () => {
     const index = await readCacheIndex();
     index[modelId] = {
       modelId,
       path: target,
       cachedAt: Date.now(),
       lastUsedAt: Date.now(),
-      sizeBytes: index[modelId]?.sizeBytes ?? 0,
+      sizeBytes,
     };
     await writeCacheIndex(index);
   });
   await pruneCache('post-cache');
   log.info(`Cached model: ${modelId}`);
-  // Compute accurate size asynchronously to avoid blocking the pipeline
-  dirSizeBytes(target)
-    .then((sizeBytes) =>
-      enqueueCacheWrite(async () => {
-        const idx = await readCacheIndex();
-        if (idx[modelId]) {
-          idx[modelId] = { ...idx[modelId], sizeBytes };
-          await writeCacheIndex(idx);
-        }
-      })
-    )
-    .catch((err) => log.debug(`Failed to update cache size for ${modelId}: ${err.message}`));
 }
 
 export async function getCacheStats() {
@@ -240,50 +214,52 @@ export async function getCacheStats() {
 export async function clearCache() {
   await rm(DIRS.cache, { recursive: true, force: true });
   await mkdir(DIRS.cache, { recursive: true });
-  await writeCacheIndex({});
+  await enqueueCacheIndexOp(() => writeCacheIndex({}));
 }
 
 export async function pruneCache(reason = 'manual') {
   if (!config.MODEL_CACHE_ENABLED) return { removed: 0, reason };
-  const index = await readCacheIndex();
-  const models = Object.values(index).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
-  const now = Date.now();
-  const ttlMs = config.MODEL_CACHE_TTL_HOURS <= 0 ? 0 : config.MODEL_CACHE_TTL_HOURS * 3600 * 1000;
-  const keep = {};
-  const removed = [];
-  let totalBytes = 0;
+  return enqueueCacheIndexOp(async () => {
+    const index = await readCacheIndex();
+    const models = Object.values(index).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+    const now = Date.now();
+    const ttlMs = config.MODEL_CACHE_TTL_HOURS <= 0 ? 0 : config.MODEL_CACHE_TTL_HOURS * 3600 * 1000;
+    const keep = {};
+    const removed = [];
+    let totalBytes = 0;
 
-  for (const model of models) {
-    const expired = ttlMs > 0 && now - (model.lastUsedAt ?? model.cachedAt ?? 0) > ttlMs;
-    if (expired) {
-      removed.push(model.modelId);
-      await rm(model.path, { recursive: true, force: true }).catch(() => {});
-      continue;
+    for (const model of models) {
+      const expired = ttlMs > 0 && now - (model.lastUsedAt ?? model.cachedAt ?? 0) > ttlMs;
+      if (expired) {
+        removed.push(model.modelId);
+        await rm(model.path, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      keep[model.modelId] = model;
+      totalBytes += model.sizeBytes ?? 0;
     }
-    keep[model.modelId] = model;
-    totalBytes += model.sizeBytes ?? 0;
-  }
 
-  let ordered = Object.values(keep).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
-  while (
-    ordered.length > config.MODEL_CACHE_MAX_ENTRIES ||
-    totalBytes > config.MODEL_CACHE_MAX_BYTES
-  ) {
-    const victim = ordered.shift();
-    if (!victim) break;
-    removed.push(victim.modelId);
-    totalBytes -= victim.sizeBytes ?? 0;
-    delete keep[victim.modelId];
-    await rm(victim.path, { recursive: true, force: true }).catch(() => {});
-  }
+    let ordered = Object.values(keep).sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+    while (
+      ordered.length > config.MODEL_CACHE_MAX_ENTRIES ||
+      totalBytes > config.MODEL_CACHE_MAX_BYTES
+    ) {
+      const victim = ordered.shift();
+      if (!victim) break;
+      removed.push(victim.modelId);
+      totalBytes -= victim.sizeBytes ?? 0;
+      delete keep[victim.modelId];
+      await rm(victim.path, { recursive: true, force: true }).catch(() => {});
+    }
 
-  await writeCacheIndex(keep);
-  if (removed.length > 0) {
-    log.info(
-      `Pruned ${removed.length} cache entr${removed.length === 1 ? 'y' : 'ies'} (${reason})`
-    );
-  }
-  return { removed: removed.length, reason };
+    await writeCacheIndex(keep);
+    if (removed.length > 0) {
+      log.info(
+        `Pruned ${removed.length} cache entr${removed.length === 1 ? 'y' : 'ies'} (${reason})`
+      );
+    }
+    return { removed: removed.length, reason };
+  });
 }
 
 export { DIRS };

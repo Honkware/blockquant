@@ -138,66 +138,14 @@ const config = Object.freeze({
   LOG_INCLUDE_STACKS: boolEnv('LOG_INCLUDE_STACKS', process.env.NODE_ENV !== 'production'),
   PUBLIC_ERROR_REDACTION_ENABLED: boolEnv('PUBLIC_ERROR_REDACTION_ENABLED', true),
 
-  // Quantization presets  (ExLlamaV3 uses bpw, typically 3-8)
-  // 3.0-3.5 = low quality (VRAM constrained only)
-  // 4.0-4.5 = sweet spot (most popular, 90%+ quality)
-  // 5.0-6.0 = high quality (95%+ quality)
-  // 8.0 = near-lossless (98%+ quality)
-  BPW_OPTIONS: [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 8.0],
+  // Quantization presets  (ExLlamaV3 uses bpw, typically 2-8)
+  BPW_OPTIONS: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 8.0],
   HEAD_BITS: intEnv('HEAD_BITS', 6),
   QUANT_PROFILES: Object.freeze({
-    // head_bits: precision for lm_head (output layer)
-    // 6 = minimum for decent quality, 8 = recommended, 16 = FP16
-    auto: { headBits: null },    // Calculated dynamically based on BPW
-    fast: { headBits: 6 },       // Was 4, but 4 causes noticeable degradation
-    balanced: { headBits: 6 },   // Sweet spot for most models
-    quality: { headBits: 8 },    // Higher precision output layer
+    fast: { headBits: 4 },
+    balanced: { headBits: 6 },
+    quality: { headBits: 8 },
   }),
-  
-  /**
-   * Calculate optimal head_bits based on BPW.
-   * Higher BPW = higher head_bits for better quality.
-   * Lower BPW = minimum viable head_bits to save VRAM.
-   * 
-   * Note: head_bits 6 vs 8 makes <1% perplexity difference per community testing,
-   * but we scale up for higher BPW tiers to match quality expectations.
-   */
-  calculateHeadBits: (bpw) => {
-    if (bpw <= 3.5) return 6;   // Low BPW: minimum viable
-    if (bpw <= 4.5) return 6;   // Sweet spot: balanced
-    if (bpw <= 6.5) return 8;   // High quality: better lm_head
-    return 8;                    // Near-lossless: max quality (or 16)
-  },
-  
-  /**
-   * Calculate calibration data size based on BPW.
-   * More calibration data = better quantization quality.
-   * Higher BPW = more calibration (better quality worth the time).
-   * Lower BPW = less calibration (faster, quality already limited).
-   */
-  calculateCalibration: (bpw) => {
-    // Default: 250 rows, 2048 columns
-    if (bpw <= 3.5) return { calRows: 200, calCols: 2048 };   // Fast, minimal
-    if (bpw <= 4.5) return { calRows: 250, calCols: 2048 };  // Default
-    if (bpw <= 6.0) return { calRows: 300, calCols: 2560 };  // Better quality
-    return { calRows: 350, calCols: 3072 };                  // Max quality
-  },
-  
-  /**
-   * Calculate all auto parameters for a given BPW.
-   * Returns complete quantOptions object for auto mode.
-   */
-  calculateAutoParams: (bpw) => {
-    const headBits = config.calculateHeadBits(bpw);
-    const { calRows, calCols } = config.calculateCalibration(bpw);
-    return {
-      headBits,
-      calRows,
-      calCols,
-      // out_scales: 'always' is default and generally best
-      // codebook: 'mcg' is default and generally best
-    };
-  },
 });
 
 export default config;
