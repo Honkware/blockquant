@@ -92,6 +92,21 @@ On first `create_pod` failure (out of stock), the CLI walks through the
 `--gpu-fallback` list automatically. Bootstrap and a 35B-class quant land at
 ~4h on H100 NVL for ~$10 community-cloud.
 
+## Pre-baked RunPod image (faster cold starts)
+
+Bootstrap on a fresh `runpod/pytorch:*` base takes ~5 minutes (apt + pip + ExLlamaV3 install + JIT compile). To skip all of that, use the pre-baked image:
+
+```bash
+./backend/venv/bin/python backend/scripts/run_runpod_job.py \
+  --image ghcr.io/honkware/blockquant:latest \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --variants 4.5
+```
+
+The image bakes in the exact (torch, CUDA, ninja, ExLlamaV3, formatron, marisa_trie, …) combination we have validated. Cold start drops to ~30 seconds. Builds + pushes to GHCR happen automatically on each `v*.*.*` git tag — see [`.github/workflows/build-runpod-image.yml`](.github/workflows/build-runpod-image.yml).
+
+The pod-side script lives at [`backend/src/blockquant/remote/quant.py`](backend/src/blockquant/remote/quant.py) — same file that gets baked into the image, also SFTP'd to non-baked pods as a fallback.
+
 ## Live dashboard
 
 `log_dashboard.py` is a single-file FastAPI app. It tails the quant log, runs

@@ -47,6 +47,15 @@ def main():
         ),
     )
     parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
+    parser.add_argument(
+        "--image",
+        default="",
+        help=(
+            "Pod image override. Use ghcr.io/honkware/blockquant:latest "
+            "to skip bootstrap (~5 min faster start). Defaults to RunPod's "
+            "pytorch base, which triggers the in-pod bootstrap path."
+        ),
+    )
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
@@ -97,6 +106,7 @@ def main():
             gpu_type=candidate,
             cloud_type=args.cloud,
             install_flash_attn=args.install_flash_attn,
+            image=args.image,
         )
         rate = attempt.get_cost_per_hour()
         print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {args.cloud})...", flush=True)
