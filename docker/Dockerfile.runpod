@@ -1,0 +1,99 @@
+# BlockQuant pre-baked RunPod image.
+#
+# Bakes every gotcha we discovered the hard way (see
+# C:\Users\juden\.claude\projects\E--BlockQuant-v2\memory\project_runpod_*.md
+# for the full archaeology) so that a RunPod pod is "quant-ready" the
+# instant it boots — no apt-get, no pip, no JIT compile during the run.
+#
+# Built and pushed by .github/workflows/build-runpod-image.yml on tags.
+
+# ---- Base ----------------------------------------------------------------
+# nvidia/cuda:devel because we need nvcc on the pod for ExLlamaV3's JIT
+# C++ extension (compiled the first time exllamav3 is imported, then cached
+# at /root/.cache/torch_extensions).
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+# ---- System ---------------------------------------------------------------
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3-pip \
+        git wget ca-certificates \
+        ninja-build build-essential \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && python -m pip install --upgrade pip
+
+# ---- Python deps ----------------------------------------------------------
+# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.30
+# on this base. Bumping any of these requires re-validating end-to-end on
+# at least one MoE model.
+RUN python -m pip install \
+        "torch==2.6.0" \
+        --index-url https://download.pytorch.org/whl/cu124
+
+RUN python -m pip install \
+        "huggingface-hub>=0.21" \
+        "transformers>=4.40" \
+        "tokenizers>=0.20" \
+        "safetensors>=0.4" \
+        "datasets>=2.0" \
+        "numpy>=1.24" \
+        "Pillow>=10.0" \
+        "marisa-trie>=1.2" \
+        "pydantic==2.11.0" \
+        "kbnf>=0.4.2" \
+        "formatron>=0.5.0" \
+        "rich>=13.0" \
+        "tqdm" \
+        "psutil" \
+        "sentencepiece" \
+        "pyyaml" \
+        "typing_extensions"
+
+# ---- ExLlamaV3 ------------------------------------------------------------
+# Install from PyPI without --no-deps so we get any deps we missed above.
+# Pin the version so the bake is reproducible. Bump on each release after
+# a full validation pass.
+ARG EXLLAMAV3_VERSION=0.0.30
+RUN python -m pip install --no-cache-dir "exllamav3==${EXLLAMAV3_VERSION}"
+
+# ---- Pre-trigger the JIT C++ extension compile ---------------------------
+# ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
+# build time bakes the compiled .so into the image so the pod doesn't pay
+# the ~30s tax on every cold boot. Wrapped in a try so the build still
+# succeeds on a host without GPU access (the actual JIT compile may
+# fail at this stage and re-run on the pod — that's fine, deps are cached).
+RUN python -c "import exllamav3; print('exllamav3 import ok')" \
+    || echo "(JIT skipped at build — will compile on first pod boot)"
+
+# ---- BlockQuant remote entrypoint ----------------------------------------
+RUN mkdir -p /opt/blockquant
+COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
+COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
+RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
+
+# ---- Image metadata ------------------------------------------------------
+LABEL org.opencontainers.image.title="BlockQuant RunPod" \
+      org.opencontainers.image.description="Pre-baked ExLlamaV3 quantization environment for RunPod pods." \
+      org.opencontainers.image.source="https://github.com/Honkware/blockquant" \
+      org.opencontainers.image.licenses="MIT" \
+      blockquant.exllamav3_version="${EXLLAMAV3_VERSION}" \
+      blockquant.torch_version="2.6.0+cu124" \
+      blockquant.cuda_runtime="12.4.1"
+
+# ---- Default workdir + ports ---------------------------------------------
+WORKDIR /workspace
+EXPOSE 22
+
+# Keep the pod alive — RunPod handles SSH key injection via env[PUBLIC_KEY]
+# and starts its own sshd. Our entrypoint just sets up the public key (if
+# present) and then sleeps forever; the local provider SSHes in to drive
+# the quant.
+CMD ["/opt/blockquant/entrypoint.sh"]

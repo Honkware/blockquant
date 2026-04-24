@@ -74,6 +74,7 @@ class RunPodProvider(Provider):
         network_volume_id: str = "",
         data_center_id: str = "",
         install_flash_attn: bool = False,
+        image: str = "",
     ):
         api_key = api_key or os.environ.get("RUNPOD_API_KEY", "")
         if not api_key:
@@ -109,6 +110,10 @@ class RunPodProvider(Provider):
         self._gpu_price_cache: dict[str, float] | None = None
         # Python interpreter inside the pod, discovered during bootstrap.
         self._remote_py: str = "python3"
+        # Override the pod image. When this points at our pre-baked
+        # ghcr.io/honkware/blockquant:* image, bootstrap() short-circuits
+        # to a no-op since every dep is already installed.
+        self.image = image or os.environ.get("BLOCKQUANT_RUNPOD_IMAGE", "")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -118,10 +123,12 @@ class RunPodProvider(Provider):
         rp = _ensure_runpod()
         logger.info(f"Creating RunPod pod with GPU: {self.gpu_type}")
 
-        # RunPod's pytorch base (April 2026 tag scheme).
-        # torch 2.8, CUDA 12.9, Python 3.11, Ubuntu 22.04 — matches exllamav3 v0.0.30.
-        # Bootstrap skips the torch reinstall and uses whatever ships here.
-        image = "runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204"
+        # Image priority:
+        #   1. Explicit override (constructor arg or BLOCKQUANT_RUNPOD_IMAGE env)
+        #   2. Default to RunPod's pytorch base — bootstrap installs everything
+        # When the image is our pre-baked ghcr.io/honkware/blockquant:*, bootstrap
+        # short-circuits because every dep is already installed (see bootstrap()).
+        image = self.image or "runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204"
 
         # Always inject the public key so `start_ssh=True` actually works.
         # (Without PUBLIC_KEY, RunPod's SSH daemon comes up with no authorized_keys.)
@@ -470,6 +477,25 @@ class RunPodProvider(Provider):
         return py
 
     def bootstrap(self, instance_id: str, exllamav3_local_dir: Path | None = None) -> bool:
+        # Pre-baked image short-circuit — every dep is in the image already
+        # and /opt/blockquant/quant.py is in place. Just run the health check
+        # and we're done.
+        if self.image and "blockquant" in self.image.lower():
+            py = self._probe_remote_python(instance_id)
+            logger.info(f"Pre-baked image detected ({self.image}); skipping bootstrap")
+            print(f"      pre-baked image: {self.image}", flush=True)
+            health = self.run(
+                instance_id,
+                f"{py} -c \"import torch, exllamav3; "
+                "print('[gpu]', torch.cuda.get_device_name(0)); "
+                "print('[ok] exllamav3', exllamav3.__version__)\"",
+            )
+            if health["code"] != 0:
+                logger.error(f"Pre-baked health check failed: {health['stderr'][:2000]}")
+                return False
+            logger.info(f"Health check output:\n{health['stdout'].strip()}")
+            return True
+
         # Always probe so run_pipeline has the right interpreter, even on fast-path.
         py = self._probe_remote_python(instance_id)
         # Note whether the selected interpreter already has torch so it's visible in logs.
@@ -630,125 +656,17 @@ class RunPodProvider(Provider):
     # Pipeline — fire-and-forget; progress via tail-log
     # ------------------------------------------------------------------
 
-    _QUANT_SCRIPT = r'''#!/usr/bin/env python3.11
-"""Remote quantization entrypoint. Writes final JSON to RESULT_PATH."""
-import json, os, sys, time, traceback
-from pathlib import Path
+    # Single source of truth: the remote quant script lives at
+    # backend/src/blockquant/remote/quant.py and is read at import time.
+    # Pre-baked Docker images bake the same file at /opt/blockquant/quant.py
+    # so we don't have to SFTP it on every run when using those.
+    _REMOTE_QUANT_PATH = Path(__file__).resolve().parents[1] / "remote" / "quant.py"
+    _BAKED_REMOTE_QUANT = "/opt/blockquant/quant.py"
 
-CONFIG_PATH = "/root/bq-config.json"
-RESULT_PATH = "/root/bq-result.json"
-
-def emit_result(payload: dict):
-    try:
-        with open(RESULT_PATH, "w") as f:
-            json.dump(payload, f)
-    except Exception as e:
-        print(f"[fatal] could not write result: {e}", flush=True)
-
-try:
-    cfg = json.loads(Path(CONFIG_PATH).read_text())
-    model_id = cfg["model_id"]
-    variants = cfg["variants"]
-    hf_token = cfg.get("hf_token", "")
-    hf_org = cfg.get("hf_org", "")
-    head_bits = int(cfg.get("head_bits", 8))
-
-    t0 = time.time()
-    import torch
-    print(f"[gpu] CUDA: {torch.cuda.is_available()} | {torch.cuda.get_device_name(0)} | "
-          f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB", flush=True)
-
-    from huggingface_hub import snapshot_download, HfApi, login as hf_login
-    workspace = Path("/workspace/blockquant")
-    workspace.mkdir(parents=True, exist_ok=True)
-    model_dir = workspace / "model"
-
-    if hf_token:
-        os.environ["HF_TOKEN"] = hf_token
-        hf_login(token=hf_token)
-
-    print(f"[download] {model_id} ...", flush=True)
-    snapshot_download(repo_id=model_id, local_dir=str(model_dir), token=hf_token or None)
-    print("[download] complete", flush=True)
-
-    # Qwen2VL preprocessor shim (same as original)
-    prep = model_dir / "preprocessor_config.json"
-    if not prep.exists():
-        prep.write_text(json.dumps({
-            "size": {"shortest_edge": 56, "longest_edge": 56},
-            "patch_size": 14,
-            "temporal_patch_size": 2,
-            "merge_size": 2,
-            "image_mean": [0.48145466, 0.4578275, 0.40821073],
-            "image_std": [0.26862954, 0.26130258, 0.27577711],
-            "image_processor_type": "Qwen2VLImageProcessorFast",
-        }))
-
-    from exllamav3.conversion.convert_model import parser, main, prepare
-    outputs = []
-    for variant in variants:
-        bpw = float(variant)
-        out_dir = workspace / f"output-{bpw}bpw"
-        work_dir = workspace / f"work-{bpw}"
-        if (out_dir / "config.json").exists():
-            print(f"[skip] {variant} exists at {out_dir}", flush=True)
-            outputs.append({"variant": variant, "path": str(out_dir)})
-            continue
-        print(f"[quantize] {variant} bpw ...", flush=True)
-        old_argv = sys.argv
-        sys.argv = [
-            "convert",
-            "-i", str(model_dir),
-            "-o", str(out_dir),
-            "-w", str(work_dir),
-            "-b", str(bpw),
-            "--head_bits", str(head_bits),
-            "--parallel_mode",
-        ]
-        try:
-            args = parser.parse_args()
-        finally:
-            sys.argv = old_argv
-        in_args, job_state, ok, err = prepare(args)
-        if not ok:
-            emit_result({"status": "failed", "error": f"prepare failed: {err}"})
-            sys.exit(1)
-        main(in_args, job_state)
-        print(f"[quantize] {variant} complete", flush=True)
-        outputs.append({"variant": variant, "path": str(out_dir)})
-
-    if hf_token:
-        print("[upload] to HuggingFace ...", flush=True)
-        api = HfApi(token=hf_token)
-        model_name = model_id.split("/")[-1]
-        # One repo per variant, suffix-encoded: {model}-{bpw}bpw-exl3.
-        # Matches the convention readers expect (bartowski, ArtusDev style)
-        # and makes the HF URL self-describing at a glance.
-        for out in outputs:
-            slug = f"{model_name}-exl3-{out['variant']}bpw"
-            repo_id = f"{hf_org}/{slug}" if hf_org else slug
-            print(f"[upload] {out['variant']} -> {repo_id} ...", flush=True)
-            api.upload_folder(
-                folder_path=out["path"],
-                repo_id=repo_id,
-                repo_type="model",
-            )
-            out["hf_repo_id"] = repo_id
-            out["hf_revision"] = "main"
-            out["hf_url"] = f"https://huggingface.co/{repo_id}"
-        print("[upload] complete", flush=True)
-
-    emit_result({
-        "status": "complete",
-        "outputs": outputs,
-        "total_time": time.time() - t0,
-    })
-    print("[done]", flush=True)
-except Exception as e:
-    traceback.print_exc()
-    emit_result({"status": "failed", "error": f"{type(e).__name__}: {e}"})
-    sys.exit(1)
-'''
+    @classmethod
+    def _load_quant_script(cls) -> bytes:
+        """Read the canonical remote quant script as bytes."""
+        return cls._REMOTE_QUANT_PATH.read_bytes()
 
     def run_pipeline(
         self,
@@ -775,14 +693,25 @@ except Exception as e:
         }
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
 
-        # 2. The quant script itself.
-        self._upload_bytes(instance_id, self._QUANT_SCRIPT.encode("utf-8"), REMOTE_SCRIPT)
-        self.run(instance_id, f"chmod +x {REMOTE_SCRIPT}")
+        # 2. Locate the remote quant script. On pre-baked images it lives
+        # at /opt/blockquant/quant.py; otherwise we SFTP the canonical
+        # source from `remote/quant.py`.
+        check = self.run(
+            instance_id,
+            f"test -f {self._BAKED_REMOTE_QUANT} && echo BAKED || echo MISSING",
+        )
+        if "BAKED" in check["stdout"]:
+            script_path = self._BAKED_REMOTE_QUANT
+            logger.info(f"Using pre-baked quant script at {script_path}")
+        else:
+            script_path = REMOTE_SCRIPT
+            self._upload_bytes(instance_id, self._load_quant_script(), script_path)
+            self.run(instance_id, f"chmod +x {script_path}")
 
         # 3. Fire-and-forget. setsid so the process survives our SSH channel.
         launch_cmd = (
             f"rm -f {REMOTE_RESULT} {REMOTE_LOG} && "
-            f"nohup setsid {self._remote_py} {REMOTE_SCRIPT} "
+            f"nohup setsid {self._remote_py} {script_path} "
             f"> {REMOTE_LOG} 2>&1 < /dev/null & echo $!"
         )
         result = self.run(instance_id, launch_cmd)
