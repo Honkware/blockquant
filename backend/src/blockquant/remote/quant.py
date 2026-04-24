@@ -65,6 +65,10 @@ def main() -> int:
         hf_token: str = cfg.get("hf_token", "")
         hf_org: str = cfg.get("hf_org", "")
         head_bits: int = int(cfg.get("head_bits", 8))
+        # Calibration tunables — fewer rows trades quality for speed.
+        # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
+        cal_rows: int | None = cfg.get("cal_rows")
+        cal_cols: int | None = cfg.get("cal_cols")
 
         t0 = time.time()
 
@@ -109,7 +113,7 @@ def main() -> int:
                 continue
             print(f"[quantize] {variant} bpw ...", flush=True)
             old_argv = sys.argv
-            sys.argv = [
+            argv = [
                 "convert",
                 "-i", str(model_dir),
                 "-o", str(out_dir),
@@ -118,6 +122,11 @@ def main() -> int:
                 "--head_bits", str(head_bits),
                 "--parallel_mode",
             ]
+            if cal_rows is not None:
+                argv += ["--cal_rows", str(int(cal_rows))]
+            if cal_cols is not None:
+                argv += ["--cal_cols", str(int(cal_cols))]
+            sys.argv = argv
             try:
                 args = parser.parse_args()
             finally:

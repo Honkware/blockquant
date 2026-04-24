@@ -62,6 +62,73 @@ class RunPodProvider(Provider):
 
     DEFAULT_SSH_KEY = Path.home() / ".ssh" / "id_rsa"
 
+    # ----- Speedup profiles ----------------------------------------------
+    # Curated sets of (cloud, GPU preference, calibration depth) that the
+    # CLI exposes via --profile. Each preset is a default; any explicit
+    # CLI flag from the user overrides the matching preset value.
+    #
+    # Wall-time / cost columns are rough multipliers vs `balanced` for a
+    # 35B-class MoE — adjust expectations linearly for other model sizes.
+    PROFILES: dict[str, dict] = {
+        "fast": {
+            "cloud_type": "COMMUNITY",
+            "gpu_preference": [
+                "NVIDIA H100 80GB HBM3",
+                "NVIDIA H100 NVL",
+                "NVIDIA H100 PCIe",
+                "NVIDIA A100-SXM4-80GB",
+            ],
+            "cal_rows": 128,
+            "cal_cols": 2048,
+            "_walltime_factor": 0.6,
+            "_cost_factor": 0.7,
+            "_summary": "fewer cal rows, community cloud — quickest cheap run",
+        },
+        "balanced": {
+            "cloud_type": "COMMUNITY",
+            "gpu_preference": [
+                "NVIDIA H100 80GB HBM3",
+                "NVIDIA H100 NVL",
+                "NVIDIA H100 PCIe",
+                "NVIDIA A100-SXM4-80GB",
+            ],
+            "cal_rows": 250,
+            "cal_cols": 2048,
+            "_walltime_factor": 1.0,
+            "_cost_factor": 1.0,
+            "_summary": "default — ExLlamaV3's standard calibration",
+        },
+        "quality": {
+            "cloud_type": "SECURE",
+            "gpu_preference": ["NVIDIA H100 80GB HBM3"],
+            "cal_rows": 512,
+            "cal_cols": 2048,
+            "_walltime_factor": 1.4,
+            "_cost_factor": 1.4,
+            "_summary": "secure cloud + deeper calibration — for the public-facing run you cite as canonical",
+        },
+    }
+
+    @classmethod
+    def resolve_profile(cls, profile: str, **overrides) -> dict:
+        """Merge a named profile with explicit per-knob overrides.
+
+        Returns a dict containing `cloud_type`, `gpu_preference` (list),
+        `cal_rows`, `cal_cols`. Any kwarg in ``overrides`` whose value is
+        not None replaces the profile's value. Unknown profile names
+        raise ``KeyError``.
+        """
+        if profile not in cls.PROFILES:
+            raise KeyError(
+                f"Unknown profile {profile!r}. Available: {', '.join(cls.PROFILES)}"
+            )
+        base = {k: v for k, v in cls.PROFILES[profile].items() if not k.startswith("_")}
+        for k, v in overrides.items():
+            if v is not None and v != "":
+                base[k] = v
+        return base
+
+
     def __init__(
         self,
         api_key: str = "",
@@ -678,19 +745,29 @@ class RunPodProvider(Provider):
         hf_org: str = "",
         head_bits: int = 8,
         use_imatrix: bool = True,
+        cal_rows: int | None = None,
+        cal_cols: int | None = None,
     ) -> dict:
-        """Start the remote quant script in the background. Returns immediately."""
+        """Start the remote quant script in the background. Returns immediately.
+
+        ``cal_rows``/``cal_cols`` override ExLlamaV3's calibration defaults
+        (250 × 2048). Lower values trade quality for speed; see PROFILES.
+        """
         # Reset any cached result from a prior call.
         self._last_result = None
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
-        cfg = {
+        cfg: dict = {
             "model_id": model_id,
             "variants": list(variants),
             "hf_token": hf_token,
             "hf_org": hf_org,
             "head_bits": head_bits,
         }
+        if cal_rows is not None:
+            cfg["cal_rows"] = int(cal_rows)
+        if cal_cols is not None:
+            cfg["cal_cols"] = int(cal_cols)
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
 
         # 2. Locate the remote quant script. On pre-baked images it lives
