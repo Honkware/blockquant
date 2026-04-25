@@ -58,11 +58,14 @@ RUN python -m pip install \
         "typing_extensions"
 
 # ---- ExLlamaV3 ------------------------------------------------------------
-# Install from PyPI without --no-deps so we get any deps we missed above.
-# Pin the version so the bake is reproducible. Bump on each release after
-# a full validation pass.
+# --no-deps mirrors what the bootstrap path does. The previous RUN block
+# already pinned every dep we actually need; including --no-deps here
+# stops pip from pulling flash-attn (which has no pre-built wheel for
+# this torch/CUDA combo and tries to compile from source — fails in CI).
+# Pin the version so the bake is reproducible; bump after each release
+# behind an end-to-end validation pass.
 ARG EXLLAMAV3_VERSION=0.0.30
-RUN python -m pip install --no-cache-dir "exllamav3==${EXLLAMAV3_VERSION}"
+RUN python -m pip install --no-cache-dir --no-deps "exllamav3==${EXLLAMAV3_VERSION}"
 
 # ---- Pre-trigger the JIT C++ extension compile ---------------------------
 # ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
