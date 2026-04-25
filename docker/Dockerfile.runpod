@@ -73,9 +73,9 @@ RUN python -m pip install --no-cache-dir --no-deps "exllamav3==${EXLLAMAV3_VERSI
 # our torch+CUDA combo and source builds fail in CI, so the prior image
 # (which installed exllamav3 with --no-deps and no stub) blew up at
 # `import exllamav3` runtime. The quantization path never invokes
-# flash_attn at runtime — only inference does — so a module-level
-# __getattr__ stub satisfies any current-or-future import without
-# requiring a real CUDA flash-attn build.
+# flash_attn at runtime — only inference does — so this top-level module
+# stub with __getattr__ satisfies the current attribute imports from
+# `flash_attn` without requiring a real CUDA flash-attn build.
 COPY docker/flash_attn_stub.py /tmp/flash_attn_stub.py
 RUN python -c "import sysconfig, shutil, pathlib; \
     dst = pathlib.Path(sysconfig.get_paths()['purelib']) / 'flash_attn.py'; \
