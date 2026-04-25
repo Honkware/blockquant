@@ -67,6 +67,23 @@ RUN python -m pip install \
 ARG EXLLAMAV3_VERSION=0.0.30
 RUN python -m pip install --no-cache-dir --no-deps "exllamav3==${EXLLAMAV3_VERSION}"
 
+# ---- flash_attn import stub ----------------------------------------------
+# exllamav3 0.0.30+ does `from flash_attn import flash_attn_func, ...` at
+# the top of `modules/attn.py`. Real flash-attn has no prebuilt wheel for
+# our torch+CUDA combo and source builds fail in CI, so the prior image
+# (which installed exllamav3 with --no-deps and no stub) blew up at
+# `import exllamav3` runtime. The quantization path never invokes
+# flash_attn at runtime — only inference does — so a module-level
+# __getattr__ stub satisfies any current-or-future import without
+# requiring a real CUDA flash-attn build.
+COPY docker/flash_attn_stub.py /tmp/flash_attn_stub.py
+RUN python -c "import sysconfig, shutil, pathlib; \
+    dst = pathlib.Path(sysconfig.get_paths()['purelib']) / 'flash_attn.py'; \
+    shutil.copyfile('/tmp/flash_attn_stub.py', dst); \
+    print('flash_attn stub ->', dst)" \
+ && python -c "from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func; print('flash_attn stub import OK')" \
+ && rm /tmp/flash_attn_stub.py
+
 # ---- Pre-trigger the JIT C++ extension compile ---------------------------
 # ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
 # build time bakes the compiled .so into the image so the pod doesn't pay
