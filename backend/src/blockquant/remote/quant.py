@@ -47,7 +47,12 @@ def _self_terminate(pod_id: str, api_key: str) -> None:
     """
     import urllib.request
     body = json.dumps({
-        "query": 'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id
+        "query": (
+            "mutation PodTerminate($podId: String!) { "
+            "podTerminate(input: {podId: $podId}) "
+            "}"
+        ),
+        "variables": {"podId": pod_id},
     }).encode("utf-8")
     req = urllib.request.Request(
         f"https://api.runpod.io/graphql?api_key={api_key}",
@@ -209,11 +214,25 @@ def main() -> int:
             key = cfg.get("runpod_api_key", "")
             if pid and key:
                 # Brief grace so the local poll loop has a chance to
-                # scoop bq-result.json before SSH dies. Default poll
-                # interval is 30 s, so this matches one tick.
-                time.sleep(30)
-                print(f"[self-terminate] terminating pod {pid} ...",
-                      flush=True)
+                # scoop bq-result.json before SSH dies.
+                # self_terminate_grace_seconds in the config controls this;
+                # falls back to poll_interval_seconds if set, then 30 s.
+                grace_seconds = cfg.get(
+                    "self_terminate_grace_seconds",
+                    cfg.get("poll_interval_seconds", 30),
+                )
+                try:
+                    grace_seconds = float(grace_seconds)
+                except (TypeError, ValueError):
+                    grace_seconds = 30.0
+                if grace_seconds < 0:
+                    grace_seconds = 30.0
+                time.sleep(grace_seconds)
+                print(
+                    f"[self-terminate] terminating pod {pid} after "
+                    f"{grace_seconds:g}s grace ...",
+                    flush=True,
+                )
                 _self_terminate(pid, key)
             else:
                 print("[self-terminate] skipped (missing pod_id or api_key)",

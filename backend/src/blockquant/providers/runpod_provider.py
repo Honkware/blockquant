@@ -30,13 +30,6 @@ from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Paramiko's transport layer emits WARN-level "Socket exception" /
-# "Error reading SSH protocol banner" lines on every transient TCP reset.
-# Our SSH retry wrappers (run / _get_pod_resilient / _sftp_put_with_retry)
-# handle those transparently — surfacing them only adds noise to the
-# dashboard ledger. Real ERROR-level paramiko output still passes through.
-logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
-
 # Lazy imports so the module loads without SDKs present.
 _runpod = None
 _paramiko = None
@@ -189,6 +182,12 @@ class RunPodProvider(Provider):
         # ghcr.io/honkware/blockquant:* image, bootstrap() short-circuits
         # to a no-op since every dep is already installed.
         self.image = image or os.environ.get("BLOCKQUANT_RUNPOD_IMAGE", "")
+        # Suppress Paramiko's WARN-level transient TCP messages (Socket
+        # exception, Error reading SSH protocol banner). The SSH retry
+        # wrappers in run() / _get_pod_resilient() handle reconnects
+        # transparently; surfacing them only adds noise to the dashboard
+        # ledger. Real ERROR-level output still passes through.
+        logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     # ------------------------------------------------------------------
     # Lifecycle

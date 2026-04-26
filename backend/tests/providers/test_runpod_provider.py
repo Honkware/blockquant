@@ -1,6 +1,7 @@
 """Unit tests for RunPodProvider."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -393,6 +394,76 @@ def test_run_pipeline_is_non_blocking(mock_ensure_rp, mock_ensure_pk, mock_ssh_k
     # The launch command must use nohup + background.
     launched = [c for c in mock_client.exec_command.call_args_list if "nohup" in str(c)]
     assert launched, "expected a nohup-based launch command"
+
+
+def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """Helper: wire SSH + SFTP mocks and return (provider, mock_client)."""
+    mock_rp = MagicMock()
+    mock_rp.get_pod.return_value = _running_pod_with_ssh()
+    mock_rp.api_key = "test-api-key"
+    mock_ensure_rp.return_value = mock_rp
+    mock_client = _mock_ssh_exec(mock_ensure_pk, exit_code=0, stdout=b"12345\n")
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_sftp.file.return_value.__enter__ = MagicMock(return_value=mock_file)
+    mock_sftp.file.return_value.__exit__ = MagicMock(return_value=False)
+    mock_client.open_sftp.return_value = mock_sftp
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    return provider, mock_client
+
+
+@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+@patch("blockquant.providers.runpod_provider._ensure_runpod")
+def test_run_pipeline_config_contains_pod_and_key(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """Config JSON must include pod_id, runpod_api_key, and keep_pod."""
+    provider, _ = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key
+    )
+    uploaded: dict[str, bytes] = {}
+
+    def _capture(instance_id, data, remote_path):
+        uploaded[remote_path] = data
+
+    with patch.object(provider, "_upload_bytes", side_effect=_capture):
+        result = provider.run_pipeline(
+            instance_id="pod-abc123",
+            model_id="foo/bar",
+            format="exl3",
+            variants=["4.5"],
+            hf_token="tok",
+        )
+
+    assert result["status"] == "started"
+    assert "/root/bq-config.json" in uploaded, "bq-config.json not uploaded"
+    cfg = json.loads(uploaded["/root/bq-config.json"])
+    assert cfg["pod_id"] == "pod-abc123"
+    assert "runpod_api_key" in cfg
+    assert cfg["keep_pod"] is False
+
+
+@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+@patch("blockquant.providers.runpod_provider._ensure_runpod")
+def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """keep_pod=True must propagate into the uploaded config JSON."""
+    provider, _ = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key
+    )
+    uploaded: dict[str, bytes] = {}
+
+    def _capture(instance_id, data, remote_path):
+        uploaded[remote_path] = data
+
+    with patch.object(provider, "_upload_bytes", side_effect=_capture):
+        provider.run_pipeline(
+            instance_id="pod-abc123",
+            model_id="foo/bar",
+            format="exl3",
+            variants=["4.5"],
+            keep_pod=True,
+        )
+
+    cfg = json.loads(uploaded["/root/bq-config.json"])
+    assert cfg["keep_pod"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 ---
-license: other
+license: {{LICENSE}}
 base_model: {{BASE_REPO}}
 base_model_relation: quantized
 quantized_by: blockblockblock

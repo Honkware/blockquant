@@ -4,7 +4,7 @@
 Run this AFTER an ``[upload] complete`` event for ``--bpw <X.X>``. It:
 
   1. Queries HuggingFace for the actual repo size (no more guessing).
-  2. Renders the card from ``backend/logs/_card_template.md``, building
+  2. Renders the card from ``backend/templates/card_template.md``, building
      the Quants table dynamically from which sibling repos exist on HF.
   3. Pushes the card + coerces ``quantization_config.bits`` to int via
      ``fix_repo_card_and_config.py --card-file``.

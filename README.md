@@ -124,9 +124,10 @@ pipeline directly. Requires a CUDA-capable NVIDIA GPU and the ExLlamaV3 clone
 already on disk.
 
 ```bash
-./backend/venv/bin/python -m blockquant.pipeline run \
+./backend/venv/bin/python -m blockquant \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --bpw 4.5 \
+  --format exl3 \
+  --variants 4.5 \
   --provider local
 ```
 
