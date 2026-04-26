@@ -175,12 +175,16 @@ def main():
         print()
         return
 
-    # Header line consumed by log_dashboard.py's parser.
-    print(
+    # Header line consumed by log_dashboard.py's parser. Skip the hf_org
+    # field entirely when unset so the dashboard doesn't render the literal
+    # placeholder "(personal)" as if it were a real account name.
+    header = (
         f"[job] model={args.model} variants={args.variants} format=exl3 "
-        f"head_bits={args.head_bits} hf_org={args.hf_org or '(personal)'}",
-        flush=True,
+        f"head_bits={args.head_bits}"
     )
+    if args.hf_org:
+        header += f" hf_org={args.hf_org}"
+    print(header, flush=True)
 
     gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
@@ -256,6 +260,7 @@ def main():
             head_bits=args.head_bits,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
+            keep_pod=args.keep_pod,
         )
         if launch_result.get("status") != "started":
             print(f"ERROR: run_pipeline failed: {launch_result}")

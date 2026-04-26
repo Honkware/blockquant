@@ -20,6 +20,7 @@ Requirements:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -28,6 +29,13 @@ from blockquant.providers.base import Provider
 from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Paramiko's transport layer emits WARN-level "Socket exception" /
+# "Error reading SSH protocol banner" lines on every transient TCP reset.
+# Our SSH retry wrappers (run / _get_pod_resilient / _sftp_put_with_retry)
+# handle those transparently — surfacing them only adds noise to the
+# dashboard ledger. Real ERROR-level paramiko output still passes through.
+logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
 # Lazy imports so the module loads without SDKs present.
 _runpod = None
@@ -747,6 +755,7 @@ class RunPodProvider(Provider):
         use_imatrix: bool = True,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
+        keep_pod: bool = False,
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -757,12 +766,18 @@ class RunPodProvider(Provider):
         self._last_result = None
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
+        # pod_id + runpod_api_key + keep_pod let the in-pod script
+        # self-terminate after [done] without depending on the local
+        # poll loop being alive — see remote/quant.py:_self_terminate.
         cfg: dict = {
             "model_id": model_id,
             "variants": list(variants),
             "hf_token": hf_token,
             "hf_org": hf_org,
             "head_bits": head_bits,
+            "pod_id": instance_id,
+            "runpod_api_key": _ensure_runpod().api_key or "",
+            "keep_pod": bool(keep_pod),
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)

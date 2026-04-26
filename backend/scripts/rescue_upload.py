@@ -14,9 +14,13 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
+
+# Silence paramiko's transient WARN-level reconnects (handled by retry layer).
+logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
 from dotenv import load_dotenv
 

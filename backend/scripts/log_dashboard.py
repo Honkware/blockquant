@@ -24,6 +24,7 @@ import asyncio
 import json
 import re
 import secrets
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,31 @@ import uvicorn
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG = REPO_ROOT / "backend" / "logs" / "runpod-qwen35b-4.5.log"
 
+# Mutable at startup — populated by main() from --log / --logs-dir.
+JOB_LOGS: dict[str, Path] = {}
+LOGS_DIR: Path | None = None
+LOG_PATTERN: str = "runpod-*.log"
+
 SESSION_ID = "-".join(f"{secrets.randbelow(10000):04d}" for _ in range(5))
+
+
+def _derive_job_id(log_path: Path) -> str:
+    """Job ID from log filename. `runpod-qwen35b-4.0.log` -> `qwen35b-4.0`.
+    Falls back to the bare stem if the prefix isn't present."""
+    stem = log_path.stem  # strips .log
+    return stem[7:] if stem.startswith("runpod-") else stem
+
+
+def _discover_logs() -> dict[str, Path]:
+    """Build the live job → log map. Returns explicitly-passed --log entries
+    plus any new ones in --logs-dir matching --log-pattern. Re-evaluated each
+    request so newly-created log files appear without a dashboard restart."""
+    out: dict[str, Path] = dict(JOB_LOGS)
+    if LOGS_DIR and LOGS_DIR.is_dir():
+        for p in sorted(LOGS_DIR.glob(LOG_PATTERN)):
+            jid = _derive_job_id(p)
+            out.setdefault(jid, p)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +132,10 @@ RULES: list[tuple[str, str, re.Pattern, Callable[[re.Match, str], dict] | None]]
     ("ETA",     "info", _r(r" -- Estimated remaining time:\s*(?P<eta>.+)"), None),
     ("CREATE_DIR", "info", _r(r" -- Creating directory\s*(?P<dir>\S+)"), None),
 
-    # Network / SSH errors
-    ("NET_RESET", "warn",
+    # Network / SSH transient hiccups — handled by the retry layer in
+    # RunPodProvider. Severity is "info" because they're normal-operation
+    # events; the parser also drops them from the visible Ledger stream.
+    ("NET_RESET", "info",
         _r(r"connection (?:reset|aborted|forcibly closed)|10054|EOFError|Server connection dropped"), None),
     ("RETRY",     "warn", _r(r"transient error, retry\s+(?P<n>\d+)/\d+"), None),
 
@@ -212,7 +239,10 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                 state["variants"] = fields.get("variants", "")
                 state["format"] = fields.get("format", "exl3")
                 state["head_bits"] = fields.get("head_bits", "") or ""
-                state["hf_org"] = fields.get("hf_org", "") or ""
+                # Treat the legacy "(personal)" placeholder as empty so the
+                # predicted URL doesn't render literal parens as an org.
+                hf_org_raw = fields.get("hf_org", "") or ""
+                state["hf_org"] = "" if hf_org_raw == "(personal)" else hf_org_raw
             elif kind == "GPU_TRY":
                 state["iteration_count"] += 1
                 try: state["cost_per_hr"] = float(fields.get("rate") or 0.0)
@@ -250,7 +280,22 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                     state["stage"] = "quantizing"
             elif kind == "UPLOAD":
                 state["upload_started"] = True
-                state["stage"] = "uploading"
+                msg = (fields.get("msg") or "")
+                # Catch "[upload] {variant} -> {org}/{repo} ..." — the
+                # repo_id is known the moment upload begins, so we can
+                # populate hf_url even if the trailing URL line never
+                # flushed (older quant.py builds didn't echo it).
+                m = re.search(r"->\s*([A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+)", msg)
+                if m:
+                    state["hf_url"] = f"https://huggingface.co/{m.group(1)}"
+                    # The upload line is authoritative — overwrite any
+                    # placeholder org that may have been parsed from the
+                    # [job] header so predicted_hf_url stops rendering it.
+                    state["hf_org"] = m.group(1).split("/")[0]
+                if "complete" in msg.lower():
+                    state["stage"] = "complete"
+                elif state["stage"] != "complete":
+                    state["stage"] = "uploading"
             elif kind == "HF_URL":
                 state["hf_url"] = fields.get("url", "")
                 state["stage"] = "complete"
@@ -295,8 +340,10 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                     state["stage"] = "terminated"
 
             # Only record one event per line — first matching rule wins.
-            # Filter QUANT_TENSOR out of the visible events stream (would be 50k+).
-            if kind not in ("QUANT_TENSOR",):
+            # Filter QUANT_TENSOR (50k+ noise) and NET_RESET (handled by
+            # the retry layer; only adds ledger spam) out of the visible
+            # events stream. They still affect state/stats above.
+            if kind not in ("QUANT_TENSOR", "NET_RESET"):
                 events.append(Event(kind=kind, severity=sev, message=line.strip(),
                                     line_no=ln_no, fields=fields))
             break
@@ -349,18 +396,24 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
     if state["model_id"]:
         state["source_hf_url"] = f"https://huggingface.co/{state['model_id']}"
         basename = state["model_id"].split("/")[-1]
-        org_or_user = state["hf_org"] or "{your-account}"
-        # Use the first declared variant for the predicted URL.
-        variant = (state["variants"].split(",")[0].strip()
-                   if state["variants"] else "")
-        if variant:
-            state["predicted_hf_url"] = (
-                f"https://huggingface.co/{org_or_user}/{basename}-{state['format']}-{variant}bpw"
-            )
+        # Only emit predicted_hf_url when the real namespace is known.
+        # Otherwise the dashboard would render "{your-account}/..." for
+        # the entire pre-upload window (~3 hours).
+        if state["hf_org"]:
+            variant = (state["variants"].split(",")[0].strip()
+                       if state["variants"] else "")
+            if variant:
+                state["predicted_hf_url"] = (
+                    f"https://huggingface.co/{state['hf_org']}/"
+                    f"{basename}-{state['format']}-{variant}bpw"
+                )
+            else:
+                state["predicted_hf_url"] = (
+                    f"https://huggingface.co/{state['hf_org']}/"
+                    f"{basename}-{state['format']}"
+                )
         else:
-            state["predicted_hf_url"] = (
-                f"https://huggingface.co/{org_or_user}/{basename}-{state['format']}"
-            )
+            state["predicted_hf_url"] = ""
     else:
         state["source_hf_url"] = ""
         state["predicted_hf_url"] = ""
@@ -411,15 +464,87 @@ def _payload(path: Path, tail_n: int = 60) -> dict:
     }
 
 
+_balance_cache: dict = {"value": None, "fetched_at": 0.0}
+
+
+def _runpod_balance() -> dict | None:
+    """Fetch RunPod credit balance + current burn rate.
+    Cached for 60 s so we don't hammer the GraphQL endpoint on every
+    SSE tick. Returns ``None`` if unfetchable so the UI shows '—'."""
+    if time.time() - _balance_cache["fetched_at"] < 60:
+        return _balance_cache["value"]
+    try:
+        import os as _os
+        api_key = _os.environ.get("RUNPOD_API_KEY", "")
+        if not api_key:
+            # Lazy dotenv load — only needed if launched without the
+            # env already populated (rare, but defensive).
+            try:
+                from dotenv import load_dotenv as _ld
+                _ld(REPO_ROOT / ".env", override=False)
+                api_key = _os.environ.get("RUNPOD_API_KEY", "")
+            except Exception:
+                pass
+        if not api_key:
+            _balance_cache["value"] = None
+        else:
+            import runpod as _rp
+            from runpod.api.graphql import run_graphql_query
+            _rp.api_key = api_key
+            q = "query myself { myself { clientBalance currentSpendPerHr } }"
+            r = run_graphql_query(q)
+            me = ((r or {}).get("data", {}) or {}).get("myself", {}) or {}
+            _balance_cache["value"] = {
+                "balance": me.get("clientBalance"),
+                "spend_per_hr": me.get("currentSpendPerHr"),
+            }
+    except Exception as e:
+        _balance_cache["value"] = {"error": str(e)[:120]}
+    _balance_cache["fetched_at"] = time.time()
+    return _balance_cache["value"]
+
+
+def _multi_payload(tail_n: int = 60) -> dict:
+    """Build a payload covering every known job. Single-job mode returns a
+    shape that's a strict superset of the single-payload format (state/stats/
+    events/tail mirror the default job), so old clients keep working."""
+    jobs_map = _discover_logs() or {_derive_job_id(DEFAULT_LOG): DEFAULT_LOG}
+    jobs: dict[str, dict] = {}
+    mtimes: dict[str, float] = {}
+    for jid, path in jobs_map.items():
+        jobs[jid] = _payload(path, tail_n=tail_n)
+        try:
+            mtimes[jid] = path.stat().st_mtime
+        except FileNotFoundError:
+            mtimes[jid] = 0.0
+    # Default = the most recently-active job. Falls back to first key when
+    # nothing has been written yet.
+    default_id = (max(mtimes, key=mtimes.get) if mtimes else next(iter(jobs)))
+    base = jobs[default_id]
+    return {
+        "session_id": SESSION_ID,
+        "state": base["state"],
+        "stats": base["stats"],
+        "events": base["events"],
+        "tail": base["tail"],
+        "jobs": jobs,
+        "default_job_id": default_id,
+        "job_mtimes": mtimes,
+        "runpod_balance": _runpod_balance(),
+    }
+
+
 @app.get("/api/payload")
 async def api_payload(log: str = "", tail: int = 60):
-    path = Path(log) if log else DEFAULT_LOG
-    return JSONResponse(_payload(path, tail_n=tail))
+    if log:
+        # Explicit single-log request — preserve old single-payload shape.
+        return JSONResponse(_payload(Path(log), tail_n=tail))
+    return JSONResponse(_multi_payload(tail_n=tail))
 
 
 @app.get("/stream")
 async def stream(request: Request, log: str = ""):
-    path = Path(log) if log else DEFAULT_LOG
+    explicit_path = Path(log) if log else None
 
     async def gen():
         while True:
@@ -427,8 +552,9 @@ async def stream(request: Request, log: str = ""):
                 break
             # Always send the full payload — the server-derived runtime/spend
             # values change every second based on file mtime, and bandwidth here
-            # is trivial (~5 KB/event).
-            payload = _payload(path)
+            # is trivial (~5 KB/event × N jobs).
+            payload = (_payload(explicit_path) if explicit_path
+                       else _multi_payload())
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(2)
 
@@ -546,6 +672,153 @@ HTML = r"""<!doctype html>
     font-weight: 400;
     color: var(--vermillion);
     font-variation-settings: "opsz" 60, "SOFT" 30;
+  }
+  .balance-chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: var(--ink);
+    background: var(--paper-warm);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 2px 8px;
+    margin-bottom: 2px;
+  }
+  .balance-chip.warn { color: var(--vermillion); border-color: var(--vermillion-d); }
+  .balance-burn {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-mute);
+    margin-left: 6px;
+    letter-spacing: 0.04em;
+  }
+  .balance-burn.live { color: var(--sage); }
+
+  /* ===== FLEET STRIP — top-of-page summary across N jobs ===== */
+  .fleet-strip {
+    display: flex;
+    align-items: stretch;
+    gap: 12px;
+    padding: 0 0 18px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--rule);
+    overflow-x: auto;
+  }
+  .fleet-strip-label {
+    flex: 0 0 auto;
+    font-family: var(--mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    color: var(--ink-mute);
+    padding: 14px 12px 0 0;
+    border-right: 1px solid var(--rule-soft);
+    align-self: stretch;
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    text-align: center;
+  }
+  .fleet-strip-items {
+    display: flex;
+    gap: 10px;
+    flex: 1;
+  }
+  .fleet-item {
+    flex: 0 0 220px;
+    background: var(--paper-warm);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--rule);
+    padding: 10px 12px 8px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, transform 0.12s;
+    position: relative;
+    font-family: var(--mono);
+  }
+  .fleet-item:hover {
+    background: var(--paper-raised);
+    border-color: var(--ink-mute);
+  }
+  .fleet-item.selected {
+    background: var(--paper-raised);
+    border-left-color: var(--vermillion);
+    border-color: var(--ink-mute);
+  }
+  .fleet-item.stale {
+    opacity: 0.55;
+  }
+  .fleet-item.complete {
+    border-left-color: var(--sage);
+  }
+  .fleet-item.failed {
+    border-left-color: var(--vermillion-d);
+  }
+  .fleet-item-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .fleet-item-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--ink);
+    letter-spacing: 0.04em;
+  }
+  .fleet-item-pct {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .fleet-item-pips {
+    display: inline-flex;
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .fleet-item-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--rule);
+    transition: background 0.3s ease;
+  }
+  .fleet-item-pip.active {
+    background: var(--vermillion);
+    box-shadow: 0 0 6px rgba(198, 48, 16, 0.6);
+  }
+  .fleet-item-pip.done {
+    background: var(--sage);
+  }
+  .fleet-item-pip.bad {
+    background: var(--vermillion-d);
+  }
+  .fleet-item-meta {
+    margin-top: 6px;
+    font-size: 10px;
+    color: var(--ink-mute);
+    letter-spacing: 0.04em;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .fleet-item-bar {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 2px;
+    background: var(--rule-soft);
+    overflow: hidden;
+  }
+  .fleet-item-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--vermillion);
+    width: 0%;
+    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .fleet-item.complete .fleet-item-bar > span {
+    background: var(--sage);
   }
 
   /* ===== HERO BAND ===== */
@@ -729,6 +1002,19 @@ HTML = r"""<!doctype html>
     width: 100%;
     height: auto;
     image-rendering: pixelated;
+  }
+  /* Smooth fade between cell colours instead of instant flips. */
+  .matrix-svg rect {
+    transition: fill 350ms ease-out;
+  }
+  /* Tactile easing on the progress bar fill. */
+  .progress-fill {
+    transition: width 600ms cubic-bezier(0.4, 0, 0.2, 1) !important;
+  }
+  /* Subtle pulse when a counter just bumped (added/removed by JS tween) */
+  .counter-bumping {
+    text-shadow: 0 0 12px rgba(255, 69, 37, 0.35);
+    transition: text-shadow 200ms ease-out;
   }
 
   .matrix-caption {
@@ -951,10 +1237,18 @@ HTML = r"""<!doctype html>
     </div>
     <h1 class="masthead-title">Block<em>Quant</em></h1>
     <div class="masthead-right">
-      Vol. I · No. <b><span id="iter-count">—</span></b><br>
+      <span id="rp-balance" class="balance-chip" title="RunPod credit balance">Balance —</span>
+      <span id="rp-burn" class="balance-burn"></span><br>
+      Vol. I · No. <b><span id="iter-count">—</span></b> &nbsp;·&nbsp;
       <span id="session-id-short">SESSION __SESSION__</span>
     </div>
   </header>
+
+  <!-- FLEET STRIP — only shown when 2+ jobs are tracked -->
+  <nav class="fleet-strip" id="fleet-strip" hidden>
+    <div class="fleet-strip-label">Fleet</div>
+    <div class="fleet-strip-items" id="fleet-strip-items"></div>
+  </nav>
 
   <!-- HERO — model + URLs + one-line stage indicator -->
   <section class="hero" id="hero" hidden>
@@ -1192,8 +1486,16 @@ const COLORS = {
   done:    "#7faf94",
 };
 
+// Repaint the matrix in row-stagger via rAF so the browser yields between
+// transformer-block rows. With CSS `transition: fill` on each rect the
+// effect is a smooth row-by-row settle, not a flash of all 12k cells.
+let _paintToken = 0;
 function paintMatrix(currentLayer, currentExpert) {
-  for (let L = 0; L < TOTAL_LAYERS; L++) {
+  const myToken = ++_paintToken;
+  let L = 0;
+  function paintRow() {
+    if (myToken !== _paintToken) return;   // superseded by a newer paint
+    if (L >= TOTAL_LAYERS) return;
     for (let E = 0; E < EXPERTS_PER_LAYER; E++) {
       let color;
       if (currentLayer == null) color = COLORS.pending;
@@ -1203,9 +1505,13 @@ function paintMatrix(currentLayer, currentExpert) {
         else if (currentExpert != null && E === currentExpert) color = COLORS.active;
         else color = COLORS.pending;
       } else color = COLORS.pending;
-      cells[L][E].setAttribute("fill", color);
+      const cell = cells[L][E];
+      if (cell.getAttribute("fill") !== color) cell.setAttribute("fill", color);
     }
+    L++;
+    requestAnimationFrame(paintRow);
   }
+  requestAnimationFrame(paintRow);
 }
 
 function setStage(id, state) {
@@ -1222,6 +1528,48 @@ function setStage(id, state) {
       state === "bad" ? "✕" : "○";
   }
 }
+
+// ===== Smooth numeric counter tween =====
+// Interpolates element textContent from oldValue → newValue over `duration`
+// using ease-out-cubic. Stores the live value on the element so successive
+// updates pick up where the previous tween left off.
+const _activeTweens = new Map();    // elementId → rAF id
+function tweenNumber(elId, toValue, duration = 1500, formatter = null) {
+  const el = $(elId);
+  if (!el) return;
+  const fromValue = parseFloat(el.dataset.tweenValue ?? "NaN");
+  const target = Number(toValue);
+  if (!Number.isFinite(target)) return;
+  // First-ever set OR no change: just write it directly.
+  if (!Number.isFinite(fromValue) || fromValue === target) {
+    el.dataset.tweenValue = String(target);
+    el.textContent = formatter ? formatter(target) : target.toLocaleString();
+    return;
+  }
+  // Cancel any in-flight tween on this element.
+  if (_activeTweens.has(elId)) cancelAnimationFrame(_activeTweens.get(elId));
+  const t0 = performance.now();
+  const delta = target - fromValue;
+  const ease = t => 1 - Math.pow(1 - t, 3);   // ease-out-cubic
+  el.classList.add("counter-bumping");
+  function step(now) {
+    const t = Math.min(1, (now - t0) / duration);
+    const v = fromValue + delta * ease(t);
+    el.textContent = formatter ? formatter(v) : Math.round(v).toLocaleString();
+    if (t < 1) {
+      _activeTweens.set(elId, requestAnimationFrame(step));
+    } else {
+      el.dataset.tweenValue = String(target);
+      el.textContent = formatter ? formatter(target) : target.toLocaleString();
+      _activeTweens.delete(elId);
+      setTimeout(() => el.classList.remove("counter-bumping"), 200);
+    }
+  }
+  _activeTweens.set(elId, requestAnimationFrame(step));
+}
+const fmtPct = v => v.toFixed(1) + "%";
+const fmtDur = v => fmtDuration(v);
+const fmtDollar = v => "$" + v.toFixed(2);
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
@@ -1248,9 +1596,238 @@ function renderEvent(e, idx) {
   </tr>`;
 }
 
+// Multi-job selection state — survives across SSE ticks. URL ?job=ID wins.
+let selectedJobId = (params.get("job") || "").trim() || null;
+let lastRenderedJobId = null;
+// Per-tick cache of the entire payload so click handlers can pull the
+// freshest snapshot for the tile they're switching to (instead of the
+// stale closure they captured at element-creation time).
+let latestPayload = null;
+
+function resetDetailPanel() {
+  // Wipe ONLY the fields that genuinely belong to the prior job.
+  // Hero, pod-info, runtime/spend etc. are re-set unconditionally by
+  // renderDetail when the new payload has the data, so leaving them
+  // alone here means an init tile renders what it knows immediately
+  // (model name, predicted URL, pod-id) rather than blinking through
+  // a "—" frame.
+  $("hf-out").innerHTML = `<span class="output-pending">— awaiting upload —</span>`;
+  ["layer", "expert", "tensors"].forEach(id => {
+    const el = $(id); if (el) el.textContent = "—";
+  });
+  $("eta").textContent = "—";
+  $("eta").style.color = "";
+  $("bar-pct").textContent = "0%";
+  ["st-bootstrap", "st-download", "st-quantize", "st-upload"].forEach(id => {
+    const el = $(id);
+    if (el) el.classList.remove("active", "done", "bad");
+  });
+  $("errs").innerHTML = "";
+  $("events").innerHTML = "";
+  $("events-meta").textContent = "0 entries";
+  $("sev-meta").textContent = "no alerts";
+  lastSeenEvents = 0;
+}
+
+function deriveLabel(jobId, jobPayload) {
+  const ms = jobPayload && jobPayload.state ? jobPayload.state.model_id : "";
+  const variants = jobPayload && jobPayload.state ? jobPayload.state.variants : "";
+  if (variants) {
+    const base = ms ? ms.split("/").pop().slice(0, 14) : jobId;
+    return `${base} · ${variants} bpw`;
+  }
+  return jobId;
+}
+
+function jobStageClass(s) {
+  if (!s) return null;
+  if (s.terminated && !s.hf_url) return "failed";
+  if (s.stage === "complete" || s.hf_url) return "complete";
+  return null;
+}
+
+function jobPctOf(s) {
+  if (!s) return 0;
+  if (s.stage === "complete" || s.hf_url) return 100;
+  // Heuristic: bootstrap=5, download=15, quantize=15→85 by layer, upload=85→99.
+  if (s.upload_started) return 92;
+  if (s.current_layer && s.max_layer_observed) {
+    const total = Math.max(s.max_layer_observed + 1, 48);
+    const ratio = Math.min(s.current_layer / total, 0.95);
+    return Math.round(15 + ratio * 70);
+  }
+  if (s.download_done) return 18;
+  if (s.download_started) return 8;
+  if (s.bootstrap_complete_at) return 5;
+  return 1;
+}
+
+function jobETA(s, st) {
+  if (!s) return "";
+  if (s.stage === "complete" || s.hf_url) return "complete";
+  if (s.eta) return s.eta;
+  if (s.upload_started) return "uploading";
+  if (s.download_started && !s.download_done) return "downloading";
+  if (s.bootstrap_complete_at) return "starting";
+  return "init";
+}
+
+function renderFleetStrip(p) {
+  const jobs = p.jobs || null;
+  const strip = $("fleet-strip");
+  // Only show strip when there are 2+ jobs.
+  if (!jobs || Object.keys(jobs).length < 2) {
+    strip.hidden = true;
+    return p;  // pass through default state for detail render
+  }
+  strip.hidden = false;
+
+  const ids = Object.keys(jobs).sort();
+  if (!selectedJobId || !jobs[selectedJobId]) {
+    selectedJobId = p.default_job_id || ids[0];
+  }
+
+  const items = $("fleet-strip-items");
+  const existing = new Map(
+    Array.from(items.children).map(el => [el.dataset.jobId, el])
+  );
+
+  const now = Date.now() / 1000;
+  ids.forEach(jid => {
+    const jp = jobs[jid];
+    const s = jp.state || {};
+    const mtime = (p.job_mtimes && p.job_mtimes[jid]) || 0;
+    const stale = mtime > 0 && (now - mtime) > 300;
+    const stageClass = jobStageClass(s);
+    const pct = jobPctOf(s);
+
+    let el = existing.get(jid);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "fleet-item";
+      el.dataset.jobId = jid;
+      el.addEventListener("click", () => {
+        if (jid === selectedJobId) return;
+        selectedJobId = jid;
+        const url = new URL(window.location);
+        url.searchParams.set("job", jid);
+        history.replaceState(null, "", url.toString());
+        // Apply selection visually.
+        document.querySelectorAll(".fleet-item").forEach(n =>
+          n.classList.toggle("selected", n.dataset.jobId === jid));
+        // Wipe stale detail fields, then re-render from the FRESHEST
+        // snapshot (latestPayload), not the stale closure-captured one.
+        resetDetailPanel();
+        lastRenderedJobId = jid;
+        const fresh = (latestPayload && latestPayload.jobs
+                       && latestPayload.jobs[jid]) || jobs[jid];
+        renderDetail(fresh);
+      });
+      el.innerHTML = `
+        <div class="fleet-item-row">
+          <span class="fleet-item-label"></span>
+          <span class="fleet-item-pct"></span>
+        </div>
+        <div class="fleet-item-pips">
+          <span class="fleet-item-pip" data-stage="bootstrap"></span>
+          <span class="fleet-item-pip" data-stage="download"></span>
+          <span class="fleet-item-pip" data-stage="quantize"></span>
+          <span class="fleet-item-pip" data-stage="upload"></span>
+        </div>
+        <div class="fleet-item-meta">
+          <span class="fleet-item-eta"></span>
+          <span class="fleet-item-tag"></span>
+        </div>
+        <div class="fleet-item-bar"><span></span></div>
+      `;
+      items.appendChild(el);
+    }
+
+    el.classList.toggle("selected", jid === selectedJobId);
+    el.classList.toggle("stale", stale);
+    el.classList.toggle("complete", stageClass === "complete");
+    el.classList.toggle("failed", stageClass === "failed");
+
+    el.querySelector(".fleet-item-label").textContent = deriveLabel(jid, jp);
+    el.querySelector(".fleet-item-pct").textContent = `${pct}%`;
+    el.querySelector(".fleet-item-eta").textContent = jobETA(s);
+    el.querySelector(".fleet-item-tag").textContent = jid;
+    el.querySelector(".fleet-item-bar > span").style.width = `${pct}%`;
+
+    // Stage pips: bootstrap → download → quantize → upload.
+    const pipStates = {
+      bootstrap: s.bootstrap_complete_at ? "done"
+                 : (s.pod_id ? "active" : null),
+      download:  s.download_done ? "done"
+                 : (s.download_started ? "active" : null),
+      quantize:  (s.upload_started || s.hf_url) ? "done"
+                 : (s.tensors_quantized > 0 ? "active" : null),
+      upload:    s.hf_url ? "done" : (s.upload_started ? "active" : null),
+    };
+    // Completion override: a finished run gets all pips green even if
+    // the parser missed an earlier "complete" line in an old log file.
+    const completed = s.stage === "complete" || !!s.hf_url;
+    if (completed) {
+      pipStates.bootstrap = "done";
+      pipStates.download  = "done";
+      pipStates.quantize  = "done";
+      pipStates.upload    = "done";
+    }
+    if (s.terminated && !s.hf_url) pipStates.quantize = "bad";
+    el.querySelectorAll(".fleet-item-pip").forEach(pip => {
+      const stage = pip.dataset.stage;
+      pip.classList.remove("active", "done", "bad");
+      if (pipStates[stage]) pip.classList.add(pipStates[stage]);
+    });
+  });
+
+  // Return the selected job's payload for the detail view to consume.
+  return jobs[selectedJobId];
+}
+
+function renderRunpodBalance(p) {
+  const b = p && p.runpod_balance;
+  const chip = $("rp-balance");
+  const burn = $("rp-burn");
+  if (!chip || !burn) return;
+  if (!b || b.error || b.balance == null) {
+    chip.textContent = "Balance —";
+    chip.classList.remove("warn");
+    burn.textContent = b && b.error ? "(api err)" : "";
+    burn.classList.remove("live");
+    return;
+  }
+  const bal = Number(b.balance) || 0;
+  chip.textContent = `Balance $${bal.toFixed(2)}`;
+  chip.classList.toggle("warn", bal < 25);
+  const spend = Number(b.spend_per_hr) || 0;
+  if (spend > 0.001) {
+    burn.textContent = `· $${spend.toFixed(2)}/hr`;
+    burn.classList.add("live");
+  } else {
+    burn.textContent = "· idle";
+    burn.classList.remove("live");
+  }
+}
+
 function update(p) {
   if (p.heartbeat) return;
+  latestPayload = p;
+  renderRunpodBalance(p);
+  // Multi-job mode: render strip and pull the selected job's payload.
+  // Single-job mode: strip stays hidden, payload passed through.
+  const detailPayload = renderFleetStrip(p) || p;
+  // Reset the panel on job switch so we don't inherit the previous job's
+  // hf_url, pod info, or events.
+  if (selectedJobId !== lastRenderedJobId) {
+    resetDetailPanel();
+    lastRenderedJobId = selectedJobId;
+  }
+  renderDetail(detailPayload);
+}
 
+function renderDetail(p) {
+  if (!p || p.heartbeat) return;
   const s = p.state, st = p.stats || {};
 
   // Apply URL overrides (for jobs whose log doesn't carry the [job] header)
@@ -1308,12 +1885,12 @@ function update(p) {
     $("pod-rate").classList.remove("dim");
   }
 
-  // Big runtime + spend (server-derived, refresh-safe)
+  // Big runtime + spend (server-derived, refresh-safe) — tween smoothly.
   if (s.pod_runtime_sec > 0) {
-    $("pod-runtime").textContent = fmtDuration(s.pod_runtime_sec);
+    tweenNumber("pod-runtime", s.pod_runtime_sec, 1500, fmtDur);
   }
   if (s.pod_spent > 0) {
-    $("pod-spent").textContent = `$${s.pod_spent.toFixed(2)}`;
+    tweenNumber("pod-spent", s.pod_spent, 1500, fmtDollar);
   }
 
   $("iter-count").textContent = s.iteration_count || 1;
@@ -1359,23 +1936,26 @@ function update(p) {
     $("tensor-rate").textContent = s.tensor_rate_per_sec
       ? `${s.tensor_rate_per_sec.toFixed(1)} /s` : "—";
   } else {
-    $("layer").textContent = s.current_layer ?? "—";
-    $("expert").textContent = s.current_expert ?? "—";
-    $("tensors").textContent = (s.tensors_quantized || 0).toLocaleString();
+    // Tween counters so they visibly tick up between SSE polls instead
+    // of teleporting whenever the syncer drains a fresh batch.
+    if (s.current_layer != null) tweenNumber("layer", s.current_layer, 800, v => Math.round(v));
+    if (s.current_expert != null) tweenNumber("expert", s.current_expert, 800, v => Math.round(v));
+    tweenNumber("tensors", s.tensors_quantized || 0, 1500, v => Math.round(v).toLocaleString());
     $("eta").textContent = s.eta || "computing";
     if (s.tensor_rate_per_sec) {
-      $("tensor-rate").textContent = `${s.tensor_rate_per_sec.toFixed(1)} /s`;
+      tweenNumber("tensor-rate", s.tensor_rate_per_sec, 1000, v => v.toFixed(1) + " /s");
     }
     if (s.layer_avg_sec > 0) {
-      $("layer-avg").textContent = fmtDuration(s.layer_avg_sec);
+      tweenNumber("layer-avg", s.layer_avg_sec, 1000, fmtDur);
     }
   }
 
-  // Progress bar: 100% when done, otherwise based on observed layer.
+  // Progress bar — tween the percentage label; the bar fill itself is
+  // CSS-transitioned via `.progress-fill { transition: width ...}`.
   const pct = done
     ? 100
     : (s.current_layer != null ? Math.min(100, ((s.current_layer + 1) / TOTAL_LAYERS) * 100) : 0);
-  $("bar-pct").textContent = pct.toFixed(1) + "%";
+  tweenNumber("bar-pct", pct, 800, fmtPct);
 
   // Matrix: paint as fully done when run is complete so all cells settle to sage.
   if (done) {
@@ -1430,16 +2010,52 @@ async def index():
 
 
 def main():
-    global DEFAULT_LOG
+    global DEFAULT_LOG, JOB_LOGS, LOGS_DIR, LOG_PATTERN
+    # Windows cp1252 stdout chokes on Unicode (→ · etc.); switch to UTF-8
+    # so our startup banner doesn't crash before uvicorn even starts.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--log", default=str(DEFAULT_LOG), help="log file to tail")
+    parser.add_argument(
+        "--log", nargs="*", default=[],
+        help="Log file(s) to tail. Pass multiple paths for fleet view.",
+    )
+    parser.add_argument(
+        "--logs-dir", default="",
+        help="Directory to auto-discover logs in (re-scanned each request).",
+    )
+    parser.add_argument(
+        "--log-pattern", default="runpod-*.log",
+        help="Glob applied inside --logs-dir.",
+    )
     args = parser.parse_args()
-    DEFAULT_LOG = Path(args.log)
+
+    log_paths = [Path(p) for p in args.log] if args.log else []
+    if args.logs_dir:
+        LOGS_DIR = Path(args.logs_dir)
+        LOG_PATTERN = args.log_pattern
+    if log_paths:
+        JOB_LOGS = {_derive_job_id(p): p for p in log_paths}
+        DEFAULT_LOG = log_paths[0]
+    elif not LOGS_DIR:
+        # No args supplied — keep legacy behaviour.
+        JOB_LOGS = {_derive_job_id(DEFAULT_LOG): DEFAULT_LOG}
+
+    discovered = _discover_logs() or {_derive_job_id(DEFAULT_LOG): DEFAULT_LOG}
     print(f"BLOCKQUANT // LIVE OPS  ·  http://{args.host}:{args.port}")
     print(f"Session: {SESSION_ID}")
-    print(f"Tailing: {DEFAULT_LOG}")
+    if len(discovered) == 1:
+        print(f"Tailing: {next(iter(discovered.values()))}")
+    else:
+        print(f"Fleet mode — {len(discovered)} jobs:")
+        for jid, path in discovered.items():
+            print(f"  · {jid}  →  {path}")
+        if LOGS_DIR:
+            print(f"  (auto-discovering {LOG_PATTERN} in {LOGS_DIR})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
