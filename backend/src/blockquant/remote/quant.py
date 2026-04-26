@@ -217,10 +217,8 @@ def main() -> int:
                 # scoop bq-result.json before SSH dies.
                 # self_terminate_grace_seconds in the config controls this;
                 # falls back to poll_interval_seconds if set, then 30 s.
-                grace_seconds = cfg.get(
-                    "self_terminate_grace_seconds",
-                    cfg.get("poll_interval_seconds", 30),
-                )
+                default_grace = cfg.get("poll_interval_seconds", 30)
+                grace_seconds = cfg.get("self_terminate_grace_seconds", default_grace)
                 try:
                     grace_seconds = float(grace_seconds)
                 except (TypeError, ValueError):

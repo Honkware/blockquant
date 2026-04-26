@@ -62,6 +62,10 @@ def main():
         try:
             # Fetch only lines we haven't seen yet by starting from the
             # next unread line (tail line numbers are 1-based).
+            # Note: if the remote log is rotated or truncated between ticks,
+            # local_line_count will exceed the remote line count and tail
+            # will return nothing until new lines are appended past that
+            # offset. This is acceptable for a best-effort syncer.
             res = prov.run(args.pod, f"tail -n +{local_line_count + 1} {args.remote_log} 2>/dev/null")
             text = res.get("stdout") or ""
             new_lines = text.splitlines()
