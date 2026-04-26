@@ -38,6 +38,36 @@ def emit_result(payload: dict) -> None:
         print(f"[fatal] could not write result: {e}", flush=True)
 
 
+def _self_terminate(pod_id: str, api_key: str) -> None:
+    """Best-effort RunPod self-terminate via the GraphQL API.
+
+    Uses urllib so we don't depend on the runpod SDK being installed
+    inside the pod. Errors are logged but never raised — the work is
+    already done, we just want to stop burning credit.
+    """
+    import urllib.request
+    body = json.dumps({
+        "query": (
+            "mutation PodTerminate($podId: String!) { "
+            "podTerminate(input: {podId: $podId}) "
+            "}"
+        ),
+        "variables": {"podId": pod_id},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.runpod.io/graphql?api_key={api_key}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            print(f"[self-terminate] http {r.status}", flush=True)
+    except Exception as e:
+        print(f"[self-terminate] WARN {type(e).__name__}: {e}",
+              flush=True)
+
+
 def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
     """Drop a Qwen2VL preprocessor stub if missing — required by some VL
     builds even when we're only using the LM, otherwise convert.py barfs
@@ -162,6 +192,10 @@ def main() -> int:
                 out["hf_repo_id"] = repo_id
                 out["hf_revision"] = "main"
                 out["hf_url"] = f"https://huggingface.co/{repo_id}"
+                # Echo the URL so the dashboard's HF_URL parser rule can
+                # populate state["hf_url"] — without this, the run's last
+                # log line is just "[upload] complete" with no URL.
+                print(f"[upload] {out['variant']} done -> {out['hf_url']}", flush=True)
             print("[upload] complete", flush=True)
 
         emit_result({
@@ -170,6 +204,39 @@ def main() -> int:
             "total_time": time.time() - t0,
         })
         print("[done]", flush=True)
+
+        # Self-terminate so we don't burn credit waiting for the local
+        # poll loop to clean up. Skip on --keep-pod (forensics path).
+        # Only fires on the success path; failure path below leaves the
+        # pod alive for rescue_upload.py / debugging.
+        if not cfg.get("keep_pod"):
+            pid = cfg.get("pod_id", "")
+            key = cfg.get("runpod_api_key", "")
+            if pid and key:
+                # Brief grace so the local poll loop has a chance to
+                # scoop bq-result.json before SSH dies.
+                # self_terminate_grace_seconds in the config controls this;
+                # falls back to poll_interval_seconds if set, then 30 s.
+                default_grace = cfg.get("poll_interval_seconds", 30)
+                grace_seconds = cfg.get("self_terminate_grace_seconds", default_grace)
+                try:
+                    grace_seconds = float(grace_seconds)
+                except (TypeError, ValueError):
+                    grace_seconds = 30.0
+                if grace_seconds < 0:
+                    grace_seconds = 30.0
+                time.sleep(grace_seconds)
+                print(
+                    f"[self-terminate] terminating pod {pid} after "
+                    f"{grace_seconds:g}s grace ...",
+                    flush=True,
+                )
+                _self_terminate(pid, key)
+            else:
+                print("[self-terminate] skipped (missing pod_id or api_key)",
+                      flush=True)
+        else:
+            print("[self-terminate] skipped (--keep-pod)", flush=True)
         return 0
 
     except Exception as e:
