@@ -16,7 +16,6 @@ logger = get_logger(__name__)
 
 DEFAULT_PROVIDER_RATES = {
     "local": 0.0,
-    "lambda": 1.10,  # A10 hourly
 }
 
 

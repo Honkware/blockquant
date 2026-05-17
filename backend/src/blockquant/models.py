@@ -22,7 +22,7 @@ class QuantConfig(BaseModel):
     format: QuantFormat = QuantFormat.EXL3  # Default matches existing bot
     variants: list[str] = Field(default_factory=lambda: ["4.0"])
     use_imatrix: bool = True  # For GGUF
-    provider: str = "local"  # "local" | "runpod" (others shelved under experimental/)
+    provider: str = "local"  # "local" | "runpod"
     spot: bool = False
     hf_org: str = ""  # Maps to existing HF_ORG
     hf_token: str = ""

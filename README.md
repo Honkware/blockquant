@@ -195,7 +195,7 @@ cream (pending) → vermillion (measuring) → sage (quantized) in real time.
 |---|---|
 | **Discord bot** (`src/`) | `/quant` slash command, EXP/queue/history |
 | **FastAPI + Celery** (`backend/src/api/`, `backend/src/blockquant/`) | Job orchestration, stage runners, progress reporting |
-| **Providers** (`backend/src/blockquant/providers/`) | `local` (any NVIDIA GPU) and `runpod` (H100/A100 cloud). Lambda + Modal are shelved — see [`experimental/README.md`](experimental/README.md) |
+| **Providers** (`backend/src/blockquant/providers/`) | `local` (any NVIDIA GPU) and `runpod` (H100/A100 cloud) |
 | **CLI** (`backend/scripts/run_runpod_job.py`) | One-shot RunPod job without the Discord stack |
 | **Dashboard** (`backend/scripts/log_dashboard.py`) | Browser UI + expert-matrix visualisation |
 | **Publishing** (`backend/scripts/publish_quant.py`, `fix_repo_card_and_config.py`) | Templated model cards + HF collection management |
@@ -236,9 +236,8 @@ BlockQuant/
 │   │   ├── rescue_upload.py           Recover from a failed upload step
 │   │   ├── cleanup_pods.py / list_pods.py / list_gpus.py   Ops utilities
 │   │   └── requirements.txt
-│   └── tests/providers/               33 mock-based tests for RunPod
+│   └── tests/providers/               35 mock-based tests for RunPod
 ├── docker/                            Dockerfile.runpod, flash_attn_stub.py, entrypoint.sh
-├── experimental/                      Shelved providers (Modal, Lambda) — not supported
 ├── docs/internal/                     Planning / cost / migration notes (not user-facing)
 └── .env.example
 ```
@@ -257,7 +256,7 @@ client is paused or dies).
 
 All new providers must ship a matching test file under
 `backend/tests/providers/` modelled on `test_runpod_provider.py`. Run the
-suite with `pytest backend/tests/providers -q` (currently 33 passing, no GPU
+suite with `pytest backend/tests/providers -q` (currently 35 tests, no GPU
 required).
 
 Before bumping the Dockerfile or the in-pod stack, scan

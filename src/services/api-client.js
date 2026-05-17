@@ -37,7 +37,7 @@ export async function isApiAvailable() {
  * @param {string} params.model_id — HF model ID
  * @param {string} params.format — "exl3" | "gguf"
  * @param {string[]} params.variants — e.g., ["4.0"] or ["q4_k_m"]
- * @param {string} [params.provider] — "local" | "lambda" | etc.
+ * @param {string} [params.provider] — "local" | "runpod"
  * @param {string} [params.hf_org]
  */
 export async function submitJob({ model_id, format = 'exl3', variants, provider = 'local', hf_org = '', parallel_mode = false, high_quality_bpws = [], head_bits_8_bpws = [], verify_quality = true }) {

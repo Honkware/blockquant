@@ -48,14 +48,6 @@ def test_monitoring_roundtrip(workspace):
     assert recent[0]["success"] is True
 
 
-def test_monitoring_cost_tracking(workspace):
-    record_job_start(workspace, "job-lambda", "model/b", "exl3", ["4.0"], "lambda")
-    record_job_complete(workspace, "job-lambda", True, 3600.0, "lambda")
-
-    stats = get_daily_stats(workspace)
-    assert stats["total_cost_usd"] > 0  # Lambda costs $1.10/hr
-
-
 @pytest.mark.slow
 @pytest.mark.skipif(
     not Path(r"C:\Users\juden\AppData\Local\Temp\blockquant-work\microsoft--Phi-3-mini-4k-instruct\model\config.json").exists(),

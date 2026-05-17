@@ -61,7 +61,7 @@ env/
 redis-win/
 tmp_pkg/
 
-# Lingering patch-encoding scratch files from the Modal era
+# Lingering patch-encoding scratch files
 gen_patch_b64*.py
 gen_stub_b64*.py
 patch_b64*.txt

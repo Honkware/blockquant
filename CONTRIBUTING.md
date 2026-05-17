@@ -34,10 +34,10 @@ cd backend
 
 The provider tests are fully mocked — no GPU, no real RunPod / HF API
 calls — so they run anywhere CI can install the deps. `pytest` against
-`tests/providers/test_runpod_provider.py` should report 27 passing.
+`tests/providers/test_runpod_provider.py` should collect 35 tests.
 
-CI (`.github/workflows/test.yml`) runs the same tests on Python 3.10,
-3.11, and 3.12 on every push and PR.
+CI (`.github/workflows/test.yml`) runs the provider tests on Python 3.10,
+3.11, and 3.12. It also runs the Node lint/test checks for the Discord bot.
 
 ## Adding a new provider
 
@@ -72,22 +72,6 @@ Checklist for a new provider PR:
    and the corresponding pass-through in
    [`backend/src/api/main.py`](backend/src/api/main.py).
 7. **Document the env vars** in `.env.example`.
-
-## Resurrecting a shelved provider
-
-Modal and Lambda are parked under
-[`experimental/`](experimental/). Before un-shelving:
-
-1. Re-read the provider file top-to-bottom; expect API drift since it
-   was last touched.
-2. Run an end-to-end job against a real account with a small, cheap
-   model.
-3. Add tests (mirror `test_runpod_provider.py`).
-4. Move files back to `backend/src/blockquant/providers/` and
-   `backend/scripts/`, re-register, re-add the CLI option.
-
-See [`experimental/README.md`](experimental/README.md) for the full
-checklist.
 
 ## Code style
 

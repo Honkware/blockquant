@@ -5,7 +5,7 @@
 - Windows 10/11
 - NVIDIA RTX 4090 (or similar CUDA-capable GPU)
 - Python 3.10
-- Node.js 18+
+- Node.js 20+
 - Git
 
 ## 1. Clone and Enter the Repo
@@ -143,14 +143,6 @@ node self-test.mjs
    cd backend\scripts
    python run_runpod_job.py --model <model_id> --variants 4.5 --gpu "NVIDIA H100 80GB"
    ```
-
-## 6. Optional: Lambda Cloud Provider
-
-1. Sign up at https://lambdalabs.com
-2. Get an API key from your dashboard
-3. Add your SSH public key to Lambda
-4. Set `LAMBDA_API_KEY` in your environment
-5. Use `/quant` with `provider: lambda` (or add a `--provider lambda` option)
 
 ## Troubleshooting
 

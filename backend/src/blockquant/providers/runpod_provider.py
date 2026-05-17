@@ -1,6 +1,6 @@
 """RunPod GPU provider — on-demand pods with SSH + tail-log progress.
 
-Design (matches Lambda provider so pipeline.py's poll loop works):
+Design (matches pipeline.py's remote-provider polling path):
 
     launch()           → create_pod(start_ssh=True, env={PUBLIC_KEY})
     wait_for_active()  → poll get_pod() until public SSH port exposed
@@ -149,7 +149,7 @@ class RunPodProvider(Provider):
             raise ValueError(
                 "RunPod API key required. Set RUNPOD_API_KEY env var or pass api_key."
             )
-        _ensure_runpod().api_key = api_key
+        self.api_key = api_key
         self.gpu_type = gpu_type
         self.cloud_type = cloud_type
         self.container_disk_gb = container_disk_gb
@@ -195,6 +195,7 @@ class RunPodProvider(Provider):
 
     def launch(self, config: dict) -> str:
         rp = _ensure_runpod()
+        rp.api_key = self.api_key
         logger.info(f"Creating RunPod pod with GPU: {self.gpu_type}")
 
         # Image priority:
@@ -236,6 +237,7 @@ class RunPodProvider(Provider):
 
     def terminate(self, instance_id: str):
         rp = _ensure_runpod()
+        rp.api_key = self.api_key
         try:
             rp.terminate_pod(instance_id)
             logger.info(f"RunPod terminated: {instance_id}")
@@ -245,6 +247,7 @@ class RunPodProvider(Provider):
     def _get_pod_resilient(self, instance_id: str):
         """rp.get_pod() with retry on transient network errors (TLS reset, etc.)."""
         rp = _ensure_runpod()
+        rp.api_key = self.api_key
         for attempt in range(5):
             try:
                 return rp.get_pod(instance_id)
@@ -775,7 +778,7 @@ class RunPodProvider(Provider):
             "hf_org": hf_org,
             "head_bits": head_bits,
             "pod_id": instance_id,
-            "runpod_api_key": _ensure_runpod().api_key or "",
+            "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),
         }
         if cal_rows is not None:
@@ -884,6 +887,7 @@ class RunPodProvider(Provider):
         if self._gpu_price_cache is not None:
             return self._gpu_price_cache.get(self.gpu_type)
         rp = _ensure_runpod()
+        rp.api_key = self.api_key
         self._gpu_price_cache = {}
         try:
             # Only get_gpu(id) returns pricing; get_gpus() is list-view only.
