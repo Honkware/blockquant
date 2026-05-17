@@ -466,6 +466,112 @@ def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock
     assert cfg["keep_pod"] is True
 
 
+@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod_provider._ensure_runpod")
+def test_get_pod_resilient_retries_transient_errors(mock_ensure, mock_sleep, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_rp.get_pod.side_effect = [RuntimeError("connection reset by peer"), _running_pod_with_ssh()]
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    pod = provider._get_pod_resilient("pod-abc123")
+
+    assert pod["desiredStatus"] == "RUNNING"
+    assert mock_rp.get_pod.call_count == 2
+    mock_sleep.assert_called_once()
+
+
+@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod_provider._ensure_runpod")
+def test_get_pod_resilient_does_not_retry_non_transient(mock_ensure, mock_sleep, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_rp.get_pod.side_effect = ValueError("bad request")
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    with pytest.raises(ValueError, match="bad request"):
+        provider._get_pod_resilient("pod-abc123")
+
+    assert mock_rp.get_pod.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+def test_run_retries_transient_exec_error(mock_ensure_pk, mock_sleep, mock_ssh_key):
+    fake_paramiko = MagicMock()
+    fake_paramiko.SSHException = RuntimeError
+    mock_ensure_pk.return_value = fake_paramiko
+    first_client = MagicMock()
+    second_client = MagicMock()
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    with patch.object(provider, "_connect_ssh", side_effect=[first_client, second_client]) as connect:
+        with patch.object(
+            provider,
+            "_exec",
+            side_effect=[RuntimeError("connection reset"), {"stdout": "ok", "stderr": "", "code": 0}],
+        ):
+            result = provider.run("pod-abc123", "echo ok", retries=2)
+
+    assert result["stdout"] == "ok"
+    assert connect.call_count == 2
+    assert first_client.close.called
+    assert second_client.close.called
+    mock_sleep.assert_called_once()
+
+
+@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+def test_sftp_put_retries_transient_write_error(mock_ensure_pk, mock_sleep, mock_ssh_key):
+    fake_paramiko = MagicMock()
+    fake_paramiko.SSHException = RuntimeError
+    mock_ensure_pk.return_value = fake_paramiko
+    first_client = MagicMock()
+    second_client = MagicMock()
+    first_sftp = MagicMock()
+    second_sftp = MagicMock()
+    first_client.open_sftp.return_value = first_sftp
+    second_client.open_sftp.return_value = second_sftp
+    attempts = []
+
+    def flaky_put(sftp):
+        attempts.append(sftp)
+        if len(attempts) == 1:
+            raise EOFError("dropped")
+        return "ok"
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    with patch.object(provider, "_connect_ssh", side_effect=[first_client, second_client]):
+        result = provider._sftp_put_with_retry("pod-abc123", flaky_put, retries=2)
+
+    assert result == "ok"
+    assert attempts == [first_sftp, second_sftp]
+    assert first_sftp.close.called
+    assert second_sftp.close.called
+    mock_sleep.assert_called_once()
+
+
+@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+@patch("blockquant.providers.runpod_provider._ensure_runpod")
+def test_run_pipeline_does_not_put_tokens_on_command_line(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    provider, mock_client = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key
+    )
+
+    provider.run_pipeline(
+        instance_id="pod-abc123",
+        model_id="foo/bar",
+        format="exl3",
+        variants=["4.5"],
+        hf_token="hf-secret-token",
+    )
+
+    commands = "\n".join(str(call.args[0]) for call in mock_client.exec_command.call_args_list)
+    assert "hf-secret-token" not in commands
+    assert "fake-key" not in commands
+
+
 # ---------------------------------------------------------------------------
 # Cost
 # ---------------------------------------------------------------------------
