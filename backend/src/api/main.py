@@ -29,8 +29,7 @@ class QuantRequest(BaseModel):
     model_id: str
     format: str = "exl3"
     variants: list[str] = Field(default_factory=lambda: ["4.0"])
-    # Supported: "local" | "runpod". Modal + Lambda are shelved under
-    # experimental/ until re-validated.
+    # Supported: "local" | "runpod".
     provider: str = "local"
     hf_org: str = ""
     workspace: str | None = None

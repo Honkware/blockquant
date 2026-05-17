@@ -94,7 +94,7 @@ export async function handleHistory(interaction) {
       });
     }
 
-    const lines = jobs.map((j, i) => {
+    const lines = jobs.map((j) => {
       const status = j.success === true ? '✅' : j.success === false ? '❌' : '⏳';
       const time = j.wall_time_seconds ? `${j.wall_time_seconds.toFixed(0)}s` : '—';
       const model = j.model_id || 'unknown';

@@ -17,9 +17,7 @@ Auto-generated from actual quantization runs.
 
 | Provider | Instance | GPU | $/hr | Notes |
 |----------|----------|-----|------|-------|
-| **Lambda** | gpu_1x_a10 | A10 | $1.10 | Best for 7B-13B models |
-| **Modal** | A100-40GB | A100 | ~$2.00 | Serverless, cold start penalty |
-| **Vast.ai** | A100 spot | A100 | ~$0.50-1.20 | Cheapest but spot preemption risk |
+| **RunPod** | H100 NVL / A100 | H100/A100 | varies | Current supported cloud path |
 
 ## Actual Runs (Today)
 
