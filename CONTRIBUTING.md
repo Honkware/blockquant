@@ -28,16 +28,26 @@ cp .env.example .env
 ## Running tests
 
 ```bash
+# Node side
+npm run check
+
+# Backend mocked tests
 cd backend
-./venv/bin/pytest tests/providers -v
+./venv/bin/pip install -r requirements-test.txt
+PYTHONPATH=src ./venv/bin/pytest tests -q
 ```
 
 The provider tests are fully mocked — no GPU, no real RunPod / HF API
-calls — so they run anywhere CI can install the deps. `pytest` against
-`tests/providers/test_runpod_provider.py` should collect 35 tests.
+calls — so they run anywhere CI can install the lightweight test deps.
+`pytest tests/providers -q` should collect 35 tests.
+
+The local cached-model pipeline test is opt-in. Set `BLOCKQUANT_TEST_WORKSPACE`
+to a workspace that already contains `{model_id}/model/config.json` under the
+normal BlockQuant cache layout. Override the default model with
+`BLOCKQUANT_TEST_MODEL_ID` if needed.
 
 CI (`.github/workflows/test.yml`) runs the provider tests on Python 3.10,
-3.11, and 3.12. It also runs the Node lint/test checks for the Discord bot.
+3.11, and 3.12. Run `npm run check` locally before touching the Discord bot.
 
 ## Adding a new provider
 

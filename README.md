@@ -255,9 +255,10 @@ throughout, plus a self-terminate path so pods don't burn credit if the local
 client is paused or dies).
 
 All new providers must ship a matching test file under
-`backend/tests/providers/` modelled on `test_runpod_provider.py`. Run the
-suite with `pytest backend/tests/providers -q` (currently 35 tests, no GPU
-required).
+`backend/tests/providers/` modelled on `test_runpod_provider.py`. Install the
+lightweight backend test deps with `pip install -r backend/requirements-test.txt`,
+then run `PYTHONPATH=backend/src pytest backend/tests/providers -q` (currently
+35 tests, no GPU required).
 
 Before bumping the Dockerfile or the in-pod stack, scan
 [`docker/Dockerfile.runpod`](docker/Dockerfile.runpod)'s comments — every
