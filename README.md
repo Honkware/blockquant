@@ -236,7 +236,7 @@ BlockQuant/
 │   │   ├── rescue_upload.py           Recover from a failed upload step
 │   │   ├── cleanup_pods.py / list_pods.py / list_gpus.py   Ops utilities
 │   │   └── requirements.txt
-│   └── tests/providers/               35 mock-based tests for RunPod
+│   └── tests/providers/               40 mock-based tests for RunPod
 ├── docker/                            Dockerfile.runpod, flash_attn_stub.py, entrypoint.sh
 ├── docs/internal/                     Planning / cost / migration notes (not user-facing)
 └── .env.example
@@ -250,7 +250,7 @@ BlockQuant/
 `backend/src/blockquant/providers/base.Provider`. The ABC defines three
 required methods (`launch`, `terminate`, `run`) plus seven optional hooks
 with safe defaults — implement only what your backend needs. Use
-`runpod_provider.py` as a reference (SSH + SFTP + retry-on-transient-network-error
+`backend/src/blockquant/providers/runpod/` as a reference (SSH + SFTP + retry-on-transient-network-error
 throughout, plus a self-terminate path so pods don't burn credit if the local
 client is paused or dies).
 
@@ -258,7 +258,7 @@ All new providers must ship a matching test file under
 `backend/tests/providers/` modelled on `test_runpod_provider.py`. Install the
 lightweight backend test deps with `pip install -r backend/requirements-test.txt`,
 then run `PYTHONPATH=backend/src pytest backend/tests/providers -q` (currently
-35 tests, no GPU required).
+40 tests, no GPU required).
 
 Before bumping the Dockerfile or the in-pod stack, scan
 [`docker/Dockerfile.runpod`](docker/Dockerfile.runpod)'s comments — every

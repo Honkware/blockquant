@@ -39,7 +39,7 @@ PYTHONPATH=src ./venv/bin/pytest tests -q
 
 The provider tests are fully mocked — no GPU, no real RunPod / HF API
 calls — so they run anywhere CI can install the lightweight test deps.
-`pytest tests/providers -q` should collect 35 tests.
+`pytest tests/providers -q` should collect 40 tests.
 
 The local cached-model pipeline test is opt-in. Set `BLOCKQUANT_TEST_WORKSPACE`
 to a workspace that already contains `{model_id}/model/config.json` under the
@@ -58,7 +58,7 @@ are optional with safe defaults (`wait_for_active`, `bootstrap`,
 `run_pipeline`, `get_progress`, `is_pipeline_running`, `sync_outputs`,
 `get_result`, `get_cost_per_hour`).
 
-Reference implementation: **[`runpod_provider.py`](backend/src/blockquant/providers/runpod_provider.py)** —
+Reference implementation: **[`providers/runpod/`](backend/src/blockquant/providers/runpod/)** —
 the canonical example of the SSH + retry-on-transient-network-error
 pattern. Read it before writing a new provider.
 
@@ -68,7 +68,7 @@ Checklist for a new provider PR:
    methods, override the optional hooks your backend actually needs.
 2. **Wrap every network-touching call** in retry+reconnect for transient
    errors. The four resilience patterns are visible in
-   `runpod_provider.py`: `_get_pod_resilient`, `run()`'s retry wrapper,
+   `providers/runpod/provider.py`: `_get_pod_resilient`, `run()`'s retry wrapper,
    `_sftp_put_with_retry`, and `_upload_directory`'s per-file retry.
 3. **Add a test file** at `backend/tests/providers/test_{name}_provider.py`
    modelled on `test_runpod_provider.py` (~25 tests, full mock coverage).

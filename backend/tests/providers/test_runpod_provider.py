@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod.provider import RunPodProvider
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ def test_public_key_loaded(mock_ssh_key):
 # Launch
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_launch_injects_public_key(mock_ensure, mock_ssh_key, fake_pod):
     mock_rp = MagicMock()
     mock_rp.create_pod.return_value = fake_pod
@@ -115,7 +115,7 @@ def test_launch_injects_public_key(mock_ensure, mock_ssh_key, fake_pod):
     assert kwargs["env"]["PUBLIC_KEY"].startswith("ssh-rsa ")
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_launch_merges_user_env(mock_ensure, mock_ssh_key, fake_pod):
     mock_rp = MagicMock()
     mock_rp.create_pod.return_value = fake_pod
@@ -129,7 +129,7 @@ def test_launch_merges_user_env(mock_ensure, mock_ssh_key, fake_pod):
     assert kwargs["env"]["PUBLIC_KEY"].startswith("ssh-rsa ")
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_launch_with_network_volume(mock_ensure, mock_ssh_key, fake_pod):
     mock_rp = MagicMock()
     mock_rp.create_pod.return_value = fake_pod
@@ -152,7 +152,7 @@ def test_launch_with_network_volume(mock_ensure, mock_ssh_key, fake_pod):
 # Terminate
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_terminate(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_ensure.return_value = mock_rp
@@ -163,7 +163,7 @@ def test_terminate(mock_ensure, mock_ssh_key):
     mock_rp.terminate_pod.assert_called_once_with("pod-abc123")
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_terminate_graceful_on_error(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.terminate_pod.side_effect = RuntimeError("network")
@@ -177,7 +177,7 @@ def test_terminate_graceful_on_error(mock_ensure, mock_ssh_key):
 # SSH endpoint polling
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_ssh_endpoint_ready(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -188,7 +188,7 @@ def test_get_ssh_endpoint_ready(mock_ensure, mock_ssh_key):
     assert endpoint == {"host": "1.2.3.4", "port": 2222}
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_ssh_endpoint_terminal_state(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = {"desiredStatus": "EXITED"}
@@ -199,7 +199,7 @@ def test_get_ssh_endpoint_terminal_state(mock_ensure, mock_ssh_key):
         provider._get_ssh_endpoint("pod-abc123", timeout=1, interval=0.1)
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_ssh_endpoint_timeout(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = {
@@ -217,8 +217,8 @@ def test_get_ssh_endpoint_timeout(mock_ensure, mock_ssh_key):
 # SSH keepalive is set
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_ssh_keepalive_set(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -235,8 +235,8 @@ def test_ssh_keepalive_set(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
 # Bootstrap
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_bootstrap_success(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -247,8 +247,8 @@ def test_bootstrap_success(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     assert provider.bootstrap("pod-abc123") is True
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_bootstrap_short_circuits_when_marker_present(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -263,8 +263,8 @@ def test_bootstrap_short_circuits_when_marker_present(mock_ensure_rp, mock_ensur
     assert mock_client.exec_command.call_count == 3
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_bootstrap_system_packages_fail(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -279,8 +279,8 @@ def test_bootstrap_system_packages_fail(mock_ensure_rp, mock_ensure_pk, mock_ssh
 # run / get_progress / is_pipeline_running
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_command(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -294,8 +294,8 @@ def test_run_command(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     assert "nvidia-smi output" in result["stdout"]
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_progress_returns_tailed_log(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -306,8 +306,8 @@ def test_get_progress_returns_tailed_log(mock_ensure_rp, mock_ensure_pk, mock_ss
     assert "[quantize]" in provider.get_progress("pod-abc123")
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_is_pipeline_running_true(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -318,8 +318,8 @@ def test_is_pipeline_running_true(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     assert provider.is_pipeline_running("pod-abc123") is True
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_is_pipeline_running_false(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -334,8 +334,8 @@ def test_is_pipeline_running_false(mock_ensure_rp, mock_ensure_pk, mock_ssh_key)
 # get_result
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_result_parses_json(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -351,8 +351,8 @@ def test_get_result_parses_json(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     assert result["outputs"][0]["variant"] == "4.5"
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_result_none_when_empty(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -368,8 +368,8 @@ def test_get_result_none_when_empty(mock_ensure_rp, mock_ensure_pk, mock_ssh_key
 # run_pipeline starts background process
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_is_non_blocking(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -412,8 +412,8 @@ def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_
     return provider, mock_client
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_config_contains_pod_and_key(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     """Config JSON must include pod_id, runpod_api_key, and keep_pod."""
     provider, _ = _make_pipeline_provider_and_client(
@@ -441,8 +441,8 @@ def test_run_pipeline_config_contains_pod_and_key(mock_ensure_rp, mock_ensure_pk
     assert cfg["keep_pod"] is False
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     """keep_pod=True must propagate into the uploaded config JSON."""
     provider, _ = _make_pipeline_provider_and_client(
@@ -466,8 +466,8 @@ def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock
     assert cfg["keep_pod"] is True
 
 
-@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_pod_resilient_retries_transient_errors(mock_ensure, mock_sleep, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.side_effect = [RuntimeError("connection reset by peer"), _running_pod_with_ssh()]
@@ -481,8 +481,8 @@ def test_get_pod_resilient_retries_transient_errors(mock_ensure, mock_sleep, moc
     mock_sleep.assert_called_once()
 
 
-@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_pod_resilient_does_not_retry_non_transient(mock_ensure, mock_sleep, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_pod.side_effect = ValueError("bad request")
@@ -496,8 +496,8 @@ def test_get_pod_resilient_does_not_retry_non_transient(mock_ensure, mock_sleep,
     mock_sleep.assert_not_called()
 
 
-@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
 def test_run_retries_transient_exec_error(mock_ensure_pk, mock_sleep, mock_ssh_key):
     fake_paramiko = MagicMock()
     fake_paramiko.SSHException = RuntimeError
@@ -521,8 +521,8 @@ def test_run_retries_transient_exec_error(mock_ensure_pk, mock_sleep, mock_ssh_k
     mock_sleep.assert_called_once()
 
 
-@patch("blockquant.providers.runpod_provider.time.sleep", return_value=None)
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider.time.sleep", return_value=None)
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
 def test_sftp_put_retries_transient_write_error(mock_ensure_pk, mock_sleep, mock_ssh_key):
     fake_paramiko = MagicMock()
     fake_paramiko.SSHException = RuntimeError
@@ -552,8 +552,8 @@ def test_sftp_put_retries_transient_write_error(mock_ensure_pk, mock_sleep, mock
     mock_sleep.assert_called_once()
 
 
-@patch("blockquant.providers.runpod_provider._ensure_paramiko")
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_does_not_put_tokens_on_command_line(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     provider, mock_client = _make_pipeline_provider_and_client(
         mock_ensure_rp, mock_ensure_pk, mock_ssh_key
@@ -576,7 +576,7 @@ def test_run_pipeline_does_not_put_tokens_on_command_line(mock_ensure_rp, mock_e
 # Cost
 # ---------------------------------------------------------------------------
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_cost_per_hour_live(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_gpu.return_value = {
@@ -594,7 +594,7 @@ def test_get_cost_per_hour_live(mock_ensure, mock_ssh_key):
     assert provider.get_cost_per_hour() == 1.85
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_cost_per_hour_falls_back_to_secure(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_gpu.return_value = {
@@ -612,7 +612,7 @@ def test_get_cost_per_hour_falls_back_to_secure(mock_ensure, mock_ssh_key):
     assert provider.get_cost_per_hour() == 2.99
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_cost_per_hour_static_fallback_on_error(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_gpu.side_effect = RuntimeError("network")
@@ -668,7 +668,7 @@ def test_resolve_profile_internal_keys_excluded():
     assert all(not k.startswith("_") for k in cfg)
 
 
-@patch("blockquant.providers.runpod_provider._ensure_runpod")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_get_cost_per_hour_unknown_gpu(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
     mock_rp.get_gpu.return_value = None
