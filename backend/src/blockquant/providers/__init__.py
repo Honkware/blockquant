@@ -26,7 +26,7 @@ def get_provider(name: str, **kwargs) -> Provider:
     if name == "runpod":
         # Lazy-loaded — has heavyweight SDK (paramiko, runpod) we don't
         # want to import when only the local path is used.
-        from blockquant.providers.runpod_provider import RunPodProvider
+        from blockquant.providers.runpod import RunPodProvider
         return RunPodProvider(**kwargs)
     raise ValueError(
         f"Unknown provider: {name!r}. "

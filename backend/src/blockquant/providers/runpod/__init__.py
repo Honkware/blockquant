@@ -1,4 +1,4 @@
-"""Compatibility import for the RunPod provider."""
+"""RunPod provider package."""
 
 from blockquant.providers.runpod.provider import RunPodProvider
 
