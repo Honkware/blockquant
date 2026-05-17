@@ -1,4 +1,5 @@
 """Integration tests for the BlockQuant pipeline."""
+import os
 import tempfile
 from pathlib import Path
 
@@ -48,15 +49,37 @@ def test_monitoring_roundtrip(workspace):
     assert recent[0]["success"] is True
 
 
+def _cached_pipeline_workspace() -> Path | None:
+    raw = os.environ.get("BLOCKQUANT_TEST_WORKSPACE")
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _cached_pipeline_model_id() -> str:
+    return os.environ.get("BLOCKQUANT_TEST_MODEL_ID", "microsoft/Phi-3-mini-4k-instruct")
+
+
+def _cached_model_config_exists() -> bool:
+    workspace = _cached_pipeline_workspace()
+    if workspace is None:
+        return False
+    model_dir = workspace / _cached_pipeline_model_id().replace("/", "--") / "model"
+    return (model_dir / "config.json").exists()
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(
-    not Path(r"C:\Users\juden\AppData\Local\Temp\blockquant-work\microsoft--Phi-3-mini-4k-instruct\model\config.json").exists(),
-    reason="Model not cached — skipping slow pipeline test"
+    not _cached_model_config_exists(),
+    reason="Set BLOCKQUANT_TEST_WORKSPACE to a workspace containing the cached model",
 )
-def test_pipeline_runs_locally(workspace):
-    """Test that the pipeline can run end-to-end with a cached model."""
+def test_pipeline_runs_locally():
+    """Opt-in smoke test for a local cached-model pipeline run."""
+    workspace = _cached_pipeline_workspace()
+    assert workspace is not None
+
     config = QuantConfig(
-        model_id="microsoft/Phi-3-mini-4k-instruct",
+        model_id=_cached_pipeline_model_id(),
         format=QuantFormat.EXL3,
         variants=["4.0"],
         workspace_dir=workspace,

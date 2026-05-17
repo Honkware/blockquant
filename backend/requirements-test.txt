@@ -1,0 +1,11 @@
+# Lightweight deps for the mocked backend tests.
+# Keep torch / CUDA / transformers out of this file so CI and local smoke tests stay cheap.
+
+pytest>=8.0
+pytest-asyncio>=0.23
+python-dotenv>=1.0
+pydantic>=2.0
+fastapi>=0.100
+huggingface-hub>=0.21.0
+runpod>=1.9
+paramiko>=3.0

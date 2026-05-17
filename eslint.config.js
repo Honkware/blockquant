@@ -3,7 +3,7 @@ import globals from 'globals';
 
 export default [
   {
-    ignores: ['node_modules/**', 'tmp/**', 'logs/**', 'data/**'],
+    ignores: ['node_modules/**', 'tmp/**', 'logs/**', 'data/**', 'venv/**', '.venv/**'],
   },
   js.configs.recommended,
   {
