@@ -26,6 +26,13 @@ class RunPodCloudType(str, Enum):
     SECURE = "SECURE"
 
 
+class VerificationStatus(str, Enum):
+    PENDING = "pending"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HF_ORG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EXL3_VARIANT_RE = re.compile(r"^(?:[1-9]\d*)(?:\.\d+)?$")
@@ -114,6 +121,15 @@ class QuantConfig(BaseModel):
         return self
 
 
+class VerificationResult(BaseModel):
+    """Load-test result for one output artifact."""
+
+    status: VerificationStatus = VerificationStatus.PENDING
+    method: str = ""
+    message: str = ""
+    details: dict = Field(default_factory=dict)
+
+
 class QuantOutput(BaseModel):
     """Single quantized output — one per variant."""
 
@@ -122,6 +138,7 @@ class QuantOutput(BaseModel):
     output_path: str  # Absolute path to output dir/file
     file_size_mb: float = 0.0
     verified: bool = False
+    verification: VerificationResult = Field(default_factory=VerificationResult)
     hf_repo_id: str = ""  # e.g., "Honkware/Mistral-7B-4bpw-exl3"
     hf_revision: str = ""
     hf_url: str = ""

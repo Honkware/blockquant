@@ -44,6 +44,9 @@ def _generate_model_card(config: QuantConfig, output: QuantOutput) -> str:
 
     # Quality metrics block
     quality_block = ""
+    verification = output.verification
+    if verification.status != "pending":
+        quality_block += f"| Verification | {verification.status.value} ({verification.method or 'none'}) |\n"
     if output.quality:
         kl = output.quality.get("kl_div")
         ppl = output.quality.get("ppl")
