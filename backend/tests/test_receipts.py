@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from blockquant.models import QuantConfig, QuantFormat, QuantOutput
+from blockquant.models import QuantConfig, QuantFormat, QuantOutput, VerificationResult, VerificationStatus
 from blockquant import pipeline
 from blockquant.pipeline import run_pipeline
 from blockquant.receipts import build_quant_recipe
@@ -29,6 +29,11 @@ def test_run_pipeline_writes_receipt_and_manifest(monkeypatch, tmp_path):
 
     def fake_verify(config, workspace, outputs):
         outputs[0].verified = True
+        outputs[0].verification = VerificationResult(
+            status=VerificationStatus.PASSED,
+            method="test",
+            message="ok",
+        )
 
     def fake_report(config, workspace, outputs):
         (workspace / "README.md").write_text("model card\n", encoding="utf-8")
@@ -65,6 +70,7 @@ def test_run_pipeline_writes_receipt_and_manifest(monkeypatch, tmp_path):
     assert receipt["stages"]["quality"] == "skipped"
     assert receipt["stages"]["upload"] == "success"
     assert receipt["outputs"][0]["verified"] is True
+    assert receipt["outputs"][0]["verification"]["status"] == "passed"
     assert receipt["recipe"] == manifest["recipe"]
     assert manifest["recipe"]["base_model"]["repo_id"] == "tester/model"
     assert manifest["recipe"]["quantization"]["variants"] == ["4.0"]
