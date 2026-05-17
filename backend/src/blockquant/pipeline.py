@@ -22,6 +22,14 @@ from blockquant.models import (
     PipelineResult,
     StageResult,
 )
+from blockquant.receipts import (
+    build_quant_recipe,
+    create_job_receipt,
+    update_job_receipt,
+    update_receipt_outputs,
+    update_receipt_remote,
+    update_receipt_stage,
+)
 from blockquant.stages import download, convert, quantize, verify, report, upload, quality
 from blockquant.providers import get_provider
 from blockquant.monitoring import record_job_start, record_job_complete
@@ -30,23 +38,29 @@ from blockquant.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResult:
+def _run_remote_pipeline(
+    config: QuantConfig,
+    progress_callback,
+    job_id: str,
+    workspace: Path,
+    receipt_path: Path,
+) -> PipelineResult:
     """Run pipeline on a cloud provider instance."""
-    provider_name = config.provider
+    provider_name = config.provider.value
     logger.info(f"Using remote provider: {provider_name}")
     t0 = time.time()
+    instance_id = ""
 
     provider_kwargs: dict = {}
     if provider_name == "runpod":
         provider_kwargs["api_key"] = config.runpod_api_key
         provider_kwargs["gpu_type"] = config.runpod_gpu_type
-        provider_kwargs["cloud_type"] = config.runpod_cloud_type
+        provider_kwargs["cloud_type"] = config.runpod_cloud_type.value
         provider_kwargs["container_disk_gb"] = config.runpod_container_disk_gb
         provider_kwargs["volume_gb"] = config.runpod_volume_gb
         provider_kwargs["ssh_key_path"] = config.runpod_ssh_key_path
 
-    provider = get_provider(provider_name, **provider_kwargs)
-    instance_id = provider.launch(config.model_dump(mode="json"))
+    provider = None
 
     def _report(stage: str, pct: int, msg: str = ""):
         if progress_callback:
@@ -65,6 +79,11 @@ def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResu
         return f"https://huggingface.co/{slug}"
 
     try:
+        provider = get_provider(provider_name, **provider_kwargs)
+        update_receipt_stage(receipt_path, "cloud_setup", "running")
+        instance_id = provider.launch(config.model_dump(mode="json"))
+        update_receipt_remote(receipt_path, provider=provider_name, instance_id=instance_id)
+
         # Wait for readiness + bootstrap (both are no-ops for providers
         # that don't need them — see Provider base class defaults).
         _report("cloud_setup", 5, f"Launching {provider_name} instance...")
@@ -74,8 +93,10 @@ def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResu
         _report("cloud_setup", 20, "Bootstrapping instance...")
         provider.bootstrap(instance_id)
         _report("cloud_setup", 25, "Bootstrap complete")
+        update_receipt_stage(receipt_path, "cloud_setup", "success")
 
         # Kick off the remote pipeline (fire-and-forget for RunPod).
+        update_receipt_stage(receipt_path, "cloud_run", "running")
         _report("cloud_run", 30, "Starting remote quantization...")
         provider.run_pipeline(
             instance_id=instance_id,
@@ -99,18 +120,20 @@ def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResu
                 _report("cloud_run", 50, last_line[:200])
 
         _report("cloud_run", 90, "Remote pipeline finished")
+        update_receipt_stage(receipt_path, "cloud_run", "success")
 
         # Sync outputs back (no-op when the remote script uploads directly
         # to HuggingFace, which is the RunPod default).
         outputs: list[QuantOutput] = []
+        update_receipt_stage(receipt_path, "cloud_sync", "running")
         _report("cloud_sync", 92, "Downloading outputs...")
-        workspace = config.workspace_dir / config.model_id.replace("/", "--")
         downloaded = provider.sync_outputs(
             instance_id,
             workspace,
             remote_rel_path=config.model_id.replace("/", "--"),
         )
         _report("cloud_sync", 95, f"Downloaded {len(downloaded)} files")
+        update_receipt_remote(receipt_path, downloaded_files=[str(path) for path in downloaded])
 
         # Translate the remote's result JSON into QuantOutput records.
         remote_result = provider.get_result()
@@ -128,20 +151,35 @@ def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResu
                     )
                 )
 
+        update_receipt_stage(receipt_path, "cloud_sync", "success")
+        update_receipt_outputs(receipt_path, outputs)
         total_time = time.time() - t0
+        stages = [StageResult(stage="remote", success=True, wall_time_seconds=total_time)]
+        manifest_path = _write_manifest(job_id, config, stages, outputs, t0, workspace)
+        update_job_receipt(
+            receipt_path,
+            status="complete",
+            total_time=total_time,
+            manifest_path=str(manifest_path),
+        )
         return PipelineResult(
-            job_id=instance_id[:8],
+            job_id=job_id,
             config=config,
-            stages=[StageResult(stage="remote", success=True, wall_time_seconds=total_time)],
+            stages=stages,
             outputs=outputs,
             total_wall_time=total_time,
+            manifest_path=str(manifest_path),
             status="complete",
         )
     except Exception as exc:
         logger.error(f"Remote pipeline failed: {exc}")
         total_time = time.time() - t0
+        update_receipt_stage(receipt_path, "cloud_setup" if not instance_id else "cloud_run", "failed")
+        if instance_id:
+            update_receipt_remote(receipt_path, instance_id=instance_id)
+        update_job_receipt(receipt_path, status="failed", error=str(exc), total_time=total_time)
         return PipelineResult(
-            job_id=instance_id[:8],
+            job_id=job_id,
             config=config,
             stages=[StageResult(stage="remote", success=False, wall_time_seconds=total_time, error=str(exc))],
             outputs=[],
@@ -149,23 +187,25 @@ def _run_remote_pipeline(config: QuantConfig, progress_callback) -> PipelineResu
             status="failed",
         )
     finally:
-        _report("cloud_teardown", 98, f"Terminating {provider_name} instance...")
-        provider.terminate(instance_id)
-        _report("complete", 100, "Cloud pipeline complete")
+        if provider and instance_id:
+            _report("cloud_teardown", 98, f"Terminating {provider_name} instance...")
+            provider.terminate(instance_id)
+            _report("complete", 100, "Cloud pipeline complete")
 
 
 def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     job_id = str(uuid.uuid4())[:8]
     workspace = config.workspace_dir / config.model_id.replace("/", "--")
     workspace.mkdir(parents=True, exist_ok=True)
+    receipt_path = create_job_receipt(config, job_id, workspace)
 
     def _report(stage: str, percent: int, message: str = ""):
         if progress_callback:
             progress_callback(stage, percent, message or f"{stage} ({percent}%)")
 
     # Route to cloud provider if not local
-    if config.provider != "local":
-        return _run_remote_pipeline(config, progress_callback)
+    if config.provider.value != "local":
+        return _run_remote_pipeline(config, progress_callback, job_id, workspace, receipt_path)
 
     logger.info(f"[{job_id}] Starting: {config.model_id} ({config.format.value})")
     record_job_start(
@@ -183,21 +223,24 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
 
     # Stage 1: Download
     _report("download", 5, "starting download")
-    stages.append(_run_stage("download", download.run, config, workspace, _report))
+    stages.append(_run_receipted_stage(receipt_path, "download", download.run, config, workspace, _report))
     _report("download", 15, "download complete")
     if not stages[-1].success:
-        return _finalize(job_id, config, stages, outputs, t0)
+        return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
     # Stage 2: Convert (GGUF only)
     if config.format == QuantFormat.GGUF:
         _report("convert", 18)
-        stages.append(_run_stage("convert", convert.run, config, workspace))
+        stages.append(_run_receipted_stage(receipt_path, "convert", convert.run, config, workspace))
         _report("convert", 22)
         if not stages[-1].success:
-            return _finalize(job_id, config, stages, outputs, t0)
+            return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
+    else:
+        update_receipt_stage(receipt_path, "convert", "skipped")
 
     # Stage 3: Quantize
     _report("quantize", 25, "starting quantization")
+    update_receipt_stage(receipt_path, "quantize", "running")
     q_result = quantize.run(config, workspace, _report)
     _report("quantize", 85, "quantization complete")
     stages.append(
@@ -210,46 +253,39 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     )
     if q_result and q_result.get("ok"):
         outputs = q_result["outputs"]
+        update_receipt_stage(receipt_path, "quantize", "success")
+        update_receipt_outputs(receipt_path, outputs)
     else:
-        return _finalize(job_id, config, stages, outputs, t0)
+        update_receipt_stage(receipt_path, "quantize", "failed")
+        return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
     # Stage 4: Verify
     _report("verify", 90, "verifying outputs")
-    stages.append(_run_stage("verify", verify.run, config, workspace, outputs))
+    stages.append(_run_receipted_stage(receipt_path, "verify", verify.run, config, workspace, outputs))
+    update_receipt_outputs(receipt_path, outputs)
 
     # Stage 4b: Quality (KL + PPL) — optional
     if config.verify_quality and config.format == QuantFormat.EXL3 and outputs:
         _report("quality", 91, "running quality metrics (KL + PPL)")
-        stages.append(_run_stage("quality", _run_quality_stage, config, workspace, outputs))
+        stages.append(_run_receipted_stage(receipt_path, "quality", _run_quality_stage, config, workspace, outputs))
+        update_receipt_outputs(receipt_path, outputs)
         _report("quality", 94, "quality metrics complete")
+    else:
+        update_receipt_stage(receipt_path, "quality", "skipped")
 
     # Stage 5: Report (model card)
     _report("report", 95, "generating model cards")
-    stages.append(_run_stage("report", report.run, config, workspace, outputs))
+    stages.append(_run_receipted_stage(receipt_path, "report", report.run, config, workspace, outputs))
 
     # Stage 6: Upload
     _report("upload", 97, "uploading to HuggingFace")
-    stages.append(_run_stage("upload", upload.run, config, workspace, outputs))
+    stages.append(_run_receipted_stage(receipt_path, "upload", upload.run, config, workspace, outputs))
+    update_receipt_outputs(receipt_path, outputs)
 
-    # Write manifest (matches existing blockquant-manifest.json)
-    manifest = {
-        "job_id": job_id,
-        "model_id": config.model_id,
-        "format": config.format.value,
-        "variants": [o.variant for o in outputs],
-        "stages": [
-            {"stage": s.stage, "success": s.success, "time": s.wall_time_seconds}
-            for s in stages
-        ],
-        "outputs": [o.model_dump(mode="json") for o in outputs],
-        "total_time": time.time() - t0,
-    }
-    manifest_path = workspace / "blockquant-manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
+    manifest_path = _write_manifest(job_id, config, stages, outputs, t0, workspace)
 
     _report("complete", 100)
-    result = _finalize(job_id, config, stages, outputs, t0, str(manifest_path))
+    result = _finalize(job_id, config, stages, outputs, t0, str(manifest_path), receipt_path)
     record_job_complete(
         workspace_dir=config.workspace_dir,
         job_id=job_id,
@@ -257,6 +293,13 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
         wall_time_seconds=result.total_wall_time,
         provider=config.provider,
     )
+    return result
+
+
+def _run_receipted_stage(receipt_path: Path, name, func, config, workspace, *extra_args) -> StageResult:
+    update_receipt_stage(receipt_path, name, "running")
+    result = _run_stage(name, func, config, workspace, *extra_args)
+    update_receipt_stage(receipt_path, name, "success" if result.success else "failed")
     return result
 
 
@@ -277,9 +320,38 @@ def _run_quality_stage(config, workspace, outputs):
     quality.run(config, workspace, outputs)
 
 
-def _finalize(job_id, config, stages, outputs, t0, manifest_path=""):
+def _write_manifest(job_id, config, stages, outputs, t0, workspace) -> Path:
+    manifest = {
+        "job_id": job_id,
+        "model_id": config.model_id,
+        "format": config.format.value,
+        "variants": [o.variant for o in outputs],
+        "recipe": build_quant_recipe(config),
+        "stages": [
+            {"stage": s.stage, "success": s.success, "time": s.wall_time_seconds, "error": s.error}
+            for s in stages
+        ],
+        "outputs": [o.model_dump(mode="json") for o in outputs],
+        "total_time": time.time() - t0,
+    }
+    manifest_path = workspace / "blockquant-manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    return manifest_path
+
+
+def _finalize(job_id, config, stages, outputs, t0, manifest_path="", receipt_path: Path | None = None):
     total = time.time() - t0
     ok = all(s.success for s in stages)
+    status = "complete" if ok else "failed"
+    if receipt_path:
+        update_receipt_outputs(receipt_path, outputs)
+        update_job_receipt(
+            receipt_path,
+            status=status,
+            total_time=total,
+            manifest_path=manifest_path,
+        )
     return PipelineResult(
         job_id=job_id,
         config=config,
@@ -287,5 +359,5 @@ def _finalize(job_id, config, stages, outputs, t0, manifest_path=""):
         outputs=outputs,
         total_wall_time=total,
         manifest_path=manifest_path,
-        status="complete" if ok else "failed",
+        status=status,
     )
