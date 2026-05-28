@@ -10,19 +10,6 @@ logger = get_logger(__name__)
 def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> None:
     """Generate model card for each output."""
     for output in outputs:
-        # Perplexity (lightweight)
-        if output.format == QuantFormat.GGUF:
-            try:
-                from llama_cpp import Llama
-
-                llm = Llama(str(output.output_path), n_ctx=512, verbose=False)
-                text = "The quick brown fox jumps over the lazy dog. " * 20
-                tokens = llm.tokenize(text.encode())
-                # Store token count as rough perplexity proxy
-                _ = tokens
-            except Exception:
-                pass
-
         # Generate model card
         card = _generate_model_card(config, output)
         if output.format == QuantFormat.EXL3:
