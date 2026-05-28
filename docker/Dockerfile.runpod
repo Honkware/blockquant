@@ -95,6 +95,8 @@ RUN python -c "import exllamav3; print('exllamav3 import ok')" \
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
 COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
+COPY backend/src/blockquant/cards.py /opt/blockquant/cards.py
+COPY backend/templates/card_template.md /opt/blockquant/card_template.md
 COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
 RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
 

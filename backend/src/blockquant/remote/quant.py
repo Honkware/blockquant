@@ -28,6 +28,18 @@ from pathlib import Path
 CONFIG_PATH = "/root/bq-config.json"
 RESULT_PATH = "/root/bq-result.json"
 
+# cards.py + card_template.md are shipped next to this script (SFTP'd by the
+# provider or baked into the image), so make the script's own dir importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _dir_size_gb(path: Path) -> float | None:
+    try:
+        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return total / 1e9 if total else None
+    except OSError:
+        return None
+
 
 def emit_result(payload: dict) -> None:
     """Write the final result JSON for the local poller."""
@@ -85,6 +97,45 @@ def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
         "image_std": [0.26862954, 0.26130258, 0.27577711],
         "image_processor_type": "Qwen2VLImageProcessorFast",
     }))
+
+
+def _write_cards(outputs, model_id, model_name, owner, hf_token,
+                 head_bits, cal_rows, model_dir) -> None:
+    """Render the polished card into each output dir before upload."""
+    import cards
+
+    rows_cal = int(cal_rows) if cal_rows else 250
+    try:
+        model_config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        model_config = {}
+
+    quant_rows = []
+    for out in outputs:
+        out["_size_gb"] = _dir_size_gb(Path(out["path"]))
+        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
+        quant_rows.append({
+            "variant": out["variant"], "head_bits": head_bits,
+            "cal_rows": rows_cal, "size_gb": out["_size_gb"],
+            "url": f"https://huggingface.co/{repo_id}",
+        })
+
+    license_id = cards.fetch_license(model_id, hf_token or None)
+    collection_url = cards.ensure_collection(
+        owner=owner, base_name=model_name, token=hf_token,
+    )
+
+    for out in outputs:
+        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
+        card = cards.render_exl3_card(
+            base_repo=model_id, repo_id=repo_id, variant=out["variant"],
+            head_bits=head_bits, cal_rows=rows_cal, size_gb=out.get("_size_gb"),
+            model_config=model_config, quant_rows=quant_rows,
+            collection_url=collection_url, license_id=license_id,
+            quantized_by=owner,
+        )
+        (Path(out["path"]) / "README.md").write_text(card, encoding="utf-8")
+        print(f"[card] {out['variant']} written", flush=True)
 
 
 def main() -> int:
@@ -176,6 +227,17 @@ def main() -> int:
             # Resolve the user portion when no org was supplied — HF rejects
             # bare slugs without a namespace.
             owner = hf_org or api.whoami()["name"]
+
+            # Write the polished card into each output dir before upload, so
+            # upload_folder ships README.md with the weights. Best-effort:
+            # a card failure must never lose a finished quant.
+            try:
+                _write_cards(outputs, model_id, model_name, owner, hf_token,
+                             head_bits, cal_rows, model_dir)
+            except Exception as exc:
+                print(f"[card] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
+
+            repo_ids = []
             for out in outputs:
                 slug = f"{model_name}-exl3-{out['variant']}bpw"
                 repo_id = f"{owner}/{slug}"
@@ -192,10 +254,18 @@ def main() -> int:
                 out["hf_repo_id"] = repo_id
                 out["hf_revision"] = "main"
                 out["hf_url"] = f"https://huggingface.co/{repo_id}"
+                repo_ids.append(repo_id)
                 # Echo the URL so the dashboard's HF_URL parser rule can
                 # populate state["hf_url"] — without this, the run's last
                 # log line is just "[upload] complete" with no URL.
                 print(f"[upload] {out['variant']} done -> {out['hf_url']}", flush=True)
+
+            try:
+                import cards
+                cards.ensure_collection(owner=owner, base_name=model_name,
+                                        token=hf_token, item_repo_ids=repo_ids)
+            except Exception as exc:
+                print(f"[collection] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
             print("[upload] complete", flush=True)
 
         emit_result({

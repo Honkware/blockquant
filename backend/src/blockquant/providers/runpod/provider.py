@@ -715,6 +715,11 @@ class RunPodProvider(Provider):
     # so we don't have to SFTP it on every run when using those.
     _REMOTE_QUANT_PATH = Path(__file__).resolve().parents[2] / "remote" / "quant.py"
     _BAKED_REMOTE_QUANT = "/opt/blockquant/quant.py"
+    # Card renderer + template shipped next to quant.py so the in-pod script
+    # can produce the polished README. parents[2] is the blockquant package;
+    # parents[4] is the backend/ root that holds templates/.
+    _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
+    _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
 
     @classmethod
     def _load_quant_script(cls) -> bytes:
@@ -777,6 +782,17 @@ class RunPodProvider(Provider):
             script_path = REMOTE_SCRIPT
             self._upload_bytes(instance_id, self._load_quant_script(), script_path)
             self.run(instance_id, f"chmod +x {script_path}")
+
+        # Ship the card renderer + template next to the script (idempotent;
+        # gives even pre-baked pods the current card without an image rebuild).
+        script_dir = os.path.dirname(script_path)
+        try:
+            self._upload_bytes(instance_id, self._CARDS_PATH.read_bytes(),
+                               f"{script_dir}/cards.py")
+            self._upload_bytes(instance_id, self._TEMPLATE_PATH.read_bytes(),
+                               f"{script_dir}/card_template.md")
+        except Exception as exc:
+            logger.warning(f"Could not ship card renderer to pod: {exc}")
 
         # 3. Fire-and-forget. setsid so the process survives our SSH channel.
         launch_cmd = (
