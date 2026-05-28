@@ -11,7 +11,7 @@
 ## 1. Clone and Enter the Repo
 
 ```powershell
-cd E:\BlockQuant-v2\BlockQuant
+cd path\to\blockquant
 ```
 
 ## 2. Python Backend
@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ### 2.3 Verify ExLlamaV3
 
-ExLlamaV3 should be at `E:\BlockQuant-v2\BlockQuant\exllamav3`. The pipeline will auto-download calibration data on first run, but you can verify:
+ExLlamaV3 should be cloned at `exllamav3/` beside the repo root (set `EXLLAMAV3_DIR` if it lives elsewhere). The pipeline will auto-download calibration data on first run, but you can verify:
 
 ```powershell
 python -c "import exllamav3; print('ExLlamaV3 OK')"
@@ -56,7 +56,7 @@ In a new terminal (with venv activated):
 ```powershell
 cd backend
 $env:HF_TOKEN = "your_huggingface_token"
-$env:EXLLAMAV3_DIR = "E:\BlockQuant-v2\BlockQuant\exllamav3"
+$env:EXLLAMAV3_DIR = "path\to\blockquant\exllamav3"
 .\venv\Scripts\python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -67,7 +67,7 @@ In another new terminal (with venv activated):
 ```powershell
 cd backend
 $env:HF_TOKEN = "your_huggingface_token"
-$env:EXLLAMAV3_DIR = "E:\BlockQuant-v2\BlockQuant\exllamav3"
+$env:EXLLAMAV3_DIR = "path\to\blockquant\exllamav3"
 .\venv\Scripts\python -m celery -A scheduler.tasks worker --loglevel=info -n windows@%h -P solo
 ```
 
@@ -78,7 +78,7 @@ $env:EXLLAMAV3_DIR = "E:\BlockQuant-v2\BlockQuant\exllamav3"
 ### 3.1 Install Node Dependencies
 
 ```powershell
-cd E:\BlockQuant-v2\BlockQuant
+cd path\to\blockquant
 npm install
 ```
 
@@ -97,7 +97,7 @@ HF_TOKEN=your_huggingface_token
 ### 3.3 Start the Bot
 
 ```powershell
-cd E:\BlockQuant-v2\BlockQuant
+cd path\to\blockquant
 node src/index.js
 ```
 
@@ -119,7 +119,7 @@ Open http://localhost:8000/dashboard/ in your browser.
 ### 4.3 Self-Test Harness
 
 ```powershell
-cd E:\BlockQuant-v2\BlockQuant
+cd path\to\blockquant
 node self-test.mjs
 ```
 

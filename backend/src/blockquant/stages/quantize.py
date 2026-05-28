@@ -212,7 +212,7 @@ def _run_exl3_quantize(
     progress_callback=None,
 ):
     """Run ExLlamaV3 convert.py with resume, streaming progress, and per-BPW flags."""
-    exllama_dir = Path(os.environ.get("EXLLAMAV3_DIR", r"E:\BlockQuant-v2\BlockQuant\exllamav3"))
+    exllama_dir = Path(os.environ.get("EXLLAMAV3_DIR", "exllamav3"))
     convert_script = exllama_dir / "convert.py"
     if not convert_script.exists():
         convert_script = Path("exllamav3/convert.py")

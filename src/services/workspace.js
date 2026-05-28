@@ -109,22 +109,6 @@ export async function clearModelDir() {
   log.info(`Model directory cleared (${Date.now() - t0} ms)`);
 }
 
-/**
- * Reset all active job directories (including model). Prefer prepareWorkAndOutput + clearModelDir
- * only when needed — avoids double-deleting model before cache restore.
- */
-export async function prepare() {
-  log.info('Preparing workspace (full reset including model)...');
-  const t0 = Date.now();
-  await clearModelDir();
-  await rm(DIRS.work, { recursive: true, force: true });
-  await rm(DIRS.output, { recursive: true, force: true });
-  for (const dir of [DIRS.root, DIRS.model, DIRS.work, DIRS.output, DIRS.cache]) {
-    await mkdir(dir, { recursive: true });
-  }
-  log.info(`Workspace ready (${Date.now() - t0} ms)`);
-}
-
 /** Clean up active job directories and keep cache for reuse. */
 export async function cleanup() {
   await rm(DIRS.model, { recursive: true, force: true }).catch(() => {});
