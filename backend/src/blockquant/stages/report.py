@@ -1,6 +1,8 @@
-"""Stage 5: Generate quality metrics and model card."""
+"""Stage 5: Generate the model card for each output."""
+import json
 from pathlib import Path
 
+from blockquant import cards
 from blockquant.models import QuantConfig, QuantFormat, QuantOutput
 from blockquant.utils.logger import get_logger
 
@@ -8,99 +10,126 @@ logger = get_logger(__name__)
 
 
 def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> None:
-    """Generate model card for each output."""
+    """Write README.md for each output. EXL3 gets the polished template card."""
+    exl3_outputs = [o for o in outputs if o.format == QuantFormat.EXL3]
+    exl3_ctx = _exl3_context(config, workspace, exl3_outputs) if exl3_outputs else None
+
     for output in outputs:
-        # Generate model card
-        card = _generate_model_card(config, output)
-        if output.format == QuantFormat.EXL3:
+        if output.format == QuantFormat.EXL3 and exl3_ctx is not None:
+            try:
+                card = _render_exl3_card(config, output, exl3_ctx)
+            except Exception as exc:  # never fail the run over a card
+                logger.warning(f"Polished card failed ({exc}); using stub")
+                card = _stub_card(config, output)
             card_path = Path(output.output_path) / "README.md"
         else:
+            card = _stub_card(config, output)
             card_path = Path(output.output_path).parent / f"README-{output.variant}.md"
 
         with open(card_path, "w") as f:
             f.write(card)
 
 
-def _generate_model_card(config: QuantConfig, output: QuantOutput) -> str:
-    """Generate README.md content matching existing huggingface.js format."""
-    model_name = config.model_id.split("/")[-1]
+def _load_model_config(workspace: Path) -> dict:
+    config_path = workspace / "model" / "config.json"
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _resolve_owner(config: QuantConfig) -> str:
     if config.hf_org:
-        repo_id = f"{config.hf_org}/{model_name}-{output.variant}"
-    else:
-        repo_id = f"{model_name}-{output.variant}"
+        return config.hf_org
+    token = config.hf_token
+    if not token:
+        return ""
+    try:
+        from huggingface_hub import HfApi
 
-    # Quality metrics block
-    quality_block = ""
-    verification = output.verification
-    if verification.status != "pending":
-        quality_block += f"| Verification | {verification.status.value} ({verification.method or 'none'}) |\n"
-    if output.quality:
-        kl = output.quality.get("kl_div")
-        ppl = output.quality.get("ppl")
-        if kl is not None:
-            quality_block += f"| KL divergence | {kl:.8f} |\n"
-        if ppl is not None:
-            quality_block += f"| Perplexity | {ppl:.6f} |\n"
+        return HfApi(token=token).whoami().get("name", "")
+    except Exception:
+        return ""
 
+
+def _exl3_context(config: QuantConfig, workspace: Path, exl3_outputs: list[QuantOutput]) -> dict:
+    """Build the shared facts every EXL3 card in this run needs."""
+    base_name = config.model_id.split("/")[-1]
+    owner = _resolve_owner(config)
+    model_config = _load_model_config(workspace)
+    cal_rows = config.cal_rows or 250
+
+    quant_rows = []
+    repo_ids = []
+    for out in exl3_outputs:
+        repo_id = cards.exl3_repo_id(owner, base_name, out.variant)
+        repo_ids.append(repo_id)
+        quant_rows.append({
+            "variant": out.variant,
+            "head_bits": config.head_bits,
+            "cal_rows": cal_rows,
+            "size_gb": (out.file_size_mb / 1024.0) if out.file_size_mb else None,
+            "url": f"https://huggingface.co/{repo_id}",
+        })
+
+    license_id = cards.fetch_license(config.model_id, config.hf_token or None)
+    collection_url = f"https://huggingface.co/{owner or 'collections'}"
+    if owner and config.hf_token:
+        collection_url = cards.ensure_collection(
+            owner=owner, base_name=base_name, token=config.hf_token,
+        )
+
+    return {
+        "owner": owner,
+        "base_name": base_name,
+        "model_config": model_config,
+        "cal_rows": cal_rows,
+        "quant_rows": quant_rows,
+        "license_id": license_id,
+        "collection_url": collection_url,
+        "quantized_by": owner or "blockquant",
+    }
+
+
+def _render_exl3_card(config: QuantConfig, output: QuantOutput, ctx: dict) -> str:
+    repo_id = cards.exl3_repo_id(ctx["owner"], ctx["base_name"], output.variant)
+    return cards.render_exl3_card(
+        base_repo=config.model_id,
+        repo_id=repo_id,
+        variant=output.variant,
+        head_bits=config.head_bits,
+        cal_rows=ctx["cal_rows"],
+        size_gb=(output.file_size_mb / 1024.0) if output.file_size_mb else None,
+        model_config=ctx["model_config"],
+        quant_rows=ctx["quant_rows"],
+        collection_url=ctx["collection_url"],
+        license_id=ctx["license_id"],
+        quantized_by=ctx["quantized_by"],
+    )
+
+
+def _stub_card(config: QuantConfig, output: QuantOutput) -> str:
+    """Minimal card for GGUF, or the EXL3 fallback when the renderer can't run."""
+    model_name = config.model_id.split("/")[-1]
     if output.format == QuantFormat.EXL3:
-        return f"""---
-base_model: {config.model_id}
-library_name: exllamav3
-tags:
-- exl3
-- exllamav3
-- quantized
-- text-generation
-- blockquant
-quantization_format: exl3
-bits_per_weight: {output.variant}
----
-
-# {model_name} — {output.variant}bpw EXL3
-
-Auto-generated by [BlockQuant](https://github.com/Honkware/blockquant).
-
-## Details
-
-| Attribute | Value |
-|-----------|-------|
-| Base model | `{config.model_id}` |
-| Format | EXL3 |
-| BPW | {output.variant} |
-| Head bits | {config.head_bits} |
-| File size | {output.file_size_mb:.1f} MB |
-{quality_block}
-## Reproduce
-
-```bash
-bq-pipeline --model {config.model_id} --format exl3 --variants {output.variant}
-```
-"""
+        fmt_tag, fmt_label = "exl3", "EXL3"
     else:
-        return f"""---
+        fmt_tag, fmt_label = "gguf", output.variant.upper() + " GGUF"
+    return f"""---
+base_model: {config.model_id}
 tags:
-- gguf
+- {fmt_tag}
 - quantized
-- llama.cpp
 - blockquant
 ---
 
-# {model_name} — {output.variant.upper()} GGUF
+# {model_name} {fmt_label}
 
 Auto-generated by [BlockQuant](https://github.com/Honkware/blockquant).
-
-## Details
 
 | Attribute | Value |
 |-----------|-------|
 | Base model | `{config.model_id}` |
-| Format | GGUF |
 | Variant | {output.variant} |
 | File size | {output.file_size_mb:.1f} MB |
-
-## Reproduce
-
-```bash
-bq-pipeline --model {config.model_id} --format gguf --variants {output.variant}
-```
 """
