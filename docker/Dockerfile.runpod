@@ -1,9 +1,8 @@
 # BlockQuant pre-baked RunPod image.
 #
-# Bakes every gotcha we discovered the hard way (see
-# C:\Users\juden\.claude\projects\E--BlockQuant-v2\memory\project_runpod_*.md
-# for the full archaeology) so that a RunPod pod is "quant-ready" the
-# instant it boots — no apt-get, no pip, no JIT compile during the run.
+# Bakes every gotcha we discovered the hard way so that a RunPod pod is
+# "quant-ready" the instant it boots — no apt-get, no pip, no JIT compile
+# during the run.
 #
 # Built and pushed by .github/workflows/build-runpod-image.yml on tags.
 
