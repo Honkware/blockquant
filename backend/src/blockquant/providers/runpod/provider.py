@@ -740,6 +740,27 @@ class RunPodProvider(Provider):
             logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
             return False
 
+        # exllamav3 0.0.37 hard-imports flash_attn at module load. We do not
+        # install real flash-attn (no wheel for this torch/CUDA), so drop the
+        # same import stub the prebaked image uses, beside the installed package
+        # so it shares its sys.path entry.
+        if not self.install_flash_attn:
+            site = self.run(
+                instance_id,
+                f"{py} -c \"import importlib.util as u, os; "
+                "s = u.find_spec('exllamav3'); "
+                "print(os.path.dirname(os.path.dirname(s.origin)) if s and s.origin else '')\"",
+            )
+            site_lines = [ln for ln in site["stdout"].strip().splitlines() if ln.strip()]
+            site_dir = site_lines[-1] if site_lines else ""
+            if not site_dir:
+                logger.error("Could not locate site-packages for flash_attn stub")
+                return False
+            self._upload_bytes(
+                instance_id, self._FLASH_ATTN_STUB.read_bytes(), f"{site_dir}/flash_attn.py"
+            )
+            logger.info(f"Installed flash_attn stub at {site_dir}/flash_attn.py")
+
         # Formatron is chronically broken against current pydantic in many base images,
         # and the exllamav3 top-level __init__ hard-imports FormatronFilter even for
         # quant-only workflows that never touch generation. Test whether the import
@@ -807,6 +828,7 @@ class RunPodProvider(Provider):
     # parents[4] is the backend/ root that holds templates/.
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
+    _FLASH_ATTN_STUB = Path(__file__).resolve().parents[5] / "docker" / "flash_attn_stub.py"
 
     @classmethod
     def _load_quant_script(cls) -> bytes:
