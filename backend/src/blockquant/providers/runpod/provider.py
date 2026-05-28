@@ -758,6 +758,21 @@ class RunPodProvider(Provider):
                 return False
             logger.info(f"flash_attn SDPA-fallback patch: {result['stdout'].strip()}")
 
+        # exllamav3's PyPI wheel omits the bundled calibration corpus, so
+        # convert.py can't find conversion/standard_cal_data/c4.utf8. Fetch it
+        # from the source repo into the installed package.
+        self._upload_bytes(
+            instance_id, self._CAL_DATA_FETCH.read_bytes(), "/tmp/fetch_cal_data.py"
+        )
+        result = self.run(instance_id, f"{py} /tmp/fetch_cal_data.py")
+        if result["code"] != 0:
+            logger.error(
+                "calibration data fetch failed: "
+                f"{result['stdout'].strip()} {result['stderr'][:1000]}"
+            )
+            return False
+        logger.info(f"calibration data: {result['stdout'].strip()}")
+
         # Formatron is chronically broken against current pydantic in many base images,
         # and the exllamav3 top-level __init__ hard-imports FormatronFilter even for
         # quant-only workflows that never touch generation. Test whether the import
@@ -826,6 +841,7 @@ class RunPodProvider(Provider):
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
     _FLASH_PATCH = Path(__file__).resolve().parents[5] / "docker" / "patch_flash_attn.py"
+    _CAL_DATA_FETCH = Path(__file__).resolve().parents[5] / "docker" / "fetch_cal_data.py"
 
     @classmethod
     def _load_quant_script(cls) -> bytes:
