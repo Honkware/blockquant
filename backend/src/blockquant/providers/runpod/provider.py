@@ -19,6 +19,7 @@ Requirements:
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -478,6 +479,13 @@ class RunPodProvider(Provider):
                 finally:
                     sftp.close()
             except transient as e:
+                # Deterministic filesystem errors (missing parent dir, perms)
+                # never succeed on retry, so surface them immediately instead
+                # of spinning through the backoff.
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR
+                ):
+                    raise
                 last_err = e
                 if attempt == retries - 1:
                     raise
@@ -734,18 +742,22 @@ class RunPodProvider(Provider):
                 "    def __init__(self, *a, **kw):\n"
                 "        raise RuntimeError('FormatronFilter stubbed out (formatron broken in env)')\n"
             )
-            # Find the exllamav3 filter module regardless of local vs PyPI install.
+            # Locate the installed formatron.py WITHOUT importing exllamav3.
+            # Its __init__ hard-imports the broken FormatronFilter, so importing
+            # it is exactly what fails here. find_spec resolves the path without
+            # executing the package, and works for PyPI and editable installs.
             locate = self.run(
                 instance_id,
-                f"{py} -c 'import exllamav3, os; "
-                "p = os.path.join(os.path.dirname(exllamav3.__file__), \"generator\", \"filter\", \"formatron.py\"); "
-                "print(p)' 2>/dev/null || true",
+                f"{py} -c \"import importlib.util as u, os; "
+                "s = u.find_spec('exllamav3'); "
+                "print(os.path.join(os.path.dirname(s.origin), 'generator', 'filter', 'formatron.py') "
+                "if s and s.origin else '')\"",
             )
-            remote_formatron = locate["stdout"].strip().splitlines()
-            remote_formatron = remote_formatron[-1] if remote_formatron else ""
+            lines = [ln for ln in locate["stdout"].strip().splitlines() if ln.strip()]
+            remote_formatron = lines[-1] if lines else ""
             if not remote_formatron:
-                # Fall back to the known local-upload path.
-                remote_formatron = "/workspace/exllamav3/exllamav3/generator/filter/formatron.py"
+                logger.error("Could not locate exllamav3 formatron module to stub")
+                return False
             self._upload_bytes(
                 instance_id, formatron_shim.encode("utf-8"), remote_formatron
             )
