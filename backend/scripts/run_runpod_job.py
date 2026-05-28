@@ -310,7 +310,14 @@ def main():
     finally:
         if not args.keep_pod:
             print(f"Terminating pod {instance_id}...")
-            provider.terminate(instance_id)
+            if not provider.terminate(instance_id):
+                print(
+                    f"\n  !! POD {instance_id} MAY STILL BE RUNNING AND BILLING !!\n"
+                    f"     Could not confirm termination. Kill it manually now:\n"
+                    f"     https://www.runpod.io/console/pods\n",
+                    file=sys.stderr, flush=True,
+                )
+                sys.exit(2)
         else:
             print(f"Pod {instance_id} kept alive (--keep-pod). Remember to terminate manually.")
 

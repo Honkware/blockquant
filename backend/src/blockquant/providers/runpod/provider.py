@@ -211,14 +211,80 @@ class RunPodProvider(Provider):
         logger.info(f"RunPod created: {self._pod_id}")
         return self._pod_id
 
-    def terminate(self, instance_id: str):
+    # Pod stops billing once it hits one of these, or 404s.
+    _TERMINAL_STATES = ("EXITED", "TERMINATED", "FAILED", "GONE")
+    _CONSOLE_URL = "https://www.runpod.io/console/pods"
+
+    def get_pod_status(self, instance_id: str) -> str:
+        """Pod state from RunPod. Returns desiredStatus, or GONE if missing."""
+        pod = self._get_pod_resilient(instance_id)
+        if pod is None:
+            return "GONE"
+        return pod.get("desiredStatus", "UNKNOWN")
+
+    def terminate(
+        self,
+        instance_id: str,
+        retries: int = 5,
+        verify: bool = True,
+        verify_timeout: int = 120,
+        poll_interval: int = 5,
+    ) -> bool:
+        """Terminate a pod and confirm it stopped.
+
+        A one-shot terminate can leave a pod running: one transient API error
+        and it keeps billing behind a single warning log. So retry the call,
+        then poll until the pod reports a terminal state or 404s. Returns True
+        only when confirmed. On failure, logs the console URL and returns
+        False. Never raises, so it is safe in a finally.
+        """
         rp = _ensure_runpod()
         rp.api_key = self.api_key
-        try:
-            rp.terminate_pod(instance_id)
-            logger.info(f"RunPod terminated: {instance_id}")
-        except Exception as e:
-            logger.warning(f"RunPod terminate failed: {e}")
+
+        def _request_terminate():
+            try:
+                rp.terminate_pod(instance_id)
+                return None
+            except Exception as e:  # noqa: BLE001
+                return e
+
+        last_err = None
+        for attempt in range(retries):
+            last_err = _request_terminate()
+            if last_err is None:
+                logger.info(f"RunPod terminate requested: {instance_id}")
+                break
+            wait = min(2 ** attempt, 30)
+            logger.warning(
+                f"terminate attempt {attempt + 1}/{retries} failed for "
+                f"{instance_id}: {last_err}; retry in {wait}s"
+            )
+            time.sleep(wait)
+
+        if not verify:
+            return last_err is None
+
+        # A successful request does not prove the pod stopped, so poll the
+        # control plane. Re-issue terminate each loop in case it did not take.
+        deadline = time.time() + verify_timeout
+        while time.time() < deadline:
+            try:
+                status = self.get_pod_status(instance_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"status check failed for {instance_id}: {e}")
+                status = "UNKNOWN"
+            if status in self._TERMINAL_STATES:
+                logger.info(f"RunPod terminate confirmed: {instance_id} ({status})")
+                return True
+            _request_terminate()
+            time.sleep(poll_interval)
+
+        logger.error(
+            f"COULD NOT CONFIRM TERMINATION of pod {instance_id} after "
+            f"{verify_timeout}s. It may still be running and billing. "
+            f"Terminate it manually at {self._CONSOLE_URL} (last error: {last_err})"
+        )
+        return False
 
     def _get_pod_resilient(self, instance_id: str):
         """rp.get_pod() with retry on transient network errors (TLS reset, etc.)."""
