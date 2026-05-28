@@ -152,25 +152,77 @@ def test_launch_with_network_volume(mock_ensure, mock_ssh_key, fake_pod):
 # Terminate
 # ---------------------------------------------------------------------------
 
+@patch("blockquant.providers.runpod.provider.time.sleep", lambda *_: None)
 @patch("blockquant.providers.runpod.provider._ensure_runpod")
-def test_terminate(mock_ensure, mock_ssh_key):
+def test_terminate_confirmed_when_pod_gone(mock_ensure, mock_ssh_key):
     mock_rp = MagicMock()
+    mock_rp.get_pod.return_value = None  # pod no longer exists -> GONE
     mock_ensure.return_value = mock_rp
 
     provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
-    provider.terminate("pod-abc123")
+    assert provider.terminate("pod-abc123") is True
+    mock_rp.terminate_pod.assert_called_with("pod-abc123")
 
-    mock_rp.terminate_pod.assert_called_once_with("pod-abc123")
 
-
+@patch("blockquant.providers.runpod.provider.time.sleep", lambda *_: None)
 @patch("blockquant.providers.runpod.provider._ensure_runpod")
-def test_terminate_graceful_on_error(mock_ensure, mock_ssh_key):
+def test_terminate_confirmed_via_exited_status(mock_ensure, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_rp.get_pod.return_value = {"desiredStatus": "EXITED"}
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    assert provider.terminate("pod-abc123") is True
+
+
+@patch("blockquant.providers.runpod.provider.time.sleep", lambda *_: None)
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_terminate_recovers_when_pod_gone_despite_api_error(mock_ensure, mock_ssh_key):
+    """terminate_pod keeps erroring, but the pod is in fact gone -> confirmed."""
     mock_rp = MagicMock()
     mock_rp.terminate_pod.side_effect = RuntimeError("network")
+    mock_rp.get_pod.return_value = None
     mock_ensure.return_value = mock_rp
 
     provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
-    provider.terminate("pod-abc123")  # should swallow
+    assert provider.terminate("pod-abc123") is True
+
+
+@patch("blockquant.providers.runpod.provider.time.sleep", lambda *_: None)
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_terminate_unconfirmed_returns_false(mock_ensure, mock_ssh_key):
+    """Pod stays RUNNING and terminate keeps failing -> returns False, no raise."""
+    mock_rp = MagicMock()
+    mock_rp.terminate_pod.side_effect = RuntimeError("network")
+    mock_rp.get_pod.return_value = {"desiredStatus": "RUNNING"}
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    assert provider.terminate("pod-abc123", verify_timeout=1, poll_interval=0) is False
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_terminate_no_verify_returns_request_result(mock_ensure, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    assert provider.terminate("pod-abc123", verify=False) is True
+    mock_rp.terminate_pod.assert_called_once_with("pod-abc123")
+    mock_rp.get_pod.assert_not_called()
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_get_pod_status(mock_ensure, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_ensure.return_value = mock_rp
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+
+    mock_rp.get_pod.return_value = {"desiredStatus": "RUNNING"}
+    assert provider.get_pod_status("pod-abc123") == "RUNNING"
+
+    mock_rp.get_pod.return_value = None
+    assert provider.get_pod_status("pod-abc123") == "GONE"
 
 
 # ---------------------------------------------------------------------------
