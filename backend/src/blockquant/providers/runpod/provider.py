@@ -871,9 +871,9 @@ class RunPodProvider(Provider):
         self._last_result = None
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
-        # pod_id + runpod_api_key + keep_pod let the in-pod script
-        # self-terminate after [done] without depending on the local
-        # poll loop being alive — see remote/quant.py:_self_terminate.
+        # pod_id + runpod_api_key + keep_pod arm the in-pod self-terminate
+        # backstop after [done] for the case where the local controller dies.
+        # See remote/quant.py:_arm_self_terminate_backstop.
         cfg: dict = {
             "model_id": model_id,
             "variants": list(variants),
