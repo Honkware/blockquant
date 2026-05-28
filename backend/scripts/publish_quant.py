@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Post-upload publisher for a single EXL3 quant variant.
+"""Finalize EXL3 cards and the collection for a model.
 
-Run this AFTER an ``[upload] complete`` event for ``--bpw <X.X>``. It:
+Run this once after the quants have been uploaded (one variant per pod in a
+parallel run, or all variants in a single run). For the given base model it:
 
-  1. Queries HuggingFace for the actual repo size (no more guessing).
-  2. Renders the card from ``backend/templates/card_template.md``, building
-     the Quants table dynamically from which sibling repos exist on HF.
-  3. Pushes the card + coerces ``quantization_config.bits`` to int via
+  1. Queries HuggingFace for which ``-exl3-{bpw}bpw`` repos exist and their
+     real sizes.
+  2. Renders each card from ``backend/templates/card_template.md`` with the
+     full cross-linked Quants table.
+  3. Pushes the card and coerces ``quantization_config.bits`` to int via
      ``fix_repo_card_and_config.py --card-file``.
-  4. Adds the repo to the user's HF collection (idempotent).
-  5. Re-pushes already-shipped sibling cards so their Quants tables
-     stay in sync (the new variant becomes "link" instead of "queued").
+  4. Creates or reuses the per-model collection and adds every repo to it.
+
+This is model-agnostic and idempotent, so it doubles as a resync: re-run it
+any time to bring every card's table back in sync.
 
 Usage::
 
-    python backend/scripts/publish_quant.py --bpw 3.0
+    python backend/scripts/publish_quant.py \\
+        --base huihui-ai/Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated \\
+        --hf-org blockblockblock
 """
 from __future__ import annotations
 
@@ -38,16 +43,9 @@ sys.path.insert(0, str(REPO_ROOT / "backend" / "src"))
 from blockquant import cards  # noqa: E402  (after sys.path setup)
 
 FIX_SCRIPT = REPO_ROOT / "backend" / "scripts" / "fix_repo_card_and_config.py"
-COLLECTION_SLUG = (
-    "blockblockblock/qwen36-35b-a3b-claude-47-opus-reasoning-distilled-exl3"
-    "-69ece89b196fa4ae78d37550"
-)
 
-# Variants we plan to ship for this model. Cal-rows reflects the --profile
-# that was used per-variant: fast=128 for the lower bpws, balanced=250 for
-# the higher bpws.
-KNOWN_VARIANTS = ["3.0", "4.0", "4.5", "5.0", "6.0"]
-CAL_ROWS = {"3.0": 128, "4.0": 128, "4.5": 250, "5.0": 250, "6.0": 250}
+DEFAULT_VARIANTS = "3.0,4.0,4.5,5.0,6.0"
+
 
 def _real_size_gb(api, repo_id: str) -> float | None:
     """Sum of every file in the repo. Returns None when the repo doesn't
@@ -65,15 +63,14 @@ def _real_size_gb(api, repo_id: str) -> float | None:
         return None
 
 
-def _quant_rows(api, base_name: str, hf_org: str) -> list[dict]:
+def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[dict]:
     """Build the Quants-table rows from which sibling repos exist on HF."""
     rows = []
-    for v in KNOWN_VARIANTS:
+    for v in variants:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
-        real = _real_size_gb(api, repo_id)
         rows.append({
-            "variant": v, "head_bits": 8, "cal_rows": CAL_ROWS.get(v, 250),
-            "size_gb": real,
+            "variant": v, "head_bits": head_bits, "cal_rows": cal_rows,
+            "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
         })
     return rows
@@ -111,32 +108,20 @@ def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
         os.unlink(tmp_path)
 
 
-def _add_to_collection(repo_id: str, token: str) -> None:
-    from huggingface_hub import add_collection_item
-    try:
-        add_collection_item(
-            collection_slug=COLLECTION_SLUG,
-            item_id=repo_id,
-            item_type="model",
-            token=token,
-            exists_ok=True,
-        )
-        print(f"[publish] collection: + {repo_id}", flush=True)
-    except Exception as e:
-        print(f"[publish] collection add WARN: {type(e).__name__}: {e}",
-              flush=True)
-
-
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bpw", required=True, help="Variant just uploaded, e.g. 3.0")
-    ap.add_argument("--base", default="lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled")
-    ap.add_argument("--hf-org", default="blockblockblock")
-    ap.add_argument(
-        "--also-resync", default="3.0,4.0,4.5,5.0,6.0",
-        help="Comma-list of sibling bpws whose cards should be re-rendered"
-             " so their Quants tables show the newly-shipped variant as link.",
-    )
+    ap = argparse.ArgumentParser(description="Finalize EXL3 cards + collection for a model.")
+    ap.add_argument("--base", required=True,
+                    help="Base model repo, e.g. huihui-ai/Huihui-Qwen3.6-35B-A3B-...-abliterated")
+    ap.add_argument("--hf-org", default="",
+                    help="Namespace the quants live under (default: the token owner).")
+    ap.add_argument("--variants", default=DEFAULT_VARIANTS,
+                    help="Comma list of bpws to consider; only those present on HF are rendered.")
+    ap.add_argument("--collection", default="auto",
+                    help="'auto' to create/reuse a per-model collection, a collection slug to "
+                         "add to, or 'off' to skip collections.")
+    ap.add_argument("--cal-rows", type=int, default=512,
+                    help="Calibration rows shown in the recipe table.")
+    ap.add_argument("--head-bits", type=int, default=8)
     ap.add_argument("--title", default=None,
                     help="Hand-curated card heading; auto-derived from the name when omitted.")
     args = ap.parse_args()
@@ -150,45 +135,45 @@ def main():
     api = HfApi(token=token)
 
     base_name = args.base.split("/")[-1]
+    hf_org = args.hf_org or api.whoami().get("name", "")
+    if not hf_org:
+        print("ERROR: could not resolve HF org (pass --hf-org)"); sys.exit(1)
+
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     model_config = _load_base_config(args.base, token)
     license_id = cards.fetch_license(args.base, token)
-    collection_url = f"https://huggingface.co/collections/{COLLECTION_SLUG}"
-    quant_rows = _quant_rows(api, base_name, args.hf_org)
+    quant_rows = _quant_rows(api, base_name, hf_org, variants, args.cal_rows, args.head_bits)
 
-    # The complete list of bpws we want re-synced — current + siblings that
-    # are already published so their tables flip "queued" -> "link".
-    targets = [b.strip() for b in args.also_resync.split(",") if b.strip()]
-    if args.bpw not in targets:
-        targets.insert(0, args.bpw)
+    # Resolve the collection slug once, up front.
+    if args.collection == "off":
+        slug = ""
+    elif args.collection == "auto":
+        slug = cards.create_model_collection(owner=hf_org, base_name=base_name, token=token)
+    else:
+        slug = args.collection
+    coll_url = cards.collection_url(slug) or f"https://huggingface.co/{hf_org}"
 
-    # Skip targets that aren't published yet (still queued).
-    published = []
-    for v in targets:
-        repo_id = f"{args.hf_org}/{base_name}-exl3-{v}bpw"
-        if v == args.bpw or _real_size_gb(api, repo_id) is not None:
-            published.append(v)
-
-    print(f"[publish] re-syncing cards for: {', '.join(published)}", flush=True)
+    published = [r["variant"] for r in quant_rows if r["size_gb"] is not None]
+    if not published:
+        print("[publish] no uploaded variants found on HF for this model yet.")
+        sys.exit(1)
+    print(f"[publish] finalizing cards for: {', '.join(published)}", flush=True)
 
     for v in published:
-        repo_id = f"{args.hf_org}/{base_name}-exl3-{v}bpw"
+        repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
         size_gb = _real_size_gb(api, repo_id)
-        if size_gb is None:
-            # Should not happen since we filtered, but guard anyway.
-            print(f"[publish] skip {v} — repo not on HF yet", flush=True)
-            continue
-
         rendered = cards.render_exl3_card(
             base_repo=args.base, repo_id=repo_id, variant=v,
-            head_bits=8, cal_rows=CAL_ROWS.get(v, 250), size_gb=size_gb,
+            head_bits=args.head_bits, cal_rows=args.cal_rows, size_gb=size_gb,
             model_config=model_config, quant_rows=quant_rows,
-            collection_url=collection_url, license_id=license_id,
-            quantized_by=args.hf_org, title_override=args.title,
+            collection_url=coll_url, license_id=license_id,
+            quantized_by=hf_org, title_override=args.title,
         )
         _push_card(repo_id, args.base, v, rendered)
-        _add_to_collection(repo_id, token)
-        print(f"[publish] {v} bpw DONE -> https://huggingface.co/{repo_id}",
-              flush=True)
+        cards.add_to_collection(slug, repo_id, token)
+        print(f"[publish] {v} bpw done -> https://huggingface.co/{repo_id}", flush=True)
+    if slug:
+        print(f"[publish] collection: {coll_url}", flush=True)
 
 
 if __name__ == "__main__":

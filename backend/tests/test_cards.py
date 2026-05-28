@@ -1,7 +1,46 @@
 """Tests for the shared EXL3 card renderer."""
 import re
+import sys
+import types
 
 from blockquant import cards
+
+
+def _fake_hf(monkeypatch, **attrs):
+    mod = types.ModuleType("huggingface_hub")
+    for name, value in attrs.items():
+        setattr(mod, name, value)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", mod)
+    return mod
+
+
+def test_create_model_collection_returns_slug(monkeypatch):
+    class Coll:
+        slug = "owner/foo-exl3-abc123"
+
+    _fake_hf(monkeypatch, create_collection=lambda **kw: Coll())
+    slug = cards.create_model_collection(owner="owner", base_name="Foo-7B", token="t")
+    assert slug == "owner/foo-exl3-abc123"
+
+
+def test_add_to_collection_is_called(monkeypatch):
+    calls = []
+    _fake_hf(monkeypatch, add_collection_item=lambda **kw: calls.append(kw))
+    cards.add_to_collection("owner/foo-abc", "owner/Foo-7B-exl3-4.5bpw", "t")
+    assert calls and calls[0]["collection_slug"] == "owner/foo-abc"
+    assert calls[0]["item_id"] == "owner/Foo-7B-exl3-4.5bpw"
+
+
+def test_add_to_collection_noop_without_slug(monkeypatch):
+    calls = []
+    _fake_hf(monkeypatch, add_collection_item=lambda **kw: calls.append(kw))
+    cards.add_to_collection("", "owner/whatever", "t")
+    assert calls == []
+
+
+def test_collection_url():
+    assert cards.collection_url("owner/x").endswith("/collections/owner/x")
+    assert cards.collection_url("") == ""
 
 
 def test_pretty_title_override_wins():
