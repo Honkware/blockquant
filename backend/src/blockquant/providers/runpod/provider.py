@@ -673,14 +673,20 @@ class RunPodProvider(Provider):
         # and transformers/sentencepiece are used across the stack. These overlap with
         # exllamav3's own requirements.txt but we install them first so a pre-upload
         # failure is cheap to diagnose.
-        logger.info("Installing HF deps...")
+        # The full runtime set exllamav3 needs, matching the prebaked image.
+        # We install these explicitly because exllamav3 is installed --no-deps
+        # below (its 0.0.37 metadata hard-requires flash-attn, which has no
+        # wheel for this torch/CUDA and fails to build).
+        logger.info("Installing HF + exllamav3 runtime deps...")
         result = self.run(
             instance_id,
             f"{py} -m pip install --no-cache-dir --upgrade "
-            "huggingface-hub transformers sentencepiece tqdm psutil",
+            "huggingface-hub transformers tokenizers safetensors datasets "
+            "numpy Pillow marisa-trie pydantic kbnf formatron rich tqdm "
+            "psutil sentencepiece pyyaml typing_extensions",
         )
         if result["code"] != 0:
-            logger.error(f"HF deps install failed: {result['stderr'][:2000]}")
+            logger.error(f"runtime deps install failed: {result['stderr'][:2000]}")
             return False
 
         if self.install_flash_attn:
@@ -724,8 +730,15 @@ class RunPodProvider(Provider):
                 f"cd {remote_dir} && {py} -m pip install -e . --no-deps",
             )
         else:
-            logger.info("Installing exllamav3 from PyPI (with deps)...")
-            result = self.run(instance_id, f"{py} -m pip install --upgrade exllamav3")
+            logger.info("Installing exllamav3 from PyPI (--no-deps; flash-attn excluded)...")
+            result = self.run(
+                instance_id,
+                f"{py} -m pip install --no-cache-dir --upgrade --no-deps exllamav3",
+            )
+
+        if result["code"] != 0:
+            logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
+            return False
 
         # Formatron is chronically broken against current pydantic in many base images,
         # and the exllamav3 top-level __init__ hard-imports FormatronFilter even for
@@ -762,10 +775,6 @@ class RunPodProvider(Provider):
                 instance_id, formatron_shim.encode("utf-8"), remote_formatron
             )
             logger.info(f"Stubbed {remote_formatron}")
-
-        if result["code"] != 0:
-            logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
-            return False
 
         logger.info("Health check...")
         result = self.run(
