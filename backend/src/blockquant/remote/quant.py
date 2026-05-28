@@ -51,29 +51,21 @@ def emit_result(payload: dict) -> None:
 
 
 def _self_terminate(pod_id: str, api_key: str) -> None:
-    """Best-effort RunPod self-terminate via the GraphQL API.
+    """Best-effort RunPod self-terminate via the REST API.
 
-    Uses urllib so we don't depend on the runpod SDK being installed
-    inside the pod. Errors are logged but never raised — the work is
-    already done, we just want to stop burning credit.
+    Uses urllib so we don't depend on the runpod SDK being installed inside
+    the pod. Errors are logged but never raised: the work is already done, we
+    just want to stop burning credit. The legacy GraphQL endpoint returns 403
+    for rpa_ keys, so use the v1 REST DELETE with Bearer auth.
     """
     import urllib.request
-    body = json.dumps({
-        "query": (
-            "mutation PodTerminate($podId: String!) { "
-            "podTerminate(input: {podId: $podId}) "
-            "}"
-        ),
-        "variables": {"podId": pod_id},
-    }).encode("utf-8")
     req = urllib.request.Request(
-        f"https://api.runpod.io/graphql?api_key={api_key}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"https://rest.runpod.io/v1/pods/{pod_id}",
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="DELETE",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             print(f"[self-terminate] http {r.status}", flush=True)
     except Exception as e:
         print(f"[self-terminate] WARN {type(e).__name__}: {e}",
@@ -234,8 +226,9 @@ def main() -> int:
             try:
                 _write_cards(outputs, model_id, model_name, owner, hf_token,
                              head_bits, cal_rows, model_dir)
-            except Exception as exc:
-                print(f"[card] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
+            except Exception:
+                import traceback
+                print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
 
             repo_ids = []
             for out in outputs:
