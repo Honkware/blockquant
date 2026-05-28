@@ -2,42 +2,41 @@
 license: {{LICENSE}}
 base_model: {{BASE_REPO}}
 base_model_relation: quantized
-quantized_by: blockblockblock
+quantized_by: {{QUANTIZED_BY}}
 library_name: exllamav3
 pipeline_tag: text-generation
 tags:
   - exl3
   - exllamav3
   - quantized
-  - mixture-of-experts
-  - qwen
+{{EXTRA_TAGS}}
 quantization_format: exl3
 bits_per_weight: {{BPW}}
 ---
 
 <div align="center">
 
-# Qwen3.6 · 35B-A3B · Claude 4.7 Opus Reasoning Distilled
+# {{TITLE}}
 
-<sub><code>EXL3</code> &nbsp;·&nbsp; <b>{{BPW}}&nbsp;bpw</b> &nbsp;·&nbsp; {{SIZE_GB}}&nbsp;GB &nbsp;·&nbsp; Mixture&#8209;of&#8209;Experts &nbsp;·&nbsp; 48 layers &times; 256 experts</sub>
+<sub><code>EXL3</code> &nbsp;·&nbsp; <b>{{BPW}}&nbsp;bpw</b> &nbsp;·&nbsp; {{SIZE_GB}}&nbsp;GB &nbsp;·&nbsp; {{ARCH_LINE}}</sub>
 
 <br/>
 
 [![format](https://img.shields.io/badge/format-EXL3-c63010?style=for-the-badge&labelColor=14120e)](https://github.com/turboderp-org/exllamav3)
 [![bpw](https://img.shields.io/badge/bpw-{{BPW}}-6b8a76?style=for-the-badge&labelColor=14120e)](#quants)
 [![size](https://img.shields.io/badge/size-{{SIZE_GB_BADGE}}_GB-6b8a76?style=for-the-badge&labelColor=14120e)](#quants)
-[![arch](https://img.shields.io/badge/arch-MoE_35B--A3B-c63010?style=for-the-badge&labelColor=14120e)](https://huggingface.co/{{BASE_REPO}})
+[![arch](https://img.shields.io/badge/arch-{{ARCH_BADGE}}-c63010?style=for-the-badge&labelColor=14120e)](https://huggingface.co/{{BASE_REPO}})
 
 [![base model](https://img.shields.io/badge/Base-{{BASE_BADGE}}-2a2620?style=flat-square&logo=huggingface&logoColor=white)](https://huggingface.co/{{BASE_REPO}})
-[![quantized by](https://img.shields.io/badge/Quantized_by-blockblockblock-2a2620?style=flat-square&logo=huggingface&logoColor=white)](https://huggingface.co/blockblockblock)
-[![collection](https://img.shields.io/badge/All_bpws-Collection-c63010?style=flat-square&logo=huggingface&logoColor=white)](https://huggingface.co/collections/blockblockblock/qwen36-35b-a3b-claude-47-opus-reasoning-distilled-exl3-69ece89b196fa4ae78d37550)
+[![quantized by](https://img.shields.io/badge/Quantized_by-{{QUANTIZED_BY}}-2a2620?style=flat-square&logo=huggingface&logoColor=white)](https://huggingface.co/{{QUANTIZED_BY}})
+[![collection](https://img.shields.io/badge/All_bpws-Collection-c63010?style=flat-square&logo=huggingface&logoColor=white)]({{COLLECTION_URL}})
 
 </div>
 
 ---
 
 > [!NOTE]
-> An [ExLlamaV3](https://github.com/turboderp-org/exllamav3) build of [`{{BASE_REPO}}`](https://huggingface.co/{{BASE_REPO}}) at **{{BPW}} bits per weight** &mdash; {{POSITIONING}}. See [Quants](#quants) for sibling repos at other bit&#8209;widths or browse the [collection](https://huggingface.co/collections/blockblockblock/qwen36-35b-a3b-claude-47-opus-reasoning-distilled-exl3-69ece89b196fa4ae78d37550).
+> An [ExLlamaV3](https://github.com/turboderp-org/exllamav3) build of [`{{BASE_REPO}}`](https://huggingface.co/{{BASE_REPO}}) at **{{BPW}} bits per weight**: {{POSITIONING}}. See [Quants](#quants) for sibling repos at other bit&#8209;widths or browse the [collection]({{COLLECTION_URL}}).
 
 ## Quants
 
@@ -86,7 +85,7 @@ huggingface-cli download \
 ```
 
 <details>
-<summary><b>Quantization recipe</b> &nbsp;<sub>(advanced &mdash; embedded in <code>quantization_config.json</code>)</sub></summary>
+<summary><b>Quantization recipe</b> &nbsp;<sub>(advanced, embedded in <code>quantization_config.json</code>)</sub></summary>
 
 <br/>
 
@@ -94,11 +93,11 @@ huggingface-cli download \
 | :--- | :--- |
 | Format | `EXL3` |
 | Bits per weight | `{{BPW}}` |
-| Head bits | `8` |
+| Head bits | `{{HEAD_BITS}}` |
 | Calibration rows | `{{CAL_ROWS}}` |
 | Codebook | `MCG` |
 | Out&#8209;scales | `always` |
-| Parallel mode | `enabled` (MoE expert batching) |
+| Parallel mode | {{PARALLEL_LINE}} |
 
 Loaded automatically by every ExLlamaV3 loader; reproduced here for searchability.
 
