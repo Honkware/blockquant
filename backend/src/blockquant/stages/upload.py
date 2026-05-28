@@ -4,6 +4,7 @@ from pathlib import Path
 
 from huggingface_hub import create_repo, HfApi
 
+from blockquant import cards
 from blockquant.models import QuantConfig, QuantFormat, QuantOutput
 from blockquant.utils.logger import get_logger
 
@@ -17,20 +18,20 @@ def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> Non
         logger.warning("No HF_TOKEN — skipping upload")
         return
 
+    model_name = config.model_id.split("/")[-1]
+    owner = config.hf_org
+    if not owner:
+        try:
+            owner = HfApi(token=hf_token).whoami().get("name", "")
+        except Exception:
+            owner = ""
+
     for output in outputs:
-        model_name = config.model_id.split("/")[-1]
-        if config.hf_org:
-            repo_id = (
-                f"{config.hf_org}/{model_name}-{output.variant}bpw-exl3"
-                if output.format == QuantFormat.EXL3
-                else f"{config.hf_org}/{model_name}-{output.variant}-GGUF"
-            )
+        if output.format == QuantFormat.EXL3:
+            repo_id = cards.exl3_repo_id(owner, model_name, output.variant)
         else:
-            repo_id = (
-                f"{model_name}-{output.variant}bpw-exl3"
-                if output.format == QuantFormat.EXL3
-                else f"{model_name}-{output.variant}-GGUF"
-            )
+            slug = f"{model_name}-{output.variant}-GGUF"
+            repo_id = f"{owner}/{slug}" if owner else slug
 
         # Create repo
         create_repo(repo_id, repo_type="model", exist_ok=True, token=hf_token)
@@ -72,3 +73,9 @@ def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> Non
         output.hf_repo_id = repo_id
         output.hf_url = f"https://huggingface.co/{repo_id}"
         logger.info(f"Uploaded: {output.hf_url}")
+
+        if output.format == QuantFormat.EXL3 and owner:
+            cards.ensure_collection(
+                owner=owner, base_name=model_name, token=hf_token,
+                item_repo_ids=[repo_id],
+            )

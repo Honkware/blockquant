@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -33,7 +34,9 @@ except Exception:
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = REPO_ROOT / "backend" / "templates" / "card_template.md"
+sys.path.insert(0, str(REPO_ROOT / "backend" / "src"))
+from blockquant import cards  # noqa: E402  (after sys.path setup)
+
 FIX_SCRIPT = REPO_ROOT / "backend" / "scripts" / "fix_repo_card_and_config.py"
 COLLECTION_SLUG = (
     "blockblockblock/qwen36-35b-a3b-claude-47-opus-reasoning-distilled-exl3"
@@ -45,29 +48,6 @@ COLLECTION_SLUG = (
 # the higher bpws.
 KNOWN_VARIANTS = ["3.0", "4.0", "4.5", "5.0", "6.0"]
 CAL_ROWS = {"3.0": 128, "4.0": 128, "4.5": 250, "5.0": 250, "6.0": 250}
-
-# Per-bpw VRAM positioning copy.
-POSITIONING = {
-    "3.0": "the tightest fit — sized for 16&nbsp;GB consumer cards while leaving usable context room",
-    "4.0": "the tight&#8209;fit build, sized to leave generous context room on a 24&nbsp;GB consumer GPU and to load on 16&nbsp;GB cards at workable context lengths",
-    "4.5": "the quality-leaning sweet spot: comfortable on a single 24&nbsp;GB consumer GPU, effectively indistinguishable from FP16 on most reasoning tasks",
-    "5.0": "the quality build — fits a 24&nbsp;GB card with reduced context, ideal headroom on 32&nbsp;GB cards",
-    "6.0": "near-lossless reference quality — designed for 32&nbsp;GB+ cards (V100, A100, RTX&nbsp;6000)",
-}
-
-VRAM_HINT = {
-    "3.0": "**VRAM at 3.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Fits a 16&nbsp;GB card with workable context, comfortable on 24&nbsp;GB with very long context.",
-    "4.0": "**VRAM at 4.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Comfortable on a single 24&nbsp;GB card with room for ~24k tokens of context; fits a 16&nbsp;GB card with a ~4&ndash;6k token window.",
-    "4.5": "**VRAM at 4.5&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Comfortable on a single 24&nbsp;GB card with room for ~16k tokens of context; fits a 16&nbsp;GB card with a reduced context window.",
-    "5.0": "**VRAM at 5.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Tight on 24&nbsp;GB (limited context); comfortable on 32&nbsp;GB+.",
-    "6.0": "**VRAM at 6.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Best on 32&nbsp;GB+ cards (V100, A100, RTX&nbsp;6000) where there's room for long context.",
-}
-
-
-def _est_size_gb(bpw: float) -> float:
-    """Coarse pre-publish estimate. ~35B params plus head_bits=8 overhead."""
-    return 35.0 * bpw / 8.0 + 1.5
-
 
 def _real_size_gb(api, repo_id: str) -> float | None:
     """Sum of every file in the repo. Returns None when the repo doesn't
@@ -85,39 +65,29 @@ def _real_size_gb(api, repo_id: str) -> float | None:
         return None
 
 
-def _build_quants_table(api, base_name: str, hf_org: str, current_bpw: str) -> str:
+def _quant_rows(api, base_name: str, hf_org: str) -> list[dict]:
+    """Build the Quants-table rows from which sibling repos exist on HF."""
     rows = []
     for v in KNOWN_VARIANTS:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
         real = _real_size_gb(api, repo_id)
-        is_current = (v == current_bpw)
-        if real is not None:
-            size_str = f"{real:.1f}&nbsp;GB"
-            status = ("<kbd>this repo</kbd>" if is_current
-                      else f"[link](https://huggingface.co/{repo_id})")
-        else:
-            size_str = f"<i>~{_est_size_gb(float(v)):.0f}&nbsp;GB</i>"
-            status = "<sub>queued</sub>"
-        if is_current:
-            size_str = f"**{size_str.replace('&nbsp;', '&nbsp;')}**"
-        bold_open = "**" if is_current else ""
-        bold_close = "**" if is_current else ""
-        rows.append(
-            f"| {bold_open}{v}{bold_close} | 8 | {CAL_ROWS[v]} | {size_str} | {status} |"
-        )
-    header = (
-        "| BPW &nbsp; | &nbsp; Head bits &nbsp; | "
-        "&nbsp; Calibration rows &nbsp; | &nbsp; Size &nbsp; | &nbsp; Status |\n"
-        "| :---: | :---: | :---: | ---: | :--- |"
-    )
-    return header + "\n" + "\n".join(rows)
+        rows.append({
+            "variant": v, "head_bits": 8, "cal_rows": CAL_ROWS.get(v, 250),
+            "size_gb": real,
+            "url": f"https://huggingface.co/{repo_id}",
+        })
+    return rows
 
 
-def _render(template: str, ctx: dict) -> str:
-    out = template
-    for k, v in ctx.items():
-        out = out.replace("{{" + k + "}}", v)
-    return out
+def _load_base_config(base_repo: str, token: str) -> dict:
+    """Fetch the base model's config.json for architecture facts."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(base_repo, "config.json", token=token or None)
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
@@ -167,6 +137,8 @@ def main():
         help="Comma-list of sibling bpws whose cards should be re-rendered"
              " so their Quants tables show the newly-shipped variant as link.",
     )
+    ap.add_argument("--title", default=None,
+                    help="Hand-curated card heading; auto-derived from the name when omitted.")
     args = ap.parse_args()
 
     load_dotenv(REPO_ROOT / ".env", override=True)
@@ -178,7 +150,10 @@ def main():
     api = HfApi(token=token)
 
     base_name = args.base.split("/")[-1]
-    template = TEMPLATE.read_text(encoding="utf-8")
+    model_config = _load_base_config(args.base, token)
+    license_id = cards.fetch_license(args.base, token)
+    collection_url = f"https://huggingface.co/collections/{COLLECTION_SLUG}"
+    quant_rows = _quant_rows(api, base_name, args.hf_org)
 
     # The complete list of bpws we want re-synced — current + siblings that
     # are already published so their tables flip "queued" -> "link".
@@ -203,21 +178,13 @@ def main():
             print(f"[publish] skip {v} — repo not on HF yet", flush=True)
             continue
 
-        ctx = {
-            "BASE_REPO": args.base,
-            "BASE_BADGE": args.base.replace("/", "%2F").replace("-", "--"),
-            "BPW": v,
-            "SIZE_GB": f"{size_gb:.1f}",
-            "SIZE_GB_BADGE": f"{size_gb:.1f}",
-            "REPO_ID": repo_id,
-            "SHORT_NAME": f"{base_name}-exl3-{v}bpw",
-            "CAL_ROWS": str(CAL_ROWS.get(v, 250)),
-            "POSITIONING": POSITIONING.get(v, f"the {v} bpw build"),
-            "VRAM_HINT": VRAM_HINT.get(v,
-                f"**VRAM at {v}&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead."),
-            "QUANTS_TABLE": _build_quants_table(api, base_name, args.hf_org, v),
-        }
-        rendered = _render(template, ctx)
+        rendered = cards.render_exl3_card(
+            base_repo=args.base, repo_id=repo_id, variant=v,
+            head_bits=8, cal_rows=CAL_ROWS.get(v, 250), size_gb=size_gb,
+            model_config=model_config, quant_rows=quant_rows,
+            collection_url=collection_url, license_id=license_id,
+            quantized_by=args.hf_org, title_override=args.title,
+        )
         _push_card(repo_id, args.base, v, rendered)
         _add_to_collection(repo_id, token)
         print(f"[publish] {v} bpw DONE -> https://huggingface.co/{repo_id}",
