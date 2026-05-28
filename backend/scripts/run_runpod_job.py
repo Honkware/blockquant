@@ -25,6 +25,7 @@ for stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.poll import poll_remote, DEFAULT_MAX_RUNTIME_S, DEFAULT_STALL_TIMEOUT_S
 from dotenv import load_dotenv
 
 # override=True so .env always wins over stale values in the ambient shell
@@ -74,6 +75,14 @@ def main():
     )
     parser.add_argument("--keep-pod", action="store_true", help="Don't terminate pod after completion")
     parser.add_argument("--poll-interval", type=int, default=15, help="Progress poll interval in seconds")
+    parser.add_argument(
+        "--max-runtime", type=int, default=DEFAULT_MAX_RUNTIME_S,
+        help="Hard cap in seconds on the remote run before the pod is terminated (default 8h).",
+    )
+    parser.add_argument(
+        "--stall-timeout", type=int, default=DEFAULT_STALL_TIMEOUT_S,
+        help="Terminate if no new log output arrives for this many seconds (default 60m).",
+    )
     # Speedup tuning surface
     parser.add_argument(
         "--profile",
@@ -269,15 +278,28 @@ def main():
 
         print(f"[5/6] Polling progress every {args.poll_interval}s...")
         last_tail = ""
-        while provider.is_pipeline_running(instance_id):
-            time.sleep(args.poll_interval)
-            tail = provider.get_progress(instance_id)
-            if tail and tail != last_tail:
-                # Print only the new tail lines
-                new = tail[len(last_tail):] if tail.startswith(last_tail) else tail
-                sys.stdout.write(new if new.endswith("\n") else new + "\n")
-                sys.stdout.flush()
-                last_tail = tail
+
+        def _print_new(tail):
+            nonlocal last_tail
+            new = tail[len(last_tail):] if tail.startswith(last_tail) else tail
+            sys.stdout.write(new if new.endswith("\n") else new + "\n")
+            sys.stdout.flush()
+            last_tail = tail
+
+        outcome = poll_remote(
+            provider, instance_id,
+            poll_interval=args.poll_interval,
+            max_runtime=args.max_runtime,
+            stall_timeout=args.stall_timeout,
+            on_progress=_print_new,
+        )
+        if outcome != "done":
+            print(
+                f"\n[watchdog] remote run hit the '{outcome}' limit; terminating pod.",
+                flush=True,
+            )
+            sys.exit(3)  # finally still terminates the pod
+
         # One deep final drain (last ~500 lines) so the local log captures
         # the last batch of remote output (final quantize layers, the
         # upload-complete line, status sentinel) — the routine 30-line

@@ -32,6 +32,7 @@ from blockquant.receipts import (
 )
 from blockquant.stages import download, convert, quantize, verify, report, upload, quality
 from blockquant.providers import get_provider
+from blockquant.poll import poll_remote
 from blockquant.monitoring import record_job_start, record_job_complete
 from blockquant.utils.logger import get_logger
 
@@ -109,15 +110,17 @@ def _run_remote_pipeline(
             use_imatrix=config.use_imatrix,
         )
 
-        # Poll until the remote process exits.
-        last_progress = ""
-        while provider.is_pipeline_running(instance_id):
-            time.sleep(5)
-            progress = provider.get_progress(instance_id)
-            if progress and progress != last_progress:
-                last_progress = progress
-                last_line = progress.strip().split("\n")[-1]
-                _report("cloud_run", 50, last_line[:200])
+        # Poll until the remote process exits, bounded so a hung pod cannot
+        # bill indefinitely.
+        def _on_progress(progress):
+            last_line = progress.strip().split("\n")[-1]
+            _report("cloud_run", 50, last_line[:200])
+
+        outcome = poll_remote(
+            provider, instance_id, poll_interval=5, on_progress=_on_progress,
+        )
+        if outcome != "done":
+            raise RuntimeError(f"remote pipeline {outcome}; terminating pod")
 
         _report("cloud_run", 90, "Remote pipeline finished")
         update_receipt_stage(receipt_path, "cloud_run", "success")
