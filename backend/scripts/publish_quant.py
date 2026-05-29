@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -100,14 +101,35 @@ def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
         os.unlink(tmp_path)
 
 
+def _discover_variants(api, base_name: str, hf_org: str) -> list[str]:
+    """Every bpw we actually published for this base, found by listing the org's
+    repos. Scoped to ``{hf_org}/{base_name}-exl3-<bpw>bpw`` so it only ever picks
+    up our own quants of THIS model (never another model or someone else's repo).
+    """
+    pat = re.compile(rf"^{re.escape(hf_org)}/{re.escape(base_name)}-exl3-([0-9.]+)bpw$")
+    found = []
+    try:
+        for m in api.list_models(author=hf_org, limit=1000):
+            rid = getattr(m, "id", None) or getattr(m, "modelId", "") or ""
+            mm = pat.match(rid)
+            if mm:
+                found.append(mm.group(1))
+    except Exception as e:
+        print(f"[publish] discovery failed ({e}); falling back to --variants", flush=True)
+        return []
+    return sorted(set(found), key=lambda x: float(x))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Finalize EXL3 cards + collection for a model.")
     ap.add_argument("--base", required=True,
                     help="Base model repo, e.g. huihui-ai/Huihui-Qwen3.6-35B-A3B-...-abliterated")
     ap.add_argument("--hf-org", default="",
                     help="Namespace the quants live under (default: the token owner).")
-    ap.add_argument("--variants", default=DEFAULT_VARIANTS,
-                    help="Comma list of bpws to consider; only those present on HF are rendered.")
+    ap.add_argument("--variants", default="",
+                    help="Comma list of bpws to cross-link. Default: auto-discover "
+                         "exactly the bpws we published for this model under --hf-org "
+                         "(so it never includes variants we didn't make).")
     ap.add_argument("--cal-rows", type=int, default=250)
     ap.add_argument("--head-bits", type=int, default=8)
     ap.add_argument("--title", default=None,
@@ -128,6 +150,9 @@ def main():
         print("ERROR: could not resolve HF org (pass --hf-org)"); sys.exit(1)
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    if not variants:
+        variants = _discover_variants(api, base_name, hf_org)
+        print(f"[publish] discovered our variants on HF: {', '.join(variants) or 'none'}", flush=True)
     model_config = _load_base_config(args.base, token)
     license_id = cards.fetch_license(args.base, token)
     quant_rows = _quant_rows(api, base_name, hf_org, variants, args.cal_rows, args.head_bits)
