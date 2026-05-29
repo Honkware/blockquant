@@ -34,18 +34,49 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
+def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
+    """GPU type ids with at least min_vram_gb, cheapest tier first.
+
+    The quant streams layer-by-layer (~4GB peak), so the limiter is disk, not
+    VRAM. Ordering by VRAM ascending puts the cheap small cards (A5000, 4090)
+    first; the launch loop falls through to bigger ones if they are out of
+    stock or short on disk.
+    """
+    import runpod
+    runpod.api_key = api_key
+    cards = []
+    for g in runpod.get_gpus():
+        gid = (g.get("id") or "").strip()
+        mem = g.get("memoryInGb") or 0
+        if not gid or gid == "unknown" or "MIG" in gid or mem < min_vram_gb:
+            continue
+        cards.append((mem, gid))
+    cards.sort(key=lambda x: x[0])
+    return [gid for _, gid in cards]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run EXL3 quantization on RunPod")
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--variants", default="4.5", help="Comma-separated BPW values")
-    parser.add_argument("--gpu", default="NVIDIA H100 80GB HBM3", help="Preferred RunPod GPU type")
+    parser.add_argument(
+        "--gpu", default="NVIDIA H100 80GB HBM3",
+        help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
+    )
     parser.add_argument(
         "--gpu-fallback",
         default="NVIDIA H100 NVL,NVIDIA H100 PCIe,NVIDIA A100-SXM4-80GB",
-        help=(
-            "Comma-separated GPU types to try if --gpu is out of stock "
-            "(on 'no instances available' only; other errors abort)."
-        ),
+        help="Comma-separated GPU types to try if --gpu is out of stock. Ignored when --gpu auto.",
+    )
+    parser.add_argument(
+        "--min-vram", type=int, default=24,
+        help="With --gpu auto, only consider cards with at least this many GB of VRAM "
+             "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
+    )
+    parser.add_argument(
+        "--container-disk", type=int, default=150,
+        help="Pod container disk in GB. Lower it (~100-120 for a 35B) so cheaper, "
+             "lower-disk hosts can take the pod.",
     )
     parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
     parser.add_argument(
@@ -195,7 +226,14 @@ def main():
         header += f" hf_org={args.hf_org}"
     print(header, flush=True)
 
-    gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
+    if args.gpu.strip().lower() == "auto":
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram)
+        if not gpu_candidates:
+            print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
+            sys.exit(1)
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, cheapest first")
+    else:
+        gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
     seen = set()
     gpu_candidates = [g for g in gpu_candidates if not (g in seen or seen.add(g))]
@@ -210,6 +248,7 @@ def main():
             api_key=args.runpod_api_key,
             gpu_type=candidate,
             cloud_type=args.cloud,
+            container_disk_gb=args.container_disk,
             install_flash_attn=args.install_flash_attn,
             image=args.image,
             network_volume_id=args.network_volume_id,
@@ -221,9 +260,16 @@ def main():
             instance_id = attempt.launch({})
         except Exception as e:
             msg = str(e).lower()
-            # Match any "no(t) ... instances available" / "no capacity" phrasing RunPod throws.
-            if ("instances available" in msg and ("no " in msg or "not " in msg)) or "capacity" in msg:
-                print(f"      out of stock ({type(e).__name__}), falling through", flush=True)
+            # Any phrasing RunPod uses for "this machine can't take the pod":
+            # out of stock, no capacity, or insufficient disk/resources.
+            unavailable = (
+                ("instances available" in msg and ("no " in msg or "not " in msg))
+                or "capacity" in msg
+                or "does not have the resources" in msg
+                or "insufficient" in msg
+            )
+            if unavailable:
+                print(f"      unavailable ({type(e).__name__}), falling through", flush=True)
                 last_err = e
                 continue
             raise
