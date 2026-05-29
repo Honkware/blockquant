@@ -187,7 +187,14 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
       if (results.size > 0) {
         resolve(out); // full or partial success
       } else {
-        reject(new Error(`run_runpod_job.py exited ${code} with no uploads`));
+        const err = new Error(`run_runpod_job.py exited ${code} with no uploads`);
+        // Only a launch/stock failure (we never got a pod) is worth retrying.
+        // If a pod WAS created and the run still failed, the quant itself
+        // errored (e.g. an unsupported arch on this exllamav3) — retrying just
+        // boots another pod that fails the same way, which is the runaway we
+        // saw. Mark those non-retryable so runVariant surfaces them instead.
+        err.retryable = !podId;
+        reject(err);
       }
     });
   });

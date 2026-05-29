@@ -486,7 +486,11 @@ export async function runApprovedJob({ interaction, job }) {
           log.error(`RunPod CLI failed for ${v} bpw (attempt ${attempt}/${MAX_ATTEMPTS})`, {
             error: err.message,
           });
-          if (attempt < MAX_ATTEMPTS) {
+          // Retry only transient launch failures (no pod was ever created).
+          // A pod that booted and then failed means the quant itself errored;
+          // retrying just boots another pod that fails the same way (the
+          // runaway we saw on the crashing arch), so surface it instead.
+          if (attempt < MAX_ATTEMPTS && err.retryable !== false) {
             pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${attempt + 1}/${MAX_ATTEMPTS}` };
             renderParallel();
             await new Promise((r) => setTimeout(r, 5000));
