@@ -1045,12 +1045,14 @@ class RunPodProvider(Provider):
         logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip()})")
         return {"status": "started"}
 
-    def get_progress(self, instance_id: str, lines: int = 30) -> str:
+    def get_progress(self, instance_id: str, lines: int = 80) -> str:
         """Return the tail of the remote log for progress reporting.
 
-        ``lines`` defaults to 30 for cheap routine polling; pass a larger
-        value (e.g. 500) for a final drain after the run completes so the
-        last batch of post-quantize + upload output is captured locally.
+        ``lines`` defaults to 80: exllamav3's measure/optimize phase emits a
+        burst of output, and a window too small drops marker lines (e.g. the
+        single "[quantize]" line) between polls, leaving the embed stuck on the
+        previous stage. Pass a larger value (e.g. 500) for a final drain after
+        the run completes so the last post-quantize + upload output is captured.
         """
         result = self.run(
             instance_id,

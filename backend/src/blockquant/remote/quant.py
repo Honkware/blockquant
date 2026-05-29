@@ -295,7 +295,15 @@ def main() -> int:
                             cur, mx = _cm.curr_progress, _cm.max_progress
                     except Exception:
                         continue
-                    if mx and cur != last:
+                    if not mx:
+                        # Capture/measure phase: exllamav3 hasn't set the module
+                        # count yet. Emit a heartbeat anyway so a parseable
+                        # quantize marker is ALWAYS in the controller's log tail
+                        # and the embed leaves "Downloading" the moment
+                        # conversion starts (this phase is long for big models).
+                        print(f"[progress] quantize {variant} 0% (preparing)", flush=True)
+                        continue
+                    if cur != last:
                         pct = min(99, int(cur / mx * 100))
                         eta = ""
                         el = time.time() - t0
