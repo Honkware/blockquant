@@ -179,29 +179,54 @@ class RunPodProvider(Provider):
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     @staticmethod
-    def recommend_volume_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 100
-    ) -> int:
-        """Size the /workspace VOLUME, which is where the model, work dir, and
-        every output actually live (remote/quant.py writes to /workspace, and
-        that is where the volume mounts).
-
-        A fixed volume silently failed once: a 35B model on a 100 GB volume ran
-        the whole quant and then died with ENOSPC on the final safetensors
-        write. remote/quant.py quantizes all variants before uploading, so their
-        outputs accumulate; we size for base_download + the SUM of all outputs +
-        one work dir + a margin. Falls back generously if the HF size lookup
-        fails, and never drops below floor_gb.
-        """
-        import math
+    @staticmethod
+    def _base_download_gb(model_id: str, token: str = "") -> float | None:
+        """Total HF download size of the base model in GB, or None on lookup
+        failure."""
         try:
             from huggingface_hub import HfApi
             info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
             base_gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
         except Exception:
+            return None
+        return base_gb if base_gb > 0 else None
+
+    @staticmethod
+    def recommend_volume_gb(
+        model_id: str, variants, token: str = "", floor_gb: int = 60
+    ) -> int:
+        """Size the /workspace VOLUME, which now holds ONLY the unquantized model
+        plus its HF download cache (the quantized outputs + work dir live on the
+        container disk; see recommend_container_gb and remote/quant.py).
+
+        Sized as base_download x1.4 (model + any cache duplication during
+        download) + a margin. Falls back generously if the HF size lookup fails,
+        and never drops below floor_gb.
+        """
+        import math
+        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        if base_gb is None:
             return max(floor_gb, 250)
-        if base_gb <= 0:
-            return max(floor_gb, 250)
+        needed = base_gb * 1.4 + 20.0
+        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+
+    @staticmethod
+    def recommend_container_gb(
+        model_id: str, variants, token: str = "", floor_gb: int = 120
+    ) -> int:
+        """Size the CONTAINER disk, which holds the OS + deps plus the quantized
+        outputs and the conversion work dir (remote/quant.py writes outputs +
+        work to /quant on the container disk).
+
+        remote/quant.py quantizes every requested variant before uploading, so
+        their outputs accumulate; size for the SUM of all outputs + one work dir
+        + an OS/deps margin. Never drops below floor_gb (the image + caches need
+        headroom regardless).
+        """
+        import math
+        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        if base_gb is None:
+            return max(floor_gb, 160)
         bpws = []
         for v in variants:
             try:
@@ -210,8 +235,7 @@ class RunPodProvider(Provider):
                 bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
         outputs = sum(base_gb * b / 16.0 for b in bpws)
         work = base_gb * (max(bpws) if bpws else 8.0) / 16.0
-        # base x1.2 leaves room for any HF download temp/cache on the volume.
-        needed = base_gb * 1.2 + outputs + work + 30.0
+        needed = outputs + work + 40.0  # +40 for OS + torch/deps + scratch
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------

@@ -126,10 +126,11 @@ def main():
              "0 disables the cap.",
     )
     parser.add_argument(
-        "--container-disk", default="120",
-        help="Container disk in GB (the OS + torch/deps live here, not the "
-             "model). The model + outputs go on the /workspace volume; 120 just "
-             "gives the image + caches comfortable headroom.",
+        "--container-disk", default="auto",
+        help="Container disk in GB, holding OS + torch/deps + the quantized "
+             "outputs and conversion work dir (the unquantized model lives on "
+             "the /workspace volume). 'auto' sizes from the model + variants; a "
+             "number pins it.",
     )
     parser.add_argument(
         "--volume-disk", default="auto",
@@ -242,18 +243,23 @@ def main():
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
 
-    # Container holds OS + torch/deps only. The model, work dir, and outputs all
-    # live on the /workspace volume, so that is what we auto-size ("auto" sizes
-    # from the model + sum of outputs; a number pins it).
+    # Disk split: the VOLUME (/workspace) holds the unquantized model + HF cache;
+    # the CONTAINER disk (/quant) holds the quantized outputs + work dir. Each
+    # auto-sizes from the model + requested variants when set to "auto"; a number
+    # pins it.
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    args.container_disk = int(args.container_disk)
+    if str(args.container_disk).strip().lower() == "auto":
+        args.container_disk = RunPodProvider.recommend_container_gb(
+            args.model, _variants, args.hf_token)
+    else:
+        args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
         args.volume_disk = RunPodProvider.recommend_volume_gb(
             args.model, _variants, args.hf_token)
     else:
         args.volume_disk = int(args.volume_disk)
-    print(f"[disk] container {args.container_disk} GB + /workspace volume "
-          f"{args.volume_disk} GB", flush=True)
+    print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
+          f"outputs+work -> container {args.container_disk} GB", flush=True)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:

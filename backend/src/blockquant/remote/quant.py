@@ -158,16 +158,27 @@ def main() -> int:
 
         from huggingface_hub import HfApi, snapshot_download, login as hf_login
 
-        workspace = Path("/workspace/blockquant")
+        # Disk split: the unquantized model + HF cache live on the VOLUME
+        # (/workspace, sized for the model), and the quantized outputs + work dir
+        # live on the CONTAINER disk (/quant). Keeping the big input and the
+        # outputs on separate disks means neither has to be sized for both, and
+        # both disks get used. Only /workspace is the mounted volume; everything
+        # else (so /quant) is the container disk.
+        workspace = Path("/workspace/blockquant")   # VOLUME: unquantized model + cache
         workspace.mkdir(parents=True, exist_ok=True)
         model_dir = workspace / "model"
 
-        # Keep the HF download cache on the (large) volume too, so the small
-        # container disk can't fill during download regardless of hf_hub version.
+        quant_root = Path("/quant")                  # CONTAINER disk: outputs + work
+        quant_root.mkdir(parents=True, exist_ok=True)
+
+        # HF download cache sits next to the model on the volume, so the download
+        # can't fill the container disk regardless of hf_hub version.
         hf_cache = workspace / ".hf-cache"
         hf_cache.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_cache))
         os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
+        print(f"[disk] model+cache -> {workspace} (volume) | outputs+work -> "
+              f"{quant_root} (container)", flush=True)
 
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
@@ -236,8 +247,8 @@ def main() -> int:
         outputs = []
         for variant in variants:
             bpw = float(variant)
-            out_dir = workspace / f"output-{bpw}bpw"
-            work_dir = workspace / f"work-{bpw}"
+            out_dir = quant_root / f"output-{bpw}bpw"
+            work_dir = quant_root / f"work-{bpw}"
             if (out_dir / "config.json").exists():
                 print(f"[skip] {variant} exists at {out_dir}", flush=True)
                 outputs.append({"variant": variant, "path": str(out_dir)})
