@@ -55,6 +55,38 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
     return [gid for _, gid in cards]
 
 
+def _terminate_stray_pods(api_key: str, prefix: str, keep_id: str = "") -> list[str]:
+    """Kill pods named ``{prefix}-*`` except keep_id.
+
+    RunPod's create_pod can create a pod AND still raise, so a failed launch
+    attempt can orphan a billing pod the controller never learned the id of.
+    The prefix is unique per run, so this only ever touches THIS run's strays,
+    never pods from other concurrent jobs. Uses the REST API (the GraphQL one
+    is flaky for rpa_ keys and has been timing out).
+    """
+    import json
+    import urllib.request as u
+    killed: list[str] = []
+    try:
+        req = u.Request("https://rest.runpod.io/v1/pods",
+                        headers={"Authorization": f"Bearer {api_key}"})
+        data = json.load(u.urlopen(req, timeout=30))
+        pods = data if isinstance(data, list) else data.get("pods", [])
+    except Exception:
+        return killed
+    for p in pods:
+        pid = p.get("id")
+        name = p.get("name") or ""
+        if pid and pid != keep_id and name.startswith(prefix + "-"):
+            try:
+                u.urlopen(u.Request(f"https://rest.runpod.io/v1/pods/{pid}", method="DELETE",
+                                    headers={"Authorization": f"Bearer {api_key}"}), timeout=20)
+                killed.append(pid)
+            except Exception:
+                pass
+    return killed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run EXL3 quantization on RunPod")
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
@@ -74,9 +106,32 @@ def main():
              "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
     )
     parser.add_argument(
-        "--container-disk", type=int, default=150,
-        help="Pod container disk in GB. Lower it (~100-120 for a 35B) so cheaper, "
-             "lower-disk hosts can take the pod.",
+        "--max-price", type=float, default=1.0,
+        help="With --gpu auto, skip any card over this $/hr. Keeps it on cheap "
+             "VRAM-appropriate cards (4090, RTX 5000 Ada, A5000...) instead of "
+             "grabbing an idle H100/A100 just because the cheap ones are out. "
+             "0 disables the cap.",
+    )
+    parser.add_argument(
+        "--container-disk", default="120",
+        help="Container disk in GB (the OS + torch/deps live here, not the "
+             "model). The model + outputs go on the /workspace volume; 120 just "
+             "gives the image + caches comfortable headroom.",
+    )
+    parser.add_argument(
+        "--volume-disk", default="auto",
+        help="/workspace volume in GB, or 'auto' (default) to size it from the "
+             "model download plus the sum of all variant outputs plus a work "
+             "dir. This is the disk that actually fills. Pass a number to pin it.",
+    )
+    parser.add_argument(
+        "--launch-retries", type=int, default=6,
+        help="How many times to re-sweep all GPU candidates when none are free. "
+             "RunPod stock blips in and out per-GPU over minutes, so one pass is brittle.",
+    )
+    parser.add_argument(
+        "--launch-retry-delay", type=int, default=30,
+        help="Seconds to wait between GPU sweeps when everything was out of stock.",
     )
     parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
     parser.add_argument(
@@ -174,6 +229,19 @@ def main():
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
 
+    # Container holds OS + torch/deps only. The model, work dir, and outputs all
+    # live on the /workspace volume, so that is what we auto-size ("auto" sizes
+    # from the model + sum of outputs; a number pins it).
+    _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    args.container_disk = int(args.container_disk)
+    if str(args.volume_disk).strip().lower() == "auto":
+        args.volume_disk = RunPodProvider.recommend_volume_gb(
+            args.model, _variants, args.hf_token)
+    else:
+        args.volume_disk = int(args.volume_disk)
+    print(f"[disk] container {args.container_disk} GB + /workspace volume "
+          f"{args.volume_disk} GB", flush=True)
+
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
         # Look up live pricing for the preferred GPU so the cost band is honest.
@@ -238,50 +306,109 @@ def main():
     seen = set()
     gpu_candidates = [g for g in gpu_candidates if not (g in seen or seen.add(g))]
 
+    # Unique pod-name prefix for THIS run, so orphan cleanup only ever touches
+    # our own create-then-raise strays, never another concurrent job's pods.
+    run_tag = f"bq-{os.getpid()}-{int(time.time()) % 100000}"
+
+    # Try SECURE first (more reliable stock + network), then COMMUNITY, unless
+    # the user pinned a cloud. The --max-price cap already keeps both clouds on
+    # the cheap VRAM-appropriate tier, so SECURE-first costs nothing extra and
+    # just lands a pod faster.
+    cloud_order = [args.cloud] if cli_passed_cloud else ["SECURE", "COMMUNITY"]
+    candidate_pairs = [(g, c) for c in cloud_order for g in gpu_candidates]
+
     provider = None
     instance_id = None
     chosen_gpu = None
+    chosen_cloud = None
     hourly = 0.0
     last_err = None
-    for candidate in gpu_candidates:
-        attempt = RunPodProvider(
-            api_key=args.runpod_api_key,
-            gpu_type=candidate,
-            cloud_type=args.cloud,
-            container_disk_gb=args.container_disk,
-            install_flash_attn=args.install_flash_attn,
-            image=args.image,
-            network_volume_id=args.network_volume_id,
-            data_center_id=args.data_center_id,
-        )
-        rate = attempt.get_cost_per_hour()
-        print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {args.cloud})...", flush=True)
-        try:
-            instance_id = attempt.launch({})
-        except Exception as e:
-            msg = str(e).lower()
-            # Any phrasing RunPod uses for "this machine can't take the pod":
-            # out of stock, no capacity, or insufficient disk/resources.
-            unavailable = (
-                ("instances available" in msg and ("no " in msg or "not " in msg))
-                or "capacity" in msg
-                or "does not have the resources" in msg
-                or "insufficient" in msg
+    _price_cache: dict = {}
+    sweeps = max(1, args.launch_retries)
+    for sweep in range(1, sweeps + 1):
+        for candidate, cloud in candidate_pairs:
+            attempt = RunPodProvider(
+                api_key=args.runpod_api_key,
+                gpu_type=candidate,
+                cloud_type=cloud,
+                container_disk_gb=args.container_disk,
+                volume_gb=args.volume_disk,
+                install_flash_attn=args.install_flash_attn,
+                image=args.image,
+                network_volume_id=args.network_volume_id,
+                data_center_id=args.data_center_id,
+                name_prefix=run_tag,
             )
-            if unavailable:
-                print(f"      unavailable ({type(e).__name__}), falling through", flush=True)
+            # Price cap (cached per gpu+cloud so retries stay fast). Skip cards
+            # over --max-price so a stock-out can't push us onto an idle
+            # H100/A100 at several times the cost of a capable cheap card.
+            ckey = (candidate, cloud)
+            rate = _price_cache.get(ckey)
+            if rate is None:
+                try:
+                    rate = attempt.get_cost_per_hour()
+                except Exception:
+                    rate = 0.0
+                _price_cache[ckey] = rate
+            if args.max_price and rate and rate > args.max_price:
+                print(f"      {candidate} ({cloud}) ${rate:.2f}/hr over cap "
+                      f"${args.max_price:.2f}, skipping", flush=True)
+                continue
+            print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {cloud})...", flush=True)
+            try:
+                instance_id = attempt.launch({})
+            except Exception as e:
+                msg = str(e).lower()
+                # Out-of-stock is expected. But transient/rate-limit errors are
+                # also common when several controllers hammer the API at once,
+                # and re-raising here would crash the whole controller (and
+                # orphan any pod a create-then-raise leaked). So NEVER re-raise
+                # mid-sweep: log and try the next candidate. A genuinely fatal
+                # condition just exhausts the sweeps and exits cleanly below.
+                unavailable = (
+                    ("instances available" in msg and ("no " in msg or "not " in msg))
+                    or "capacity" in msg
+                    or "does not have the resources" in msg
+                    or "insufficient" in msg
+                )
+                label = "unavailable" if unavailable else "error"
+                print(f"      {label} ({type(e).__name__}: {str(e)[:80]}), falling through", flush=True)
                 last_err = e
                 continue
-            raise
-        provider = attempt
-        chosen_gpu = candidate
-        hourly = rate
-        break
+            provider = attempt
+            chosen_gpu = candidate
+            chosen_cloud = cloud
+            hourly = rate
+            break
+        if provider is not None:
+            break
+        # Whole sweep came up empty. Clean any create-then-raise orphans from
+        # this run, then wait for stock to blip back before re-sweeping.
+        strays = _terminate_stray_pods(args.runpod_api_key, run_tag)
+        if strays:
+            print(f"      cleaned {len(strays)} stray pod(s): {strays}", flush=True)
+        if sweep < sweeps:
+            print(f"[1/6] No GPU free (sweep {sweep}/{sweeps}); retrying in "
+                  f"{args.launch_retry_delay}s...", flush=True)
+            time.sleep(args.launch_retry_delay)
 
     if provider is None or instance_id is None:
-        print(f"ERROR: all GPU candidates out of stock. Last error: {last_err}")
+        _terminate_stray_pods(args.runpod_api_key, run_tag)
+        print(f"ERROR: all GPU candidates out of stock after {sweeps} sweeps. "
+              f"Last error: {last_err}")
         sys.exit(1)
-    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu})")
+    # Defensive: a create-then-raise earlier in the sweep may have orphaned a
+    # pod we never tracked; kill any of our strays that isn't the live one.
+    strays = _terminate_stray_pods(args.runpod_api_key, run_tag, keep_id=instance_id)
+    if strays:
+        print(f"      cleaned {len(strays)} stray pod(s): {strays}", flush=True)
+    # hourly was already cached during the sweep; only look it up if somehow unset.
+    if not hourly:
+        try:
+            hourly = provider.get_cost_per_hour()
+        except Exception:
+            hourly = 0.0
+    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu}, {chosen_cloud}, ~${hourly:.2f}/hr)")
 
     t_launch = time.time()
     try:

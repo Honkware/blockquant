@@ -1,5 +1,10 @@
 import { getLogger } from '../logger.js';
-import { MessageFlags } from 'discord.js';
+import {
+  MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from 'discord.js';
 import { randomUUID } from 'node:crypto';
 import config from '../config.js';
 import * as hf from '../services/huggingface.js';
@@ -10,57 +15,77 @@ import * as embeds from '../utils/embeds.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
+import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
+import { runViaCli, finalizeCollection } from '../services/runpodCli.js';
 
 const log = getLogger('cmd:quant');
 
-/** Throttle progress embed edits to max once per 4 seconds. */
+/**
+ * Throttle progress embed edits to max once per `ms` (leading + trailing), so
+ * a burst of progress events becomes a smooth ~once-per-4s cadence instead of
+ * spamming Discord (which rate-limits message edits and would freeze the embed).
+ * Exposes `.cancel()` to drop any pending trailing edit — call it before a final
+ * embed write so a late trailing render can't clobber the "Complete" frame.
+ */
 function throttle(fn, ms = 4000) {
   let last = 0;
   let pending = null;
-  return (...args) => {
+  const wrapped = (...args) => {
     const now = Date.now();
     if (now - last >= ms) {
       last = now;
       return fn(...args);
     }
-    // Buffer the latest call
     clearTimeout(pending);
     pending = setTimeout(
       () => {
+        pending = null;
         last = Date.now();
         fn(...args);
       },
       ms - (now - last)
     );
   };
+  wrapped.cancel = () => {
+    clearTimeout(pending);
+    pending = null;
+  };
+  return wrapped;
 }
 
+function approvalButtons(jobId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`bq:approve:${jobId}`)
+      .setLabel('Approve')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`bq:deny:${jobId}`)
+      .setLabel('Deny')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+/**
+ * /quant: validate the request, then post it for admin approval instead of
+ * running immediately. The actual quantization runs from runApprovedJob once
+ * an admin clicks Approve (see approval.js).
+ */
 export async function handleQuant(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
-  const profile = interaction.options.getString('profile') ?? 'balanced';
-  const headBitsOverride = interaction.options.getInteger('head_bits');
-  const category = interaction.options.getString('category') ?? 'General';
-  const format = interaction.options.getString('format') ?? 'exl3';
-  const provider = interaction.options.getString('provider') ?? 'local';
   const userId = interaction.user.id;
-  const isAdmin = config.ADMIN_IDS.includes(userId);
 
-  if (!config.QUANT_PROFILES[profile]) {
-    return interaction.editReply({
-      embeds: [embeds.error('Invalid profile', `Unknown profile: \`${profile}\``)],
-    });
-  }
-
-  if (headBitsOverride != null && !isAdmin) {
-    return interaction.editReply({
-      embeds: [embeds.error('Forbidden', 'Only admins can override `head_bits`.')],
-    });
-  }
+  // The request is intentionally just model + bpw. Everything else is a fixed
+  // sensible default; an admin tunes anything exotic out of band.
+  const profile = 'balanced';
+  const category = 'General';
+  const format = 'exl3';
+  const provider = 'runpod';
   const quantOptions = {
-    headBits: headBitsOverride ?? config.QUANT_PROFILES[profile].headBits,
+    headBits: config.QUANT_PROFILES[profile].headBits,
     profile,
   };
 
@@ -91,9 +116,8 @@ export async function handleQuant(interaction) {
       });
     }
     variants = variants.map((v) => v.toLowerCase());
-    bpws = []; // BPW concept doesn't apply to GGUF in the same way
+    bpws = [];
   } else {
-    // EXL3: parse as floats
     bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
     if (bpws.length === 0) {
       return interaction.editReply({
@@ -104,13 +128,13 @@ export async function handleQuant(interaction) {
     if (invalid.length) {
       return interaction.editReply({
         embeds: [
-          embeds.error(
-            'BPW Out of Range',
-            `Values must be between 1.5–8.5. Got: ${invalid.join(', ')}`
-          ),
+          embeds.error('BPW Out of Range', `Values must be between 1.5-8.5. Got: ${invalid.join(', ')}`),
         ],
       });
     }
+    // Normalize to one-decimal form so repo names are consistent
+    // (3 -> "3.0", matching the -exl3-3.0bpw convention).
+    variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
   }
 
   // ── Parse model URL ───────────────────────────────────────────────────────
@@ -125,12 +149,7 @@ export async function handleQuant(interaction) {
 
   // ── Pre-flight: validate HF token + model exists ──────────────────────────
   await interaction.editReply({
-    embeds: [
-      embeds.info(
-        '🔍 Running Pre-flight Checks…',
-        'Verifying HuggingFace credentials and model access…'
-      ),
-    ],
+    embeds: [embeds.info('Running pre-flight checks...', 'Verifying HuggingFace credentials and model access...')],
   });
 
   let flight;
@@ -138,32 +157,22 @@ export async function handleQuant(interaction) {
     flight = await hf.preflight(urlInput);
   } catch (err) {
     log.error('Preflight failed', { error: err.message, userId });
-    return interaction.editReply({
-      embeds: [embeds.error('Pre-flight Failed', toUserMessage(err))],
-    });
+    return interaction.editReply({ embeds: [embeds.error('Pre-flight Failed', toUserMessage(err))] });
   }
 
   if (!flight.modelExists) {
     return interaction.editReply({
-      embeds: [
-        embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`),
-      ],
+      embeds: [embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`)],
     });
   }
-
   if (!flight.canWrite) {
     return interaction.editReply({
-      embeds: [
-        embeds.error(
-          'Token Error',
-          'The HF token does not have write permissions. Update `HF_TOKEN` in .env.'
-        ),
-      ],
+      embeds: [embeds.error('Token Error', 'The HF token does not have write permissions. Update `HF_TOKEN` in .env.')],
     });
   }
 
   // ── Runtime setup checks (local EXL3 only) ────────────────────────────────
-  if (format === 'exl3') {
+  if (format === 'exl3' && provider === 'local') {
     try {
       await quantizer.validateSetup();
     } catch (err) {
@@ -176,8 +185,8 @@ export async function handleQuant(interaction) {
 
   // ── Pre-check upload targets for idempotency (EXL3 local only) ────────────
   const modelName = modelId.split('/').pop();
-  let precheckedRepos = {};
-  let alreadyUploaded = [];
+  const precheckedRepos = {};
+  const alreadyUploaded = [];
   if (format === 'exl3') {
     try {
       for (const bpw of bpws) {
@@ -189,11 +198,7 @@ export async function handleQuant(interaction) {
           quantOptions,
         });
         precheckedRepos[String(bpw)] = state;
-        if (
-          state.exists &&
-          state.settingsMatch === false &&
-          state.reason !== 'manifest_missing'
-        ) {
+        if (state.exists && state.settingsMatch === false && state.reason !== 'manifest_missing') {
           return interaction.editReply({
             embeds: [
               embeds.error(
@@ -208,57 +213,45 @@ export async function handleQuant(interaction) {
         }
       }
     } catch (err) {
-      return interaction.editReply({
-        embeds: [embeds.error('Repo Pre-check Failed', toUserMessage(err))],
-      });
+      return interaction.editReply({ embeds: [embeds.error('Repo Pre-check Failed', toUserMessage(err))] });
     }
 
     if (alreadyUploaded.length === bpws.length) {
       return interaction.editReply({
         embeds: [
-          embeds.success(
-            'Already Quantized',
-            `Matching uploads already exist for all requested BPWs: ${alreadyUploaded.join(', ')}`
+          embeds.success('Already Quantized', `Matching uploads already exist for all requested BPWs: ${alreadyUploaded.join(', ')}`),
+        ],
+      });
+    }
+  }
+
+  // ── Cost gate: refuse if RunPod can't even afford the optimistic estimate ─
+  // The work to actually do is the variants minus the ones already uploaded.
+  const billable = Math.max(1, variants.length - alreadyUploaded.length);
+  if (provider === 'runpod') {
+    const bal = await getBalance();
+    const est = estimateCost(billable);
+    if (bal && est.low > bal.balance) {
+      return interaction.editReply({
+        embeds: [
+          embeds.error(
+            'Insufficient RunPod balance',
+            `Estimated cost ~$${est.low.toFixed(0)}-${est.high.toFixed(0)} for ${billable} variant(s), ` +
+              `but the RunPod balance is only $${bal.balance.toFixed(2)}. Top up before requesting.`
           ),
         ],
       });
     }
   }
 
-  // ── EXP check ─────────────────────────────────────────────────────────────
-  const users = await db.loadUsers();
-  const user = users[userId] ?? { exp: 0, lastQuant: 0 };
-  const missingCount = variants.length - alreadyUploaded.length;
-  const cost = missingCount * 10; // charge only for variants that still need work
-  if (user.exp < cost) {
-    return interaction.editReply({
-      embeds: [
-        embeds.warning(
-          'Insufficient EXP',
-          `You need **${cost}** EXP but have **${user.exp}**. Keep chatting to earn more!`
-        ),
-      ],
-    });
-  }
-
+  // ── Persist as a pending request and post it for admin approval ───────────
   const jobId = randomUUID();
-  const createdAt = Date.now();
-
-  // ── Create thread for live progress ───────────────────────────────────────
-  const thread = await interaction.channel.threads.create({
-    name: `⚡ ${modelId.split('/').pop()} [${interaction.user.username}]`,
-    autoArchiveDuration: 1440,
-  });
-
-  const progressMsg = await thread.send({
-    embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
-  });
-
   await db.upsertJob({
     id: jobId,
-    status: db.JOB_STATUS.queued,
-    createdAt,
+    status: db.JOB_STATUS.pending_approval,
+    createdAt: Date.now(),
     userId,
+    username: interaction.user.username,
     modelId,
     url: urlInput,
     format,
@@ -267,59 +260,110 @@ export async function handleQuant(interaction) {
     categories: [category],
     profile,
     quantOptions,
-    cost,
+    provider,
+    precheckedRepos,
+    alreadyUploaded,
     channelId: interaction.channelId,
-    threadId: thread.id,
-    progressMessageId: progressMsg.id,
-    chargedAt: null,
-    refundedAt: null,
+    threadId: null,
+    progressMessageId: null,
     partialResults: [],
   });
 
-  const chargeResult = await db.chargeForJob({ jobId, userId, cost });
-  if (!chargeResult.charged) {
-    await db.patchJob(jobId, {
-      status: db.JOB_STATUS.failed,
-      error: 'Insufficient EXP at charge time',
-      failedAt: Date.now(),
-    });
-    return interaction.editReply({
-      embeds: [
-        embeds.warning(
-          'Insufficient EXP',
-          `You need **${cost}** EXP but have **${chargeResult.balance ?? user.exp}**.`
-        ),
-      ],
-    });
-  }
+  const costLine = provider === 'runpod' ? await costPreflightLine(variants.length) : '';
+
+  const requestEmbed = embeds.info(
+    'Quantization request · awaiting approval',
+    [
+      `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
+      `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
+      `**Profile:** ${profile}  ·  **Provider:** ${provider}`,
+      costLine,
+      `**Requested by:** <@${userId}>`,
+      alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
+      '',
+      'An admin must approve before this runs.',
+    ].filter(Boolean).join('\n')
+  );
+
+  await interaction.channel.send({
+    embeds: [requestEmbed],
+    components: [approvalButtons(jobId)],
+  });
 
   await interaction.editReply({
     embeds: [
       embeds.success(
-        '✅ Job Submitted',
-        `Follow progress in ${thread}.\nCost: **${cost}** EXP (balance: **${chargeResult.balance}**)${
-          alreadyUploaded.length
-            ? `\nReused existing uploads: **${alreadyUploaded.join(', ')}**`
-            : ''
-        }`
+        'Request submitted',
+        'Your quantization request was posted for admin approval. You will be pinged in a thread once it starts.'
       ),
     ],
   });
+}
 
-  // ── Throttled progress updater ────────────────────────────────────────────
+/**
+ * Run a previously-approved job. Called from approval.js with the approving
+ * admin's button interaction and the stored pending-approval job record. Owns
+ * the progress thread + live embed + execution, exactly as before, minus the
+ * EXP accounting.
+ */
+export async function runApprovedJob({ interaction, job }) {
+  const {
+    id: jobId,
+    userId,
+    username,
+    modelId,
+    url: urlInput,
+    format,
+    variants,
+    bpws,
+    categories,
+    profile,
+    quantOptions,
+    provider,
+    precheckedRepos = {},
+  } = job;
+  const category = (categories && categories[0]) || 'General';
+
+  const channel =
+    interaction.channel ||
+    (await interaction.client.channels.fetch(job.channelId).catch(() => null));
+  if (!channel || !channel.threads) {
+    throw new Error('Could not resolve a channel to open the progress thread in.');
+  }
+  const thread = await channel.threads.create({
+    name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
+    autoArchiveDuration: 1440,
+  });
+
+  const progressMsg = await thread.send({
+    embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
+  });
+
+  await db.patchJob(jobId, {
+    status: db.JOB_STATUS.queued,
+    approvedAt: Date.now(),
+    approvedBy: interaction.user.id,
+    threadId: thread.id,
+    progressMessageId: progressMsg.id,
+  });
+
   const updateEmbed = throttle(async (data) => {
     try {
-      await progressMsg.edit({
-        embeds: [embeds.jobProgress({ url: modelId, userId, ...data })],
-      });
+      await progressMsg.edit({ embeds: [embeds.jobProgress({ url: modelId, userId, ...data })] });
     } catch (err) {
       log.debug(`Failed to update embed: ${err.message}`);
     }
   });
 
-  // Shared completion handler
+  // Assigned by the runpod path below; declared here so handleComplete/
+  // handleError can cancel its pending render before writing the final embed.
+  let renderParallel = null;
+
   async function handleComplete(results) {
     try {
+      // Drop any pending throttled progress render so it can't fire after this
+      // and overwrite the final "Complete" embed with a stale frame.
+      renderParallel?.cancel();
       await progressMsg.edit({ embeds: [embeds.jobComplete({ url: modelId, userId, results })] });
       const pushedCount = results.filter((r) => r.pushed).length;
       let completionNote;
@@ -334,7 +378,6 @@ export async function handleQuant(interaction) {
       }
       await thread.send(completionNote);
 
-      // Save model record
       const models = await db.loadModels();
       models[modelId] = {
         url: modelId,
@@ -351,22 +394,33 @@ export async function handleQuant(interaction) {
         completedAt: Date.now(),
         partialResults: results,
       });
+
+      // Re-sync ALL of this model's EXL3 cards + collection, so variants done
+      // in separate runs (or earlier) cross-reference each other. Best-effort:
+      // a finalize failure must not fail the job.
+      if (format === 'exl3' && results.some((r) => r.pushed)) {
+        try {
+          await thread.send('Cross-linking model cards + collection...');
+          const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
+          await thread.send(
+            fin.ok
+              ? `Cards cross-linked${fin.collectionUrl ? ` · [collection](${fin.collectionUrl})` : ''}.`
+              : 'Cards uploaded, but the cross-link/collection step had an issue (the quants are still on HF).'
+          );
+        } catch (e) {
+          log.debug(`finalize step failed: ${e.message}`);
+        }
+      }
     } catch (err) {
       log.error('Completion callback error', { error: err.message });
     }
   }
 
-  // Shared error handler
   async function handleError(err) {
     try {
-      const refund = await db.refundForJob({ jobId, userId, cost });
-      await progressMsg.edit({
-        embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })],
-      });
-      const refundMessage = refund.refunded
-        ? `Your **${cost}** EXP has been refunded.`
-        : 'No EXP refund was required for this job.';
-      await thread.send(`<@${userId}> Quantization failed. ${refundMessage}`);
+      renderParallel?.cancel();
+      await progressMsg.edit({ embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })] });
+      await thread.send(`<@${userId}> Quantization failed.`);
       await db.patchJob(jobId, {
         status: db.JOB_STATUS.failed,
         failedAt: Date.now(),
@@ -377,11 +431,92 @@ export async function handleQuant(interaction) {
     }
   }
 
-  // ── API vs Local branch ───────────────────────────────────────────────────
-  const useApi = format === 'gguf' || await isApiAvailable();
+  // RunPod EXL3: one pod per variant, in parallel. Each run_runpod_job grabs
+  // its own pod (unique name tag -> safe orphan cleanup) and quantizes a single
+  // bpw, so per-pod volume is small (easier to find stock) and the variants
+  // finish concurrently instead of one after another. Progress from all pods is
+  // aggregated into a single embed, one line per bpw.
+  if (provider === 'runpod' && format === 'exl3') {
+    await db.patchJob(jobId, { status: db.JOB_STATUS.running, startedAt: Date.now() });
+
+    const pstate = {};
+    variants.forEach((v) => {
+      pstate[v] = { stage: 'Provisioning', overall: 0, message: 'waiting for a GPU', startedAt: Date.now() };
+    });
+    renderParallel = throttle(async () => {
+      try {
+        await progressMsg.edit({
+          embeds: [embeds.jobProgressParallel({ url: modelId, userId, variants, state: pstate })],
+        });
+      } catch (err) {
+        log.debug(`parallel embed edit failed: ${err.message}`);
+      }
+    });
+    renderParallel();
+    // Heartbeat: re-render every 15s so elapsed time ticks even during silent
+    // phases (the model download emits no events for ~10-15 min), so the embed
+    // never looks frozen.
+    const heartbeat = setInterval(() => renderParallel(), 15000);
+
+    // Run one variant on its own pod, retrying the WHOLE thing on failure.
+    // run_runpod_job can drop a variant to a transient post-create error
+    // (SSH/API blip, rate limit) that spikes under concurrency; a fresh attempt
+    // almost always succeeds, and it self-heals in the embed instead of leaving
+    // a dead "Failed" line. Each attempt's pod self-terminates, so retries
+    // never stack cost.
+    const MAX_ATTEMPTS = 3;
+    async function runVariant(v) {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const res = await runViaCli({
+            modelId,
+            variants: [v],
+            hfOrg: config.HF_ORG,
+            calRows: 250,
+            onProgress: (d) => {
+              pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+              renderParallel();
+            },
+          });
+          const url = res && res[0] ? res[0].url : null;
+          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url };
+          renderParallel();
+          return res;
+        } catch (err) {
+          log.error(`RunPod CLI failed for ${v} bpw (attempt ${attempt}/${MAX_ATTEMPTS})`, {
+            error: err.message,
+          });
+          if (attempt < MAX_ATTEMPTS) {
+            pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${attempt + 1}/${MAX_ATTEMPTS}` };
+            renderParallel();
+            await new Promise((r) => setTimeout(r, 5000));
+            continue;
+          }
+          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+          renderParallel();
+          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+        }
+      }
+    }
+
+    let settled;
+    try {
+      settled = await Promise.all(
+        // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
+        variants.map((v, i) =>
+          new Promise((r) => setTimeout(r, i * 4000)).then(() => runVariant(v))
+        )
+      );
+    } finally {
+      clearInterval(heartbeat);
+    }
+    await handleComplete(settled.flat());
+    return { thread };
+  }
+
+  const useApi = format === 'gguf' || (await isApiAvailable());
 
   if (useApi) {
-    // ── API mode ─────────────────────────────────────────────────────────────
     try {
       const apiJob = await submitJob({
         model_id: modelId,
@@ -408,19 +543,10 @@ export async function handleQuant(interaction) {
           const stage = progress?.stage || status;
           const msg = progress?.message || status;
           const pct = progress?.percent ?? (status === 'running' ? 50 : 0);
-          updateEmbed({
-            stage,
-            progress: pct,
-            overall: pct,
-            message: msg,
-            currentBPW: bpws[0],
-            bpwIndex: 0,
-            totalBPWs,
-          });
+          updateEmbed({ stage, progress: pct, overall: pct, message: msg, currentBPW: bpws[0], bpwIndex: 0, totalBPWs });
         }
       });
 
-      // Map API result to existing result shape
       const outputs = apiResult?.outputs || [];
       const results = outputs.map((o) => ({
         bpw: o.variant,
@@ -439,7 +565,6 @@ export async function handleQuant(interaction) {
       await handleError(err);
     }
   } else {
-    // ── Local mode (fallback) ────────────────────────────────────────────────
     queue.enqueue({
       jobId,
       url: urlInput,
@@ -449,11 +574,11 @@ export async function handleQuant(interaction) {
       quantOptions,
       precheckedRepos,
       userId,
-      cost,
-
       onProgress: (data) => updateEmbed(data),
       onComplete: handleComplete,
       onError: handleError,
     });
   }
+
+  return { thread };
 }

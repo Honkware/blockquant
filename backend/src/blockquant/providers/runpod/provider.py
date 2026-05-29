@@ -34,6 +34,12 @@ from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Minimum ExLlamaV3 a pre-baked image must ship. Older bakes are rejected at
+# boot so they can't silently quantize with outdated kernels or fail on newer
+# model architectures. Keep in sync with EXLLAMAV3_VERSION in
+# docker/Dockerfile.runpod.
+_MIN_EXLLAMAV3 = (0, 0, 37)
+
 
 class RunPodProvider(Provider):
     name = "runpod"
@@ -120,6 +126,7 @@ class RunPodProvider(Provider):
         data_center_id: str = "",
         install_flash_attn: bool = False,
         image: str = "",
+        name_prefix: str = "blockquant",
     ):
         api_key = api_key or os.environ.get("RUNPOD_API_KEY", "")
         if not api_key:
@@ -136,6 +143,10 @@ class RunPodProvider(Provider):
         self.network_volume_id = network_volume_id
         self.data_center_id = data_center_id
         self.install_flash_attn = install_flash_attn
+        # Pods are named "{name_prefix}-{ts}". A unique prefix per run lets the
+        # launcher clean up only its OWN create-then-raise orphans without
+        # touching pods from other concurrent jobs (e.g. run_parallel_quants).
+        self.name_prefix = name_prefix
         if not self.ssh_key_path.exists():
             raise ValueError(
                 f"SSH private key not found at {self.ssh_key_path}. "
@@ -166,6 +177,42 @@ class RunPodProvider(Provider):
         # ledger. Real ERROR-level output still passes through.
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
+    @staticmethod
+    def recommend_volume_gb(
+        model_id: str, variants, token: str = "", floor_gb: int = 100
+    ) -> int:
+        """Size the /workspace VOLUME, which is where the model, work dir, and
+        every output actually live (remote/quant.py writes to /workspace, and
+        that is where the volume mounts).
+
+        A fixed volume silently failed once: a 35B model on a 100 GB volume ran
+        the whole quant and then died with ENOSPC on the final safetensors
+        write. remote/quant.py quantizes all variants before uploading, so their
+        outputs accumulate; we size for base_download + the SUM of all outputs +
+        one work dir + a margin. Falls back generously if the HF size lookup
+        fails, and never drops below floor_gb.
+        """
+        import math
+        try:
+            from huggingface_hub import HfApi
+            info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
+            base_gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
+        except Exception:
+            return max(floor_gb, 250)
+        if base_gb <= 0:
+            return max(floor_gb, 250)
+        bpws = []
+        for v in variants:
+            try:
+                bpws.append(float(v))
+            except (TypeError, ValueError):
+                bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
+        outputs = sum(base_gb * b / 16.0 for b in bpws)
+        work = base_gb * (max(bpws) if bpws else 8.0) / 16.0
+        # base x1.2 leaves room for any HF download temp/cache on the volume.
+        needed = base_gb * 1.2 + outputs + work + 30.0
+        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -188,7 +235,7 @@ class RunPodProvider(Provider):
         env.update(config.get("env", {}) or {})
 
         kwargs = dict(
-            name=f"blockquant-{int(time.time())}",
+            name=f"{self.name_prefix}-{int(time.time())}",
             image_name=image,
             gpu_type_id=self.gpu_type,
             cloud_type=self.cloud_type,
@@ -611,16 +658,38 @@ class RunPodProvider(Provider):
             py = self._probe_remote_python(instance_id)
             logger.info(f"Pre-baked image detected ({self.image}); skipping bootstrap")
             print(f"      pre-baked image: {self.image}", flush=True)
-            health = self.run(
-                instance_id,
-                f"{py} -c \"import torch, exllamav3; "
+            # Health check + hard version gate. The remote exits non-zero if
+            # torch/exllamav3 fail to import OR exllamav3 is older than the
+            # minimum, so a stale bake fails fast here instead of silently
+            # quantizing with outdated kernels.
+            mn = _MIN_EXLLAMAV3
+            health_code = (
+                "import torch, exllamav3, sys; "
                 "print('[gpu]', torch.cuda.get_device_name(0)); "
-                "print('[ok] exllamav3', exllamav3.__version__)\"",
+                "v = exllamav3.__version__; print('[ok] exllamav3', v); "
+                "p = tuple(int(x) for x in v.split('.')[:3] if x.isdigit()); "
+                f"sys.exit(0 if p >= {mn} else 7)"
             )
+            health = self.run(instance_id, f"{py} -c \"{health_code}\"")
+            if health["code"] == 7:
+                logger.error(
+                    f"Pre-baked image {self.image} ships an ExLlamaV3 older than "
+                    f"the required {'.'.join(map(str, mn))}; rebuild and push the "
+                    f"image (docker/Dockerfile.runpod) before using it.\n"
+                    f"{health['stdout'].strip()}"
+                )
+                return False
             if health["code"] != 0:
-                logger.error(f"Pre-baked health check failed: {health['stderr'][:2000]}")
+                logger.error(
+                    f"Pre-baked health check failed (code {health['code']}):\n"
+                    f"{health['stdout'].strip()}\n{health['stderr'][:1500]}"
+                )
                 return False
             logger.info(f"Health check output:\n{health['stdout'].strip()}")
+            # Ensure hf_transfer is present even on an older bake that predates
+            # it (idempotent + fast if already installed). remote/quant.py only
+            # enables the parallel downloader when the package imports.
+            self.run(instance_id, f"{py} -m pip install -q hf_transfer || true")
             return True
 
         # Always probe so run_pipeline has the right interpreter, even on fast-path.
@@ -681,7 +750,7 @@ class RunPodProvider(Provider):
         result = self.run(
             instance_id,
             f"{py} -m pip install --no-cache-dir --upgrade "
-            "huggingface-hub transformers tokenizers safetensors datasets "
+            "huggingface-hub hf_transfer transformers tokenizers safetensors datasets "
             "numpy Pillow marisa-trie pydantic kbnf formatron rich tqdm "
             "psutil sentencepiece pyyaml typing_extensions",
         )
@@ -893,17 +962,21 @@ class RunPodProvider(Provider):
         # 2. Locate the remote quant script. On pre-baked images it lives
         # at /opt/blockquant/quant.py; otherwise we SFTP the canonical
         # source from `remote/quant.py`.
+        # ALWAYS upload the current remote/quant.py, even on pre-baked images.
+        # The baked copy can lag the repo (the image is rebuilt rarely), and a
+        # stale quant.py silently loses fixes like the download heartbeat. The
+        # script is a few KB, so re-uploading costs nothing. When a baked copy
+        # exists we overwrite it in place so cards.py stays a sibling; otherwise
+        # we drop it at /root. This way the image gives us fast deps while the
+        # code is always canonical.
         check = self.run(
             instance_id,
             f"test -f {self._BAKED_REMOTE_QUANT} && echo BAKED || echo MISSING",
         )
-        if "BAKED" in check["stdout"]:
-            script_path = self._BAKED_REMOTE_QUANT
-            logger.info(f"Using pre-baked quant script at {script_path}")
-        else:
-            script_path = REMOTE_SCRIPT
-            self._upload_bytes(instance_id, self._load_quant_script(), script_path)
-            self.run(instance_id, f"chmod +x {script_path}")
+        script_path = self._BAKED_REMOTE_QUANT if "BAKED" in check["stdout"] else REMOTE_SCRIPT
+        self._upload_bytes(instance_id, self._load_quant_script(), script_path)
+        self.run(instance_id, f"chmod +x {script_path}")
+        logger.info(f"Uploaded current quant script to {script_path}")
 
         # Ship the card renderer + template next to the script (idempotent;
         # gives even pre-baked pods the current card without an image rebuild).

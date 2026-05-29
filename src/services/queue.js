@@ -387,15 +387,6 @@ export function enqueue(jobConfig) {
           failedAt: Date.now(),
           partialResults: results,
         }));
-        if (jobConfig.userId && jobConfig.cost) {
-          await db
-            .refundForJob({
-              jobId,
-              userId: jobConfig.userId,
-              cost: jobConfig.cost,
-            })
-            .catch((refundErr) => log.error('Refund failed', { error: refundErr.message }));
-        }
       }
       jobConfig.onError(err);
     } finally {

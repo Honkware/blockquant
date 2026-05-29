@@ -30,14 +30,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python -m pip install --upgrade pip
 
 # ---- Python deps ----------------------------------------------------------
-# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.30
+# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.37
 # on this base. Bumping any of these requires re-validating end-to-end on
 # at least one MoE model.
 RUN python -m pip install \
         "torch==2.6.0" \
         --index-url https://download.pytorch.org/whl/cu124
 
+# hf_transfer gives parallel, Rust-backed weight downloads (the 70GB+ pull is
+# the longest part of a run); remote/quant.py turns it on when it is present.
 RUN python -m pip install \
+        "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
         "transformers>=4.40" \
         "tokenizers>=0.20" \
@@ -63,7 +66,11 @@ RUN python -m pip install \
 # this torch/CUDA combo and tries to compile from source — fails in CI).
 # Pin the version so the bake is reproducible; bump after each release
 # behind an end-to-end validation pass.
-ARG EXLLAMAV3_VERSION=0.0.30
+# Keep this in sync with the min version the controller's pre-baked health
+# check enforces (_MIN_EXLLAMAV3 in providers/runpod/provider.py). An image
+# older than that is rejected at boot so a stale bake can't silently quantize
+# with outdated kernels / unsupported architectures (e.g. newer MoE models).
+ARG EXLLAMAV3_VERSION=0.0.37
 RUN python -m pip install --no-cache-dir --no-deps "exllamav3==${EXLLAMAV3_VERSION}"
 
 # ---- flash_attn import stub ----------------------------------------------

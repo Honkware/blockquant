@@ -97,6 +97,13 @@ const config = Object.freeze({
   HF_TOKEN: required('HF_TOKEN'),
   HF_ORG: process.env.HF_ORG || '',
 
+  // RunPod pod image. Empty = the in-pod bootstrap path (installs the latest
+  // ExLlamaV3 fresh; ~5 min slower start but always current). Set to a
+  // pre-baked image (e.g. ghcr.io/honkware/blockquant:<tag>) to skip bootstrap
+  // once that image has been rebuilt at the required ExLlamaV3 version; the
+  // controller's health check rejects a too-old image, so this is safe to flip.
+  RUNPOD_IMAGE: process.env.RUNPOD_IMAGE || '',
+
   // Access
   ADMIN_IDS: (process.env.ADMIN_IDS || '')
     .split(',')
