@@ -50,34 +50,29 @@ def emit_result(payload: dict) -> None:
         print(f"[fatal] could not write result: {e}", flush=True)
 
 
-def _self_terminate(pod_id: str, api_key: str) -> None:
-    """Best-effort RunPod self-terminate via the GraphQL API.
+def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float) -> None:
+    """Spawn a detached process that terminates the pod after a grace window.
 
-    Uses urllib so we don't depend on the runpod SDK being installed
-    inside the pod. Errors are logged but never raised — the work is
-    already done, we just want to stop burning credit.
+    This lets quant.py exit right after [done] so a live controller can drain
+    the log, fetch the result, and terminate the pod itself first. The backstop
+    fires only if that has not happened within the grace window (controller
+    died), so it cannot orphan the pod and does not race a live controller.
+
+    Uses urllib + the v1 REST DELETE with Bearer auth; the legacy GraphQL
+    endpoint returns 403 for rpa_ keys. No dependency on the runpod SDK.
     """
-    import urllib.request
-    body = json.dumps({
-        "query": (
-            "mutation PodTerminate($podId: String!) { "
-            "podTerminate(input: {podId: $podId}) "
-            "}"
-        ),
-        "variables": {"podId": pod_id},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"https://api.runpod.io/graphql?api_key={api_key}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    import subprocess
+    code = (
+        "import time, urllib.request as u;"
+        f"time.sleep({float(grace_seconds)});"
+        f"u.urlopen(u.Request('https://rest.runpod.io/v1/pods/{pod_id}', "
+        f"method='DELETE', headers={{'Authorization': 'Bearer {api_key}'}}), timeout=20)"
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            print(f"[self-terminate] http {r.status}", flush=True)
-    except Exception as e:
-        print(f"[self-terminate] WARN {type(e).__name__}: {e}",
-              flush=True)
+    subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
@@ -234,8 +229,9 @@ def main() -> int:
             try:
                 _write_cards(outputs, model_id, model_name, owner, hf_token,
                              head_bits, cal_rows, model_dir)
-            except Exception as exc:
-                print(f"[card] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
+            except Exception:
+                import traceback
+                print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
 
             repo_ids = []
             for out in outputs:
@@ -283,25 +279,19 @@ def main() -> int:
             pid = cfg.get("pod_id", "")
             key = cfg.get("runpod_api_key", "")
             if pid and key:
-                # Brief grace so the local poll loop has a chance to
-                # scoop bq-result.json before SSH dies.
-                # self_terminate_grace_seconds in the config controls this;
-                # falls back to poll_interval_seconds if set, then 30 s.
-                default_grace = cfg.get("poll_interval_seconds", 30)
-                grace_seconds = cfg.get("self_terminate_grace_seconds", default_grace)
+                # Arm a detached backstop and exit immediately. A live
+                # controller sees this process finish, drains the log, fetches
+                # bq-result.json, and terminates the pod itself, all well
+                # before the backstop fires. The backstop only matters if the
+                # controller has died, so it can't orphan the pod.
                 try:
-                    grace_seconds = float(grace_seconds)
+                    grace = float(cfg.get("self_terminate_grace_seconds", 300))
                 except (TypeError, ValueError):
-                    grace_seconds = 30.0
-                if grace_seconds < 0:
-                    grace_seconds = 30.0
-                time.sleep(grace_seconds)
-                print(
-                    f"[self-terminate] terminating pod {pid} after "
-                    f"{grace_seconds:g}s grace ...",
-                    flush=True,
-                )
-                _self_terminate(pid, key)
+                    grace = 300.0
+                if grace < 0:
+                    grace = 300.0
+                _arm_self_terminate_backstop(pid, key, grace)
+                print(f"[self-terminate] backstop armed ({grace:g}s)", flush=True)
             else:
                 print("[self-terminate] skipped (missing pod_id or api_key)",
                       flush=True)
