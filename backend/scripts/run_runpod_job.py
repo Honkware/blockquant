@@ -34,6 +34,12 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
+# Blackwell-class GPUs (sm_100/sm_120) need CUDA 12.8+ / torch >= 2.7; our
+# torch 2.6 + cu124 has no kernels for them. Matched as substrings of the
+# RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
+_BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
+
+
 def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
     """GPU type ids with at least min_vram_gb, cheapest tier first.
 
@@ -49,6 +55,13 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
         gid = (g.get("id") or "").strip()
         mem = g.get("memoryInGb") or 0
         if not gid or gid == "unknown" or "MIG" in gid or mem < min_vram_gb:
+            continue
+        # torch 2.6 / cu124 (the baked image AND the bootstrap path) has no
+        # kernels for Blackwell (sm_100/sm_120): the quant dies mid-run with
+        # "no kernel image is available for execution on the device". Skip
+        # Blackwell-class cards until the stack moves to a cu128 torch. Plenty
+        # of cheap Ada/Ampere/Hopper stock remains under the price cap.
+        if any(tok in gid for tok in _BLACKWELL_EXCLUDE):
             continue
         cards.append((mem, gid))
     cards.sort(key=lambda x: x[0])
