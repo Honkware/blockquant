@@ -266,7 +266,41 @@ def main() -> int:
             if not ok:
                 emit_result({"status": "failed", "error": f"prepare failed: {err}"})
                 return 1
-            exl_main(in_args, job_state)
+            # Stream real quantize progress. exllamav3 renders a transient rich
+            # progress bar (no parseable per-layer lines), so without this the
+            # embed sits frozen for the whole hours-long quantize phase.
+            # convert_model tracks curr/max_progress module globals (one tick per
+            # quantized linear layer); poll them and emit a parseable line.
+            import threading
+            import exllamav3.conversion.convert_model as _cm
+            _q_done = threading.Event()
+
+            def _quant_progress():
+                last = -1
+                t0 = time.time()
+                while not _q_done.wait(15):
+                    try:
+                        with _cm.progress_lock:
+                            cur, mx = _cm.curr_progress, _cm.max_progress
+                    except Exception:
+                        continue
+                    if mx and cur != last:
+                        pct = min(99, int(cur / mx * 100))
+                        eta = ""
+                        el = time.time() - t0
+                        if cur > 0:
+                            rem = (mx - cur) * (el / cur)
+                            eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
+                        print(f"[progress] quantize {variant} {pct}% ({cur}/{mx}){eta}", flush=True)
+                        last = cur
+
+            _qt = threading.Thread(target=_quant_progress, daemon=True)
+            _qt.start()
+            try:
+                exl_main(in_args, job_state)
+            finally:
+                _q_done.set()
+                _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
             outputs.append({"variant": variant, "path": str(out_dir)})
 

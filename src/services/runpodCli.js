@@ -18,6 +18,9 @@ const RE = {
   bootstrap: /Bootstrap complete/,
   download: /\[download\]\s*(.+)/,
   quantizeStart: /\[quantize\]\s*([0-9.]+)\s*bpw/,
+  // Real quantize progress emitted by remote/quant.py:
+  // "[progress] quantize 5.0 42% (118/280) eta 12m"
+  quantProgress: /\[progress\]\s*quantize\s+([0-9.]+)\s+(\d+)%(?:\s*\([^)]*\))?(?:\s*eta\s*(\S+))?/,
   layer: /Quantized:\s*\S*?layers\.(\d+)/,
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
@@ -78,6 +81,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     const results = new Map(); // bpw -> url
     let curBpw = variants[0];
     let curLayer = 0;
+    let curQuantPct = null; // real quantize % from [progress] lines, when present
     let podId = '';
     let stage = 'Provisioning';
 
@@ -88,7 +92,11 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     const report = (message) => {
       let overall;
       if (stage === 'Quantizing') {
-        overall = 25 + Math.round(Math.min(curLayer / TOTAL_LAYERS_GUESS, 1) * 65);
+        // Prefer the real module-progress % from quant.py; fall back to the
+        // coarse layer-count guess only if no [progress] line has arrived yet.
+        overall = curQuantPct != null
+          ? 25 + Math.round((curQuantPct / 100) * 65)
+          : 25 + Math.round(Math.min(curLayer / TOTAL_LAYERS_GUESS, 1) * 65);
       } else {
         overall = PHASE_PCT[stage] ?? 0;
       }
@@ -110,9 +118,17 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
         stage = 'Uploading';
         return report(`Uploaded ${m[1]} bpw`);
       }
+      if ((m = RE.quantProgress.exec(line))) {
+        curBpw = m[1];
+        curQuantPct = parseInt(m[2], 10);
+        stage = 'Quantizing';
+        const eta = m[3] ? ` · eta ${m[3]}` : '';
+        return report(`${curQuantPct}%${eta}`);
+      }
       if ((m = RE.quantizeStart.exec(line))) {
         curBpw = m[1];
         curLayer = 0;
+        curQuantPct = null;
         stage = 'Quantizing';
         return report(`Quantizing ${m[1]} bpw`);
       }
