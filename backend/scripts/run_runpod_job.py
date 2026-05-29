@@ -39,6 +39,29 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
 _BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
 
+# exllamav3 version is chosen by architecture. The stable release (0.0.37, what
+# the bootstrap path installs) handles the proven models incl. Qwen3.6. The
+# master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
+# (Qwen3.6 segfaults loading the first layer), so we only reach for the master
+# image when the model's architecture actually needs it.
+_MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
+_MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
+
+
+def _arch_needs_master(model_id: str, token: str) -> bool:
+    """True if the model's architecture is only supported on exllamav3 master."""
+    try:
+        import json as _json
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(model_id, "config.json", token=token or None)
+        with open(p) as f:
+            cfg = _json.load(f)
+        archs = " ".join(cfg.get("architectures") or [])
+        hay = f"{archs} {cfg.get('model_type', '')}".lower()
+        return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
+    except Exception:
+        return False
+
 
 def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
     """GPU type ids with at least min_vram_gb, cheapest tier first.
@@ -260,6 +283,17 @@ def main():
         args.volume_disk = int(args.volume_disk)
     print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
           f"outputs+work -> container {args.container_disk} GB", flush=True)
+
+    # Pick exllamav3 by architecture (unless an image was pinned explicitly).
+    # Stable 0.0.37 (the bootstrap path) for the proven models incl. Qwen3.6;
+    # the master image only for archs that need it (e.g. LFM2), since master
+    # regresses Qwen3.6.
+    if not args.image:
+        if _arch_needs_master(args.model, args.hf_token):
+            args.image = _MASTER_IMAGE
+            print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
+        else:
+            print("[image] bootstrap path (exllamav3 0.0.37, stable)", flush=True)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
