@@ -242,6 +242,12 @@ class RunPodProvider(Provider):
             cloud_type=self.cloud_type,
             container_disk_in_gb=self.container_disk_gb,
             volume_in_gb=self.volume_gb,
+            # Mount the volume at /workspace, where remote/quant.py puts the
+            # model, HF cache, work dir, and outputs. The runpod SDK defaults
+            # this to /runpod-volume, which left the volume unused and crammed
+            # everything onto the (smaller) container disk — the big 35B model
+            # then overflowed it and the quant never started.
+            volume_mount_path="/workspace",
             support_public_ip=True,
             start_ssh=True,
             ports="22/tcp",
