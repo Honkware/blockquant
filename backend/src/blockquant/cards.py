@@ -48,8 +48,11 @@ def _find_template() -> str:
     env = os.environ.get("BLOCKQUANT_CARD_TEMPLATE")
     if env:
         candidates.append(Path(env))
-    candidates.append(here.parents[1] / "templates" / "card_template.md")  # backend/templates
     candidates.append(here / "card_template.md")  # co-located on the pod
+    if len(here.parents) >= 2:
+        # Library layout: backend/src/blockquant/cards.py -> backend/templates.
+        # Guarded because a shallow path (e.g. /root on a pod) has no parents[1].
+        candidates.append(here.parents[1] / "templates" / "card_template.md")
     for path in candidates:
         try:
             if path.is_file():

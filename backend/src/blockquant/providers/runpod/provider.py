@@ -19,6 +19,7 @@ Requirements:
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -478,6 +479,13 @@ class RunPodProvider(Provider):
                 finally:
                     sftp.close()
             except transient as e:
+                # Deterministic filesystem errors (missing parent dir, perms)
+                # never succeed on retry, so surface them immediately instead
+                # of spinning through the backoff.
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR
+                ):
+                    raise
                 last_err = e
                 if attempt == retries - 1:
                     raise
@@ -665,14 +673,20 @@ class RunPodProvider(Provider):
         # and transformers/sentencepiece are used across the stack. These overlap with
         # exllamav3's own requirements.txt but we install them first so a pre-upload
         # failure is cheap to diagnose.
-        logger.info("Installing HF deps...")
+        # The full runtime set exllamav3 needs, matching the prebaked image.
+        # We install these explicitly because exllamav3 is installed --no-deps
+        # below (its 0.0.37 metadata hard-requires flash-attn, which has no
+        # wheel for this torch/CUDA and fails to build).
+        logger.info("Installing HF + exllamav3 runtime deps...")
         result = self.run(
             instance_id,
             f"{py} -m pip install --no-cache-dir --upgrade "
-            "huggingface-hub transformers sentencepiece tqdm psutil",
+            "huggingface-hub transformers tokenizers safetensors datasets "
+            "numpy Pillow marisa-trie pydantic kbnf formatron rich tqdm "
+            "psutil sentencepiece pyyaml typing_extensions",
         )
         if result["code"] != 0:
-            logger.error(f"HF deps install failed: {result['stderr'][:2000]}")
+            logger.error(f"runtime deps install failed: {result['stderr'][:2000]}")
             return False
 
         if self.install_flash_attn:
@@ -716,8 +730,48 @@ class RunPodProvider(Provider):
                 f"cd {remote_dir} && {py} -m pip install -e . --no-deps",
             )
         else:
-            logger.info("Installing exllamav3 from PyPI (with deps)...")
-            result = self.run(instance_id, f"{py} -m pip install --upgrade exllamav3")
+            logger.info("Installing exllamav3 from PyPI (--no-deps; flash-attn excluded)...")
+            result = self.run(
+                instance_id,
+                f"{py} -m pip install --no-cache-dir --upgrade --no-deps exllamav3",
+            )
+
+        if result["code"] != 0:
+            logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
+            return False
+
+        # exllamav3 0.0.37 imports flash_attn unconditionally and its dispatch
+        # wrappers call it whenever the arg shapes match, so it crashes during
+        # calibration when flash-attn is absent. We do not install real
+        # flash-attn (no wheel for this torch/CUDA), so patch the wrappers to
+        # fall back to exllamav3's own SDPA backend instead.
+        if not self.install_flash_attn:
+            self._upload_bytes(
+                instance_id, self._FLASH_PATCH.read_bytes(), "/tmp/patch_flash_attn.py"
+            )
+            result = self.run(instance_id, f"{py} /tmp/patch_flash_attn.py")
+            if result["code"] != 0:
+                logger.error(
+                    "flash_attn SDPA-fallback patch failed: "
+                    f"{result['stdout'].strip()} {result['stderr'][:1000]}"
+                )
+                return False
+            logger.info(f"flash_attn SDPA-fallback patch: {result['stdout'].strip()}")
+
+        # exllamav3's PyPI wheel omits the bundled calibration corpus, so
+        # convert.py can't find conversion/standard_cal_data/c4.utf8. Fetch it
+        # from the source repo into the installed package.
+        self._upload_bytes(
+            instance_id, self._CAL_DATA_FETCH.read_bytes(), "/tmp/fetch_cal_data.py"
+        )
+        result = self.run(instance_id, f"{py} /tmp/fetch_cal_data.py")
+        if result["code"] != 0:
+            logger.error(
+                "calibration data fetch failed: "
+                f"{result['stdout'].strip()} {result['stderr'][:1000]}"
+            )
+            return False
+        logger.info(f"calibration data: {result['stdout'].strip()}")
 
         # Formatron is chronically broken against current pydantic in many base images,
         # and the exllamav3 top-level __init__ hard-imports FormatronFilter even for
@@ -734,26 +788,26 @@ class RunPodProvider(Provider):
                 "    def __init__(self, *a, **kw):\n"
                 "        raise RuntimeError('FormatronFilter stubbed out (formatron broken in env)')\n"
             )
-            # Find the exllamav3 filter module regardless of local vs PyPI install.
+            # Locate the installed formatron.py WITHOUT importing exllamav3.
+            # Its __init__ hard-imports the broken FormatronFilter, so importing
+            # it is exactly what fails here. find_spec resolves the path without
+            # executing the package, and works for PyPI and editable installs.
             locate = self.run(
                 instance_id,
-                f"{py} -c 'import exllamav3, os; "
-                "p = os.path.join(os.path.dirname(exllamav3.__file__), \"generator\", \"filter\", \"formatron.py\"); "
-                "print(p)' 2>/dev/null || true",
+                f"{py} -c \"import importlib.util as u, os; "
+                "s = u.find_spec('exllamav3'); "
+                "print(os.path.join(os.path.dirname(s.origin), 'generator', 'filter', 'formatron.py') "
+                "if s and s.origin else '')\"",
             )
-            remote_formatron = locate["stdout"].strip().splitlines()
-            remote_formatron = remote_formatron[-1] if remote_formatron else ""
+            lines = [ln for ln in locate["stdout"].strip().splitlines() if ln.strip()]
+            remote_formatron = lines[-1] if lines else ""
             if not remote_formatron:
-                # Fall back to the known local-upload path.
-                remote_formatron = "/workspace/exllamav3/exllamav3/generator/filter/formatron.py"
+                logger.error("Could not locate exllamav3 formatron module to stub")
+                return False
             self._upload_bytes(
                 instance_id, formatron_shim.encode("utf-8"), remote_formatron
             )
             logger.info(f"Stubbed {remote_formatron}")
-
-        if result["code"] != 0:
-            logger.error(f"exllamav3 install failed: {result['stderr'][:2000]}")
-            return False
 
         logger.info("Health check...")
         result = self.run(
@@ -786,6 +840,8 @@ class RunPodProvider(Provider):
     # parents[4] is the backend/ root that holds templates/.
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
+    _FLASH_PATCH = Path(__file__).resolve().parents[5] / "docker" / "patch_flash_attn.py"
+    _CAL_DATA_FETCH = Path(__file__).resolve().parents[5] / "docker" / "fetch_cal_data.py"
 
     @classmethod
     def _load_quant_script(cls) -> bytes:
@@ -815,9 +871,9 @@ class RunPodProvider(Provider):
         self._last_result = None
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
-        # pod_id + runpod_api_key + keep_pod let the in-pod script
-        # self-terminate after [done] without depending on the local
-        # poll loop being alive — see remote/quant.py:_self_terminate.
+        # pod_id + runpod_api_key + keep_pod arm the in-pod self-terminate
+        # backstop after [done] for the case where the local controller dies.
+        # See remote/quant.py:_arm_self_terminate_backstop.
         cfg: dict = {
             "model_id": model_id,
             "variants": list(variants),
