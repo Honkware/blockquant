@@ -83,6 +83,19 @@ def _size_tokens(model_name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _params_b_from_name(model_name: str, default: float = 35.0) -> float:
+    """Total parameter count (in billions) from the model name, for size
+    estimates. Uses the leading number of the size token (e.g. ``8B-A1B`` -> 8,
+    ``35B-A3B`` -> 35, ``0.5B`` -> 0.5). EXL3 size scales with TOTAL params (all
+    MoE experts are stored), so the leading figure is the right one. Falls back
+    to ``default`` when the name carries no size token."""
+    tok = _size_tokens(model_name)
+    if not tok:
+        return default
+    m = re.match(r"(\d+(?:\.\d+)?)B", tok)
+    return float(m.group(1)) if m else default
+
+
 def derive_model_facts(config: dict, model_name: str = "") -> dict:
     """Pull architecture facts out of a HuggingFace ``config.json`` dict."""
     archs = config.get("architectures") or []
@@ -137,7 +150,7 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     return n_params_b * bpw / 8.0 + 1.5
 
 
-def build_quants_table(rows: list[dict], current_variant: str) -> str:
+def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0) -> str:
     """Render the Quants table.
 
     Each row: ``{"variant": str, "head_bits": int, "cal_rows": int,
@@ -161,7 +174,7 @@ def build_quants_table(rows: list[dict], current_variant: str) -> str:
                 else f"[link]({row['url']})"
             )
         else:
-            size_str = f"<i>~{_est_size_gb(float(v)):.0f}&nbsp;GB</i>"
+            size_str = f"<i>~{_est_size_gb(float(v), n_params_b):.0f}&nbsp;GB</i>"
             status = "<kbd>this repo</kbd>" if is_current else "<sub>queued</sub>"
         if is_current:
             size_str = f"**{size_str}**"
@@ -198,7 +211,8 @@ def render_exl3_card(
     """Render the full polished card for one EXL3 variant."""
     base_name = base_repo.split("/")[-1]
     facts = derive_model_facts(model_config, base_name)
-    size_str = f"{size_gb:.1f}" if size_gb is not None else f"{_est_size_gb(float(variant)):.1f}"
+    n_params_b = _params_b_from_name(base_name)
+    size_str = f"{size_gb:.1f}" if size_gb is not None else f"{_est_size_gb(float(variant), n_params_b):.1f}"
 
     ctx = {
         "LICENSE": license_id or "other",
@@ -222,7 +236,7 @@ def render_exl3_card(
             variant,
             f"**VRAM at {variant}&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead.",
         ),
-        "QUANTS_TABLE": build_quants_table(quant_rows, variant),
+        "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),
         "COLLECTION_URL": collection_url,
     }
     return _render(_find_template(), ctx)
