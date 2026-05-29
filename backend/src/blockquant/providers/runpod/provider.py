@@ -23,6 +23,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -662,15 +663,28 @@ class RunPodProvider(Provider):
             # torch/exllamav3 fail to import OR exllamav3 is older than the
             # minimum, so a stale bake fails fast here instead of silently
             # quantizing with outdated kernels.
+            # Read the version robustly: a git/source install (master) doesn't
+            # set exllamav3.__version__ at the top level the way a PyPI wheel
+            # does, so prefer installed package metadata and fall back through
+            # the module attrs. If the version can't be determined at all, the
+            # gate fails OPEN (import already succeeded, which is the real
+            # signal) rather than rejecting a working image.
             mn = _MIN_EXLLAMAV3
             health_code = (
-                "import torch, exllamav3, sys; "
-                "print('[gpu]', torch.cuda.get_device_name(0)); "
-                "v = exllamav3.__version__; print('[ok] exllamav3', v); "
-                "p = tuple(int(x) for x in v.split('.')[:3] if x.isdigit()); "
-                f"sys.exit(0 if p >= {mn} else 7)"
+                "import torch, exllamav3, sys\n"
+                "print('[gpu]', torch.cuda.get_device_name(0))\n"
+                "v = ''\n"
+                "try:\n"
+                "    from importlib.metadata import version as _ver\n"
+                "    v = _ver('exllamav3')\n"
+                "except Exception:\n"
+                "    v = getattr(exllamav3, '__version__', '') or "
+                "getattr(getattr(exllamav3, 'version', None), '__version__', '') or ''\n"
+                "print('[ok] exllamav3', v or '(version unknown)')\n"
+                "p = tuple(int(x) for x in v.split('.')[:3] if x.isdigit())\n"
+                f"sys.exit(7 if (p and p < {mn}) else 0)\n"
             )
-            health = self.run(instance_id, f"{py} -c \"{health_code}\"")
+            health = self.run(instance_id, f"{py} -c {shlex.quote(health_code)}")
             if health["code"] == 7:
                 logger.error(
                     f"Pre-baked image {self.image} ships an ExLlamaV3 older than "
