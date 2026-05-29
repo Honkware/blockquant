@@ -36,7 +36,7 @@ bits_per_weight: {{BPW}}
 ---
 
 > [!NOTE]
-> An [ExLlamaV3](https://github.com/turboderp-org/exllamav3) build of [`{{BASE_REPO}}`](https://huggingface.co/{{BASE_REPO}}) at **{{BPW}} bits per weight**: {{POSITIONING}}. See [Quants](#quants) for sibling repos at other bit&#8209;widths or browse the [collection]({{COLLECTION_URL}}).
+> An [ExLlamaV3](https://github.com/turboderp-org/exllamav3) build of [`{{BASE_REPO}}`](https://huggingface.co/{{BASE_REPO}}) at **{{BPW}} bits per weight**. See [Quants](#quants) for sibling repos at other bit&#8209;widths or browse the [collection]({{COLLECTION_URL}}).
 
 ## Quants
 
@@ -70,9 +70,6 @@ bits_per_weight: {{BPW}}
     </tr>
   </tbody>
 </table>
-
-> [!TIP]
-> {{VRAM_HINT}}
 
 ## Download
 

@@ -12,23 +12,10 @@ import os
 import re
 from pathlib import Path
 
-# Per-bpw positioning + VRAM copy. Generic enough for any mid/large model;
-# unlisted bit-widths fall back to a neutral line.
-POSITIONING = {
-    "3.0": "the tightest fit, sized for 16&nbsp;GB consumer cards while leaving usable context room",
-    "4.0": "the tight&#8209;fit build, sized to leave generous context room on a 24&nbsp;GB consumer GPU and to load on 16&nbsp;GB cards at workable context lengths",
-    "4.5": "the quality-leaning sweet spot: comfortable on a single 24&nbsp;GB consumer GPU, effectively indistinguishable from FP16 on most reasoning tasks",
-    "5.0": "the quality build that fits a 24&nbsp;GB card with reduced context, with headroom on 32&nbsp;GB cards",
-    "6.0": "near-lossless reference quality for 32&nbsp;GB+ cards (V100, A100, RTX&nbsp;6000)",
-}
-
-VRAM_HINT = {
-    "3.0": "**VRAM at 3.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Fits a 16&nbsp;GB card with workable context, comfortable on 24&nbsp;GB with very long context.",
-    "4.0": "**VRAM at 4.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Comfortable on a single 24&nbsp;GB card with room for ~24k tokens of context; fits a 16&nbsp;GB card with a ~4&ndash;6k token window.",
-    "4.5": "**VRAM at 4.5&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Comfortable on a single 24&nbsp;GB card with room for ~16k tokens of context; fits a 16&nbsp;GB card with a reduced context window.",
-    "5.0": "**VRAM at 5.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Tight on 24&nbsp;GB (limited context); comfortable on 32&nbsp;GB+.",
-    "6.0": "**VRAM at 6.0&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead. Best on 32&nbsp;GB+ cards (V100, A100, RTX&nbsp;6000) where there's room for long context.",
-}
+# The card is intentionally facts-only: bit-width, the real measured size, the
+# architecture, and the cross-linked Quants table. The weight size already
+# tells the reader their VRAM need, so we deliberately do NOT print VRAM/context
+# estimates (which would have to guess KV-cache geometry per architecture).
 
 
 def exl3_repo_slug(base_name: str, variant: str) -> str:
@@ -212,7 +199,8 @@ def render_exl3_card(
     base_name = base_repo.split("/")[-1]
     facts = derive_model_facts(model_config, base_name)
     n_params_b = _params_b_from_name(base_name)
-    size_str = f"{size_gb:.1f}" if size_gb is not None else f"{_est_size_gb(float(variant), n_params_b):.1f}"
+    weights_gb = size_gb if size_gb is not None else _est_size_gb(float(variant), n_params_b)
+    size_str = f"{weights_gb:.1f}"
 
     ctx = {
         "LICENSE": license_id or "other",
@@ -231,11 +219,6 @@ def render_exl3_card(
         "CAL_ROWS": str(cal_rows),
         "REPO_ID": repo_id,
         "SHORT_NAME": repo_id.split("/")[-1],
-        "POSITIONING": POSITIONING.get(variant, f"the {variant}&nbsp;bpw build"),
-        "VRAM_HINT": VRAM_HINT.get(
-            variant,
-            f"**VRAM at {variant}&nbsp;bpw:** weights on disk + ~2&nbsp;GB context overhead.",
-        ),
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),
         "COLLECTION_URL": collection_url,
     }
