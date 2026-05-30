@@ -396,16 +396,19 @@ export async function runApprovedJob({ interaction, job }) {
       });
 
       // Re-sync ALL of this model's EXL3 cards + collection, so variants done
-      // in separate runs (or earlier) cross-reference each other. Best-effort:
-      // a finalize failure must not fail the job.
-      if (format === 'exl3' && results.some((r) => r.pushed)) {
+      // in separate runs (or earlier) cross-reference each other. Run it for any
+      // exl3 job regardless of what THIS run's result tracking says: the
+      // finalizer discovers the actual uploaded repos from HF, so it still
+      // cross-links variants even when a controller died/was marked failed but
+      // the quant had already uploaded. Best-effort: never fails the job.
+      if (format === 'exl3') {
         try {
           await thread.send('Cross-linking model cards + collection...');
           const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
           await thread.send(
             fin.ok
               ? `Cards cross-linked${fin.collectionUrl ? ` · [collection](${fin.collectionUrl})` : ''}.`
-              : 'Cards uploaded, but the cross-link/collection step had an issue (the quants are still on HF).'
+              : 'Cross-link/collection step had an issue (any uploaded quants are still on HF).'
           );
         } catch (e) {
           log.debug(`finalize step failed: ${e.message}`);
