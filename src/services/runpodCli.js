@@ -17,7 +17,7 @@ const RE = {
   quantizeStart: /\[quantize\]\s*([0-9.]+)\s*bpw/,
   // Real quantize progress emitted by remote/quant.py:
   // "[progress] quantize 5.0 42% (118/280) eta 12m"
-  quantProgress: /\[progress\]\s*quantize\s+([0-9.]+)\s+(\d+)%(?:\s*\([^)]*\))?(?:\s*eta\s*(\S+))?/,
+  quantProgress: /\[progress\]\s*quantize\s+([0-9.]+)\s+(\d+)%(?:\s*\(([^)]*)\))?(?:\s*eta\s*(\S+))?/,
   layer: /Quantized:\s*\S*?layers\.(\d+)/,
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
@@ -78,10 +78,18 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     const results = new Map(); // bpw -> url
     let curBpw = variants[0];
     let curDownloadPct = 0;   // from [download] N% (monotonic)
-    let curQuantPct = null;   // from [progress] X% (monotonic)
     let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
+
+    // Quantize is two passes (measure, then quantize) and exllamav3's module
+    // counter resets between them. Track the pass and a monotonic fraction
+    // across BOTH passes so the bar climbs honestly instead of snapping to 90%
+    // after the (fast) measure pass and freezing through the (long) quantize.
+    let quantPhase = 0;       // 0 = measure pass, 1 = quantize pass, 2+ = extra
+    let phaseCur = -1;        // highest module index seen in the current pass
+    let quantSuper = 0;       // monotonic 0..1 across all quantize passes
+    let lastQuantPctMsg = 0;  // for the embed message text
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
     // bar climbs smoothly the whole run (download 4->25, quantize 25->90), and
@@ -92,7 +100,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
       switch (stage) {
         case 'Provisioning': overall = 4; break;
         case 'Downloading':  overall = 4 + Math.round((curDownloadPct / 100) * 21); break;
-        case 'Quantizing':   overall = 25 + Math.round(((curQuantPct ?? 0) / 100) * 65); break;
+        case 'Quantizing':   overall = 25 + Math.round(quantSuper * 65); break;
         case 'Uploading':    overall = 95; break;
         case 'Complete':     overall = 100; break;
         default:             overall = 0;
@@ -118,19 +126,32 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
         return report(`Uploaded ${m[1]} bpw`);
       }
       if ((m = RE.quantProgress.exec(line))) {
-        const pct = parseInt(m[2], 10);
-        // Ignore stale lines the poll reprints from its window (pct < current)
-        // so the percent only ever climbs.
-        if (curQuantPct != null && pct < curQuantPct) return;
         curBpw = m[1];
-        curQuantPct = pct;
         stage = 'Quantizing';
-        const eta = m[3] ? ` · eta ${m[3]}` : '';
-        return report(`${pct}%${eta}`);
+        const eta = m[4] ? ` · eta ${m[4]}` : '';
+        // "[progress] quantize 4.0 36% (281/774) eta 71m" -> cur=281, mx=774.
+        // The "(preparing)" heartbeat has no cur/mx; just hold the bar.
+        let cur = null, mx = null;
+        if (m[3]) { const cm = m[3].match(/(\d+)\s*\/\s*(\d+)/); if (cm) { cur = +cm[1]; mx = +cm[2]; } }
+        if (cur == null || !mx) return report('preparing');
+        // A counter that dropped to well under half its peak means the next
+        // pass started (measure -> quantize). A stale line the poll reprinted
+        // only drops by the small window span, so it won't trip this.
+        if (phaseCur > 50 && cur < phaseCur * 0.6) { quantPhase++; phaseCur = -1; }
+        if (cur <= phaseCur) return;            // stale reprint within this pass
+        phaseCur = cur;
+        const frac = Math.min(cur / mx, 1);
+        // Measure pass is fast, quantize pass is the long one -> give quantize
+        // the bigger band. Extra passes (rare) ride the tail.
+        const BANDS = [[0, 0.35], [0.35, 0.97], [0.97, 1]];
+        const b = BANDS[Math.min(quantPhase, BANDS.length - 1)];
+        const s = b[0] + frac * (b[1] - b[0]);
+        if (s > quantSuper) quantSuper = s;     // monotonic across passes
+        lastQuantPctMsg = parseInt(m[2], 10);
+        return report(`${lastQuantPctMsg}%${eta}`);
       }
       if ((m = RE.quantizeStart.exec(line))) {
         curBpw = m[1];
-        if (curQuantPct == null) curQuantPct = 0; // entered quantize; bar at band start
         stage = 'Quantizing';
         return report(`Quantizing ${m[1]} bpw`);
       }
