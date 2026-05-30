@@ -277,47 +277,92 @@ def main() -> int:
             if not ok:
                 emit_result({"status": "failed", "error": f"prepare failed: {err}"})
                 return 1
-            # Stream real quantize progress. exllamav3 renders a transient rich
-            # progress bar (no parseable per-layer lines), so without this the
-            # embed sits frozen for the whole hours-long quantize phase.
-            # convert_model tracks curr/max_progress module globals (one tick per
-            # quantized linear layer); poll them and emit a parseable line.
+            # Stream layer-based quantize progress. The HONEST progress signal is
+            # the layer index (0..num_hidden_layers): exllamav3's internal
+            # curr/max counter resets per group and does NOT track overall
+            # progress (it read 99% while only on layer 7 of 40). Tap stdout to
+            # follow the highest "Quantized: ...layers.N" the converter prints,
+            # and emit a parseable percent from layer/total.
+            import re as _re
             import threading
-            import exllamav3.conversion.convert_model as _cm
+
+            def _model_total_layers() -> int:
+                try:
+                    with open(model_dir / "config.json") as _f:
+                        _cfg = json.load(_f)
+                except Exception:
+                    return 0
+
+                def _find(o):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in ("num_hidden_layers", "num_layers") and isinstance(v, int):
+                                return v
+                            r = _find(v)
+                            if r:
+                                return r
+                    return None
+
+                return _find(_cfg) or 0
+
+            _total_layers = _model_total_layers()
+            _lstate = {"layer": 0}
+            _layer_re = _re.compile(r"layers\.(\d+)")
+
+            class _LayerTap:
+                """Pass stdout through unchanged, but track the highest layer the
+                converter reports so the monitor can read it."""
+                def __init__(self, real):
+                    self._real = real
+
+                def write(self, s):
+                    self._real.write(s)
+                    if "Quantized" in s and "layers." in s:
+                        for mm in _layer_re.finditer(s):
+                            n = int(mm.group(1))
+                            if n > _lstate["layer"]:
+                                _lstate["layer"] = n
+
+                def flush(self):
+                    self._real.flush()
+
+                def __getattr__(self, a):
+                    return getattr(self._real, a)
+
             _q_done = threading.Event()
 
             def _quant_progress():
                 last = -1
-                t0 = time.time()
+                t_first = None
                 while not _q_done.wait(15):
-                    try:
-                        with _cm.progress_lock:
-                            cur, mx = _cm.curr_progress, _cm.max_progress
-                    except Exception:
-                        continue
-                    if not mx:
-                        # Capture/measure phase: exllamav3 hasn't set the module
-                        # count yet. Emit a heartbeat anyway so a parseable
-                        # quantize marker is ALWAYS in the controller's log tail
-                        # and the embed leaves "Downloading" the moment
-                        # conversion starts (this phase is long for big models).
+                    n = _lstate["layer"]
+                    if not _total_layers or n == 0:
+                        # Measure/prep phase: no layer reported yet. Heartbeat so
+                        # the embed leaves "Downloading" the moment conversion
+                        # starts and the controller's tail always has a marker.
                         print(f"[progress] quantize {variant} 0% (preparing)", flush=True)
                         continue
-                    if cur != last:
-                        pct = min(99, int(cur / mx * 100))
-                        eta = ""
-                        el = time.time() - t0
-                        if cur > 0:
-                            rem = (mx - cur) * (el / cur)
-                            eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
-                        print(f"[progress] quantize {variant} {pct}% ({cur}/{mx}){eta}", flush=True)
-                        last = cur
+                    if t_first is None:
+                        t_first = time.time()
+                    if n == last:
+                        continue
+                    pct = min(99, int(n / _total_layers * 100))
+                    eta = ""
+                    el = time.time() - t_first
+                    if el > 0:
+                        rem = (_total_layers - n) * (el / n)
+                        eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
+                    print(f"[progress] quantize {variant} {pct}% (layer {n}/{_total_layers}){eta}", flush=True)
+                    last = n
 
             _qt = threading.Thread(target=_quant_progress, daemon=True)
             _qt.start()
+            _old_stdout = sys.stdout
+            sys.stdout = _LayerTap(_old_stdout)
             try:
                 exl_main(in_args, job_state)
             finally:
+                sys.stdout = _old_stdout
                 _q_done.set()
                 _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
