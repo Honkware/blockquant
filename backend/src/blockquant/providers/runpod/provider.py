@@ -1045,19 +1045,33 @@ class RunPodProvider(Provider):
         logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip()})")
         return {"status": "started"}
 
-    def get_progress(self, instance_id: str, lines: int = 80) -> str:
-        """Return the tail of the remote log for progress reporting.
+    # Progress markers worth streaming to the controller/embed. Everything else
+    # in the log (exllamav3's per-submodule "Quantized: ...experts.N..." flood —
+    # hundreds of lines per MoE layer) is dropped so it can't drown the clean
+    # [progress] heartbeat or overwhelm the controller->bot stream, which left
+    # the embed frozen on a 35B MoE. The [progress] line already carries the
+    # quantize stage + percent, so we don't need the per-layer flood.
+    _PROGRESS_MARKERS = (
+        r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
+        r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
+    )
 
-        ``lines`` defaults to 80: exllamav3's measure/optimize phase emits a
-        burst of output, and a window too small drops marker lines (e.g. the
-        single "[quantize]" line) between polls, leaving the embed stuck on the
-        previous stage. Pass a larger value (e.g. 500) for a final drain after
-        the run completes so the last post-quantize + upload output is captured.
+    def get_progress(self, instance_id: str, lines: int = 40, raw: bool = False) -> str:
+        """Return recent progress-marker lines from the remote log.
+
+        By default the log is filtered to the meaningful markers (see
+        _PROGRESS_MARKERS) so the MoE per-submodule flood can't bury the
+        heartbeat. Pass ``raw=True`` (and a larger ``lines``) for a final drain
+        after the run to capture the full unfiltered tail.
         """
-        result = self.run(
-            instance_id,
-            f"tail -n {int(lines)} {REMOTE_LOG} 2>/dev/null || echo NO_LOG",
-        )
+        if raw:
+            cmd = f"tail -n {int(lines)} {REMOTE_LOG} 2>/dev/null || echo NO_LOG"
+        else:
+            cmd = (
+                f"grep -aE '{self._PROGRESS_MARKERS}' {REMOTE_LOG} 2>/dev/null "
+                f"| tail -n {int(lines)} || echo NO_LOG"
+            )
+        result = self.run(instance_id, cmd)
         return result["stdout"]
 
     def is_pipeline_running(self, instance_id: str) -> bool:

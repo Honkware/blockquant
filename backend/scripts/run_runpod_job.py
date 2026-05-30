@@ -541,7 +541,7 @@ def main():
         # the last batch of remote output (final quantize layers, the
         # upload-complete line, status sentinel) — the routine 30-line
         # poll skips most of these when the run wraps up between ticks.
-        final_tail = provider.get_progress(instance_id, lines=500)
+        final_tail = provider.get_progress(instance_id, lines=500, raw=True)
         if final_tail and final_tail != last_tail:
             new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
             sys.stdout.write(new if new.endswith("\n") else new + "\n")
