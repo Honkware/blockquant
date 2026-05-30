@@ -1082,7 +1082,7 @@ class RunPodProvider(Provider):
         r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
     )
 
-    def get_progress(self, instance_id: str, lines: int = 40, raw: bool = False) -> str:
+    def get_progress(self, instance_id: str, lines: int = 15, raw: bool = False) -> str:
         """Return recent progress-marker lines from the remote log.
 
         By default the log is filtered to the meaningful markers (see

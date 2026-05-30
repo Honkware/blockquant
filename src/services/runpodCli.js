@@ -9,9 +9,6 @@ const ROOT = config.ROOT_DIR;
 const SCRIPT = path.join(ROOT, 'backend', 'scripts', 'run_runpod_job.py');
 const PUBLISH = path.join(ROOT, 'backend', 'scripts', 'publish_quant.py');
 const PYTHON = config.PYTHON_BIN || path.join(ROOT, 'backend', 'venv', 'bin', 'python');
-// Most MoE/dense LLMs we target are <= 48 blocks; used only to turn the live
-// layer index into a fraction for the aggregate bar, so a rough guess is fine.
-const TOTAL_LAYERS_GUESS = 48;
 
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
@@ -80,26 +77,28 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     const total = variants.length;
     const results = new Map(); // bpw -> url
     let curBpw = variants[0];
-    let curLayer = 0;
-    let curQuantPct = null; // real quantize % from [progress] lines, when present
+    let curDownloadPct = 0;   // from [download] N% (monotonic)
+    let curQuantPct = null;   // from [progress] X% (monotonic)
+    let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
 
-    // Phase-based progress so the bar always moves through the pipeline even
-    // when a phase emits no granular events (the download phase is silent for
-    // ~10-15 min). Quantize interpolates by layer across its band.
-    const PHASE_PCT = { Provisioning: 4, Downloading: 20, Uploading: 94, Complete: 100 };
+    // Each phase maps its REAL percent into a band of the overall bar, so the
+    // bar climbs smoothly the whole run (download 4->25, quantize 25->90), and
+    // a monotonic clamp keeps stale lines (the poll reprints its window) from
+    // ever knocking the bar backward.
     const report = (message) => {
       let overall;
-      if (stage === 'Quantizing') {
-        // Prefer the real module-progress % from quant.py; fall back to the
-        // coarse layer-count guess only if no [progress] line has arrived yet.
-        overall = curQuantPct != null
-          ? 25 + Math.round((curQuantPct / 100) * 65)
-          : 25 + Math.round(Math.min(curLayer / TOTAL_LAYERS_GUESS, 1) * 65);
-      } else {
-        overall = PHASE_PCT[stage] ?? 0;
+      switch (stage) {
+        case 'Provisioning': overall = 4; break;
+        case 'Downloading':  overall = 4 + Math.round((curDownloadPct / 100) * 21); break;
+        case 'Quantizing':   overall = 25 + Math.round(((curQuantPct ?? 0) / 100) * 65); break;
+        case 'Uploading':    overall = 95; break;
+        case 'Complete':     overall = 100; break;
+        default:             overall = 0;
       }
+      if (overall < lastOverall) overall = lastOverall;
+      lastOverall = overall;
       onProgress?.({
         stage,
         message,
@@ -119,24 +118,21 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
         return report(`Uploaded ${m[1]} bpw`);
       }
       if ((m = RE.quantProgress.exec(line))) {
+        const pct = parseInt(m[2], 10);
+        // Ignore stale lines the poll reprints from its window (pct < current)
+        // so the percent only ever climbs.
+        if (curQuantPct != null && pct < curQuantPct) return;
         curBpw = m[1];
-        curQuantPct = parseInt(m[2], 10);
+        curQuantPct = pct;
         stage = 'Quantizing';
         const eta = m[3] ? ` · eta ${m[3]}` : '';
-        return report(`${curQuantPct}%${eta}`);
+        return report(`${pct}%${eta}`);
       }
       if ((m = RE.quantizeStart.exec(line))) {
         curBpw = m[1];
-        curLayer = 0;
-        curQuantPct = null;
+        if (curQuantPct == null) curQuantPct = 0; // entered quantize; bar at band start
         stage = 'Quantizing';
         return report(`Quantizing ${m[1]} bpw`);
-      }
-      if ((m = RE.layer.exec(line))) {
-        const l = parseInt(m[1], 10);
-        if (Number.isFinite(l) && l >= curLayer) curLayer = l;
-        stage = 'Quantizing';
-        return report(`layer ${l}`);
       }
       if (RE.bootstrap.test(line)) {
         stage = 'Downloading';
@@ -148,6 +144,12 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
       }
       if ((m = RE.download.exec(line))) {
         stage = 'Downloading';
+        const pm = m[1].match(/(\d+)\s*%/);
+        if (pm) {
+          const dp = parseInt(pm[1], 10);
+          if (dp < curDownloadPct) return; // stale reprint
+          curDownloadPct = dp;
+        }
         return report(m[1].slice(0, 80));
       }
       if ((m = RE.eta.exec(line))) {
