@@ -40,10 +40,25 @@ def poll_remote(
     start = _now()
     last_change = start
     last_progress = ""
-    while provider.is_pipeline_running(instance_id):
+    while True:
+        # is_pipeline_running / get_progress run over SSH, which can hit a
+        # transient reset (a local network blip reset every pod's connection at
+        # once, and the old code crashed out and terminated pods MID-UPLOAD).
+        # Treat an SSH error as "still running, no news" and let stall_timeout
+        # decide, so a blip can't kill a job: the pod uploads to HF on its own
+        # and the controller reconnects and sees it finish.
+        try:
+            running = provider.is_pipeline_running(instance_id)
+        except Exception:
+            running = True
+        if not running:
+            return "done"
         _sleep(poll_interval)
         now = _now()
-        progress = provider.get_progress(instance_id)
+        try:
+            progress = provider.get_progress(instance_id)
+        except Exception:
+            progress = None
         if progress and progress != last_progress:
             last_progress = progress
             last_change = now
@@ -53,4 +68,3 @@ def poll_remote(
             return "max_runtime"
         if now - last_change > stall_timeout:
             return "stalled"
-    return "done"
