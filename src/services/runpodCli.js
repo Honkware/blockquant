@@ -45,10 +45,10 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
       // unavailable. Disk is auto-sized by the CLI (default).
       '--gpu', 'auto',
       '--min-vram', '24',
-      // Cap $/hr so a stock-out can't bump us onto an idle H100/A100. The quant
-      // is layer-by-layer (~4GB peak) so a cheap card is plenty; extra VRAM
-      // doesn't speed it up. $1/hr keeps it on 4090 / RTX 5000 Ada / A5000 tier.
-      '--max-price', '1.0',
+      // Cap $/hr scaled to model size: small models stay on cheap cards, a big
+      // model reaches an A100/H100 (compute-bound, ~3x faster for ~same total
+      // cost). The CLI also orders big-model candidates capable-first.
+      '--max-price', 'auto',
       // Be patient: stock is tight and blips per-GPU, so keep re-sweeping for
       // ~20 min before giving up rather than failing after a few minutes.
       '--launch-retries', '24',

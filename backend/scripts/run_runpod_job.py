@@ -67,14 +67,31 @@ def _arch_needs_master(model_id: str, token: str) -> bool:
         return False
 
 
-def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
-    """GPU type ids with at least min_vram_gb, cheapest tier first.
+def _recommend_max_price(base_gb: float | None) -> float:
+    """Price cap scaled to model size. The quant is compute-bound, so a big
+    model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
+    while a small model is plenty fast on the cheap tier. Tiers by HF download
+    GB (35B ~= 72 GB, 8B ~= 17 GB)."""
+    if not base_gb:
+        return 1.5
+    if base_gb <= 20:
+        return 0.80   # <= ~10B: cheap cards are fast enough
+    if base_gb <= 50:
+        return 1.30   # ~10-25B: RTX 5000 Ada / A40 / A6000 tier
+    if base_gb <= 100:
+        return 1.80   # ~25-50B: A100 tier (worth it, ~3x faster)
+    return 2.80       # 50B+: A100 80GB / H100
 
-    The quant streams layer-by-layer (~4GB peak), so the limiter is disk, not
-    VRAM. Ordering by VRAM ascending puts the cheap small cards (A5000, 4090)
-    first; the launch loop falls through to bigger ones if they are out of
-    stock or short on disk.
+
+def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
+    """GPU type ids with at least min_vram_gb, ordered by the model size.
+
+    Small models go cheapest-first (cheap cards quantize them fast). Big models
+    are compute-bound and would crawl on a cheap card, so they go capable-first
+    (priciest within the cap) and fall back to cheaper cards on a stock-out, so
+    they finish far faster for ~the same total cost without ever getting stuck.
     """
+    from blockquant.providers.runpod.pricing import static_price
     import runpod
     runpod.api_key = api_key
     cards = []
@@ -98,7 +115,11 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
         if gid in _WEAK_FOR_QUANT:
             continue
         cards.append((mem, gid))
-    cards.sort(key=lambda x: x[0])
+    # Big model (> ~25 GB download, ~12B+) -> capable-first: sort by price (then
+    # VRAM) DESCENDING so the fastest allowed card is tried first, falling back
+    # to cheaper ones. Small model -> cheapest/smallest first.
+    big = bool(base_gb and base_gb > 25)
+    cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
     return [gid for _, gid in cards]
 
 
@@ -153,11 +174,11 @@ def main():
              "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
     )
     parser.add_argument(
-        "--max-price", type=float, default=1.0,
-        help="With --gpu auto, skip any card over this $/hr. Keeps it on cheap "
-             "VRAM-appropriate cards (4090, RTX 5000 Ada, A5000...) instead of "
-             "grabbing an idle H100/A100 just because the cheap ones are out. "
-             "0 disables the cap.",
+        "--max-price", default="auto",
+        help="With --gpu auto, skip any card over this $/hr. 'auto' scales the "
+             "cap to the model size (small models -> cheap cards; a big model -> "
+             "A100/H100 since it's compute-bound and ~3x faster for ~the same "
+             "total cost). A number pins it; 0 disables the cap.",
     )
     parser.add_argument(
         "--container-disk", default="auto",
@@ -295,6 +316,17 @@ def main():
     print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
           f"outputs+work -> container {args.container_disk} GB", flush=True)
 
+    # Model size (HF download GB) drives the price cap AND the card ordering:
+    # big models go to a capable card (compute-bound, ~3x faster for ~same total
+    # cost), small ones stay cheap. Computed once, reused for both.
+    _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
+    if str(args.max_price).strip().lower() == "auto":
+        args.max_price = _recommend_max_price(_base_gb)
+    else:
+        args.max_price = float(args.max_price)
+    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
+          f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
+
     # Pick exllamav3 by architecture (unless an image was pinned explicitly).
     # Stable 0.0.37 (the bootstrap path) for the proven models incl. Qwen3.6;
     # the master image only for archs that need it (e.g. LFM2), since master
@@ -359,7 +391,7 @@ def main():
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
-        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram)
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb)
         if not gpu_candidates:
             print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
             sys.exit(1)
