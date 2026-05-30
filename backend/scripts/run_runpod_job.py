@@ -39,6 +39,10 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
 _BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
 
+# Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
+# for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
+_WEAK_FOR_QUANT = {"NVIDIA L4"}
+
 # exllamav3 version is chosen by architecture. The stable release (0.0.37, what
 # the bootstrap path installs) handles the proven models incl. Qwen3.6. The
 # master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
@@ -85,6 +89,13 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int) -> list[str]:
         # Blackwell-class cards until the stack moves to a cu128 torch. Plenty
         # of cheap Ada/Ampere/Hopper stock remains under the price cap.
         if any(tok in gid for tok in _BLACKWELL_EXCLUDE):
+            continue
+        # Skip cards too weak to reliably quantize a large model. The L4 is a
+        # low-power inference card (~72W) that froze mid-quant on the 35B MoE
+        # while an RTX 5000 Ada on the same job finished fine. Exact match so we
+        # don't also drop the capable L40 / L40S. Plenty of cheap, more capable
+        # stock remains (3090, 4090, A5000, A40, RTX 5000 Ada...).
+        if gid in _WEAK_FOR_QUANT:
             continue
         cards.append((mem, gid))
     cards.sort(key=lambda x: x[0])
