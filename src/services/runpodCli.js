@@ -164,6 +164,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
       const lines = buf.split('\n');
       buf = lines.pop();
       for (const line of lines) {
+        if (process.env.BQ_DEBUG_RAW) log.info(`[raw] ${line.slice(0, 140)}`);
         try { handleLine(line); } catch (e) { log.debug(`parse: ${e.message}`); }
       }
     });

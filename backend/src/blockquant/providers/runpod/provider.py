@@ -529,6 +529,31 @@ class RunPodProvider(Provider):
             f"run() exhausted {retries} retries on {instance_id}: {last_err}"
         )
 
+    def run_detached(self, instance_id: str, command: str, read_timeout: int = 20) -> dict:
+        """Launch a fire-and-forget command without waiting for it to exit.
+
+        A backgrounded remote process keeps the SSH channel open long after it
+        has started, so run() (which blocks on recv_exit_status) stalls the
+        caller for minutes on a launch — which left the progress poll, and thus
+        the embed, frozen until the launch finally returned. Here we send the
+        command, read the one line it echoes (the pid), and return immediately,
+        leaving the process running.
+        """
+        client = self._connect_ssh(instance_id)
+        try:
+            stdin, stdout, stderr = client.exec_command(command, timeout=read_timeout)
+            try:
+                stdout.channel.settimeout(read_timeout)
+                out = stdout.readline()
+            except Exception:
+                out = ""
+            return {"stdout": out.strip(), "stderr": "", "code": 0}
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def _sftp_put_with_retry(self, instance_id: str, fn, retries: int = 5):
         """Run a single SFTP operation with reconnect-on-transient-error.
 
@@ -1039,10 +1064,11 @@ class RunPodProvider(Provider):
             f"nohup setsid {self._remote_py} {script_path} "
             f"> {REMOTE_LOG} 2>&1 < /dev/null & echo $!"
         )
-        result = self.run(instance_id, launch_cmd)
-        if result["code"] != 0:
-            return {"status": "failed", "error": f"launch failed: {result['stderr'][:2000]}"}
-        logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip()})")
+        # Detached: a normal run() here blocks on recv_exit_status until the
+        # backgrounded process releases the channel (minutes), freezing the
+        # progress poll. run_detached returns as soon as the pid is echoed.
+        result = self.run_detached(instance_id, launch_cmd)
+        logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip() or '?'})")
         return {"status": "started"}
 
     # Progress markers worth streaming to the controller/embed. Everything else
