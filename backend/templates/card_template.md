@@ -74,9 +74,9 @@ bits_per_weight: {{BPW}}
 ## Download
 
 ```bash
-pip install -U "huggingface_hub[cli]"
+pip install -U huggingface_hub
 
-huggingface-cli download \
+hf download \
   {{REPO_ID}} \
   --local-dir ./{{SHORT_NAME}}
 ```
