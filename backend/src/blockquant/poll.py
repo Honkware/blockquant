@@ -40,6 +40,7 @@ def poll_remote(
     start = _now()
     last_change = start
     last_progress = ""
+    not_running = 0
     while True:
         # is_pipeline_running / get_progress run over SSH, which can hit a
         # transient reset (a local network blip reset every pod's connection at
@@ -51,8 +52,17 @@ def poll_remote(
             running = provider.is_pipeline_running(instance_id)
         except Exception:
             running = True
+        # Require TWO consecutive "not running" reads before declaring done. A
+        # reconnect right after a network reset can return a spurious empty/
+        # garbled result that looks like "done" while the quant is still going,
+        # which would end the poll early and fail the job. One real completion
+        # reads done twice in a row; a glitch does not.
         if not running:
-            return "done"
+            not_running += 1
+            if not_running >= 2:
+                return "done"
+        else:
+            not_running = 0
         _sleep(poll_interval)
         now = _now()
         try:

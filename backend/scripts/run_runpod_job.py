@@ -67,6 +67,28 @@ def _arch_needs_master(model_id: str, token: str) -> bool:
         return False
 
 
+def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
+    """True if a requested variant's exl3 repo is already on HF with a
+    config.json. Used as a fallback when the result file can't be read over a
+    dropped SSH connection -- the pod uploads to HF on its own, so an upload may
+    have succeeded even though the controller lost contact."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token or None)
+        base = model_id.split("/")[-1]
+        org = hf_org or (api.whoami() or {}).get("name", "")
+        for v in variants:
+            try:
+                info = api.model_info(f"{org}/{base}-exl3-{v}bpw")
+                if "config.json" in {s.rfilename for s in (info.siblings or [])}:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
 def _recommend_max_price(base_gb: float | None) -> float:
     """Price cap scaled to model size. The quant is compute-bound, so a big
     model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
@@ -573,18 +595,37 @@ def main():
         # the last batch of remote output (final quantize layers, the
         # upload-complete line, status sentinel) — the routine 30-line
         # poll skips most of these when the run wraps up between ticks.
-        final_tail = provider.get_progress(instance_id, lines=500, raw=True)
-        if final_tail and final_tail != last_tail:
-            new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
-            sys.stdout.write(new if new.endswith("\n") else new + "\n")
-            sys.stdout.flush()
+        try:
+            final_tail = provider.get_progress(instance_id, lines=500, raw=True)
+            if final_tail and final_tail != last_tail:
+                new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
+                sys.stdout.write(new if new.endswith("\n") else new + "\n")
+                sys.stdout.flush()
+        except Exception as e:
+            print(f"      (final drain skipped: {e})", flush=True)
 
         print(f"\n[6/6] Fetching result...")
-        result = provider.get_result()
+        # Reading the result is over SSH and can hit a transient reset right at
+        # the end; retry a few times before giving up.
+        result = None
+        for _attempt in range(5):
+            try:
+                result = provider.get_result()
+                if result is not None:
+                    break
+            except Exception as e:
+                print(f"      result read retry ({e})", flush=True)
+            time.sleep(8)
         elapsed = time.time() - t_launch
         cost = (elapsed / 3600) * hourly
         if result is None:
-            print("ERROR: no result file on pod — check log tail above")
+            # SSH unreachable / pod self-terminated. The pod uploads to HF on its
+            # own, so check there before declaring failure.
+            if _variant_uploaded(args.model, _variants, args.hf_org, args.hf_token):
+                print("      result unreadable over SSH, but the variant is on HF "
+                      "-> treating as complete", flush=True)
+                sys.exit(0)
+            print("ERROR: no result file on pod and nothing on HF — check log tail above")
             sys.exit(1)
         status = result.get("status", "unknown")
         print(f"      Status: {status}")
