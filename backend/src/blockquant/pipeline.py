@@ -58,7 +58,20 @@ def _run_remote_pipeline(
         provider_kwargs["gpu_type"] = config.runpod_gpu_type
         provider_kwargs["cloud_type"] = config.runpod_cloud_type.value
         provider_kwargs["container_disk_gb"] = config.runpod_container_disk_gb
-        provider_kwargs["volume_gb"] = config.runpod_volume_gb
+        # Size the /workspace VOLUME (where the model, work dir, and all outputs
+        # live) so the final safetensors write can't ENOSPC. Never below the
+        # configured value, so an explicit larger setting still wins.
+        from blockquant.providers.runpod.provider import RunPodProvider as _RP
+        _recommended_vol = _RP.recommend_volume_gb(
+            config.model_id, config.variants, config.hf_token
+        )
+        _vol = max(config.runpod_volume_gb, _recommended_vol)
+        if _vol != config.runpod_volume_gb:
+            logger.info(
+                f"Volume disk: {_vol} GB "
+                f"(configured {config.runpod_volume_gb}, model needs ~{_recommended_vol})"
+            )
+        provider_kwargs["volume_gb"] = _vol
         provider_kwargs["ssh_key_path"] = config.runpod_ssh_key_path
 
     provider = None

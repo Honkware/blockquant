@@ -158,20 +158,86 @@ def main() -> int:
 
         from huggingface_hub import HfApi, snapshot_download, login as hf_login
 
-        workspace = Path("/workspace/blockquant")
+        # Disk split: the unquantized model + HF cache live on the VOLUME
+        # (/workspace, sized for the model), and the quantized outputs + work dir
+        # live on the CONTAINER disk (/quant). Keeping the big input and the
+        # outputs on separate disks means neither has to be sized for both, and
+        # both disks get used. Only /workspace is the mounted volume; everything
+        # else (so /quant) is the container disk.
+        workspace = Path("/workspace/blockquant")   # VOLUME: unquantized model + cache
         workspace.mkdir(parents=True, exist_ok=True)
         model_dir = workspace / "model"
+
+        quant_root = Path("/quant")                  # CONTAINER disk: outputs + work
+        quant_root.mkdir(parents=True, exist_ok=True)
+
+        # HF download cache sits next to the model on the volume, so the download
+        # can't fill the container disk regardless of hf_hub version.
+        hf_cache = workspace / ".hf-cache"
+        hf_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(hf_cache))
+        os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
+        print(f"[disk] model+cache -> {workspace} (volume) | outputs+work -> "
+              f"{quant_root} (container)", flush=True)
 
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
             hf_login(token=hf_token)
 
-        print(f"[download] {model_id} ...", flush=True)
-        snapshot_download(
-            repo_id=model_id,
-            local_dir=str(model_dir),
-            token=hf_token or None,
-        )
+        # hf_transfer does parallel, Rust-backed chunked downloads, typically a
+        # few times faster than the default single-stream path on big repos
+        # (the 70GB+ weights are the longest part of startup). Only enable it if
+        # the package actually imports, so a base image without it just falls
+        # back to the normal downloader instead of erroring.
+        try:
+            import hf_transfer  # noqa: F401
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            print("[download] hf_transfer enabled (parallel download)", flush=True)
+        except Exception:
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
+        # Download on a worker thread and emit a size heartbeat every 20s. The
+        # download is otherwise silent for many minutes (the full weights are
+        # tens of GB), and a silent stretch longer than the controller's stall
+        # window gets the pod killed mid-download. Regular "[download] N GB"
+        # lines keep the stall watchdog happy and give the dashboard real
+        # download progress. Errors from the thread are re-raised on the main
+        # thread so the normal failure path still runs.
+        import threading
+        # Total repo size up front so the heartbeat can report a percent.
+        try:
+            _info = HfApi(token=hf_token or None).model_info(model_id, files_metadata=True)
+            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])) / 1e9
+        except Exception:
+            _total_gb = 0.0
+        print(f"[download] {model_id} ({_total_gb:.1f} GB) ...", flush=True)
+        _dl_done = threading.Event()
+        _dl_err: dict = {}
+
+        def _do_download() -> None:
+            try:
+                snapshot_download(
+                    repo_id=model_id,
+                    local_dir=str(model_dir),
+                    token=hf_token or None,
+                )
+            except Exception as exc:  # surfaced after join()
+                _dl_err["exc"] = exc
+            finally:
+                _dl_done.set()
+
+        _dl_thread = threading.Thread(target=_do_download, daemon=True)
+        _dl_thread.start()
+        while not _dl_done.wait(20):
+            gb = _dir_size_gb(model_dir) or 0.0
+            if _total_gb > 0:
+                pct = min(99, int(gb / _total_gb * 100))
+                print(f"[download] {pct}% ({gb:.1f}/{_total_gb:.1f} GB)", flush=True)
+            else:
+                print(f"[download] {gb:.1f} GB downloaded...", flush=True)
+        _dl_thread.join()
+        if "exc" in _dl_err:
+            raise _dl_err["exc"]
         print("[download] complete", flush=True)
 
         _qwen2vl_preprocessor_shim(model_dir)
@@ -181,8 +247,8 @@ def main() -> int:
         outputs = []
         for variant in variants:
             bpw = float(variant)
-            out_dir = workspace / f"output-{bpw}bpw"
-            work_dir = workspace / f"work-{bpw}"
+            out_dir = quant_root / f"output-{bpw}bpw"
+            work_dir = quant_root / f"work-{bpw}"
             if (out_dir / "config.json").exists():
                 print(f"[skip] {variant} exists at {out_dir}", flush=True)
                 outputs.append({"variant": variant, "path": str(out_dir)})
@@ -211,7 +277,94 @@ def main() -> int:
             if not ok:
                 emit_result({"status": "failed", "error": f"prepare failed: {err}"})
                 return 1
-            exl_main(in_args, job_state)
+            # Stream layer-based quantize progress. The HONEST progress signal is
+            # the layer index (0..num_hidden_layers): exllamav3's internal
+            # curr/max counter resets per group and does NOT track overall
+            # progress (it read 99% while only on layer 7 of 40). Tap stdout to
+            # follow the highest "Quantized: ...layers.N" the converter prints,
+            # and emit a parseable percent from layer/total.
+            import re as _re
+            import threading
+
+            def _model_total_layers() -> int:
+                try:
+                    with open(model_dir / "config.json") as _f:
+                        _cfg = json.load(_f)
+                except Exception:
+                    return 0
+
+                def _find(o):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in ("num_hidden_layers", "num_layers") and isinstance(v, int):
+                                return v
+                            r = _find(v)
+                            if r:
+                                return r
+                    return None
+
+                return _find(_cfg) or 0
+
+            _total_layers = _model_total_layers()
+            _lstate = {"layer": 0}
+            _layer_re = _re.compile(r"layers\.(\d+)")
+
+            class _LayerTap:
+                """Pass stdout through unchanged, but track the highest layer the
+                converter reports so the monitor can read it."""
+                def __init__(self, real):
+                    self._real = real
+
+                def write(self, s):
+                    self._real.write(s)
+                    if "Quantized" in s and "layers." in s:
+                        for mm in _layer_re.finditer(s):
+                            n = int(mm.group(1))
+                            if n > _lstate["layer"]:
+                                _lstate["layer"] = n
+
+                def flush(self):
+                    self._real.flush()
+
+                def __getattr__(self, a):
+                    return getattr(self._real, a)
+
+            _q_done = threading.Event()
+
+            def _quant_progress():
+                last = -1
+                t_first = None
+                while not _q_done.wait(15):
+                    n = _lstate["layer"]
+                    if not _total_layers or n == 0:
+                        # Measure/prep phase: no layer reported yet. Heartbeat so
+                        # the embed leaves "Downloading" the moment conversion
+                        # starts and the controller's tail always has a marker.
+                        print(f"[progress] quantize {variant} 0% (preparing)", flush=True)
+                        continue
+                    if t_first is None:
+                        t_first = time.time()
+                    if n == last:
+                        continue
+                    pct = min(99, int(n / _total_layers * 100))
+                    eta = ""
+                    el = time.time() - t_first
+                    if el > 0:
+                        rem = (_total_layers - n) * (el / n)
+                        eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
+                    print(f"[progress] quantize {variant} {pct}% (layer {n}/{_total_layers}){eta}", flush=True)
+                    last = n
+
+            _qt = threading.Thread(target=_quant_progress, daemon=True)
+            _qt.start()
+            _old_stdout = sys.stdout
+            sys.stdout = _LayerTap(_old_stdout)
+            try:
+                exl_main(in_args, job_state)
+            finally:
+                sys.stdout = _old_stdout
+                _q_done.set()
+                _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
             outputs.append({"variant": variant, "path": str(out_dir)})
 
@@ -230,7 +383,9 @@ def main() -> int:
                 _write_cards(outputs, model_id, model_name, owner, hf_token,
                              head_bits, cal_rows, model_dir)
             except Exception:
-                import traceback
+                # traceback is imported at module scope; a local re-import here
+                # would make the name function-local and trip an
+                # UnboundLocalError in the outer handler's traceback.print_exc().
                 print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
 
             repo_ids = []
@@ -242,11 +397,31 @@ def main() -> int:
                     repo_id=repo_id, repo_type="model",
                     exist_ok=True, private=False,
                 )
-                api.upload_folder(
-                    folder_path=out["path"],
-                    repo_id=repo_id,
-                    repo_type="model",
-                )
+                # Upload on a worker thread with a heartbeat: pushing tens of GB
+                # is silent for minutes, the last quiet phase that could trip the
+                # controller's stall watchdog. Regular "[upload] still pushing"
+                # lines keep it alive. Errors surface after join().
+                import threading
+                _up_done = threading.Event()
+                _up_err: dict = {}
+
+                def _do_upload(path=out["path"], rid=repo_id) -> None:
+                    try:
+                        api.upload_folder(folder_path=path, repo_id=rid, repo_type="model")
+                    except Exception as exc:
+                        _up_err["exc"] = exc
+                    finally:
+                        _up_done.set()
+
+                _up_thread = threading.Thread(target=_do_upload, daemon=True)
+                _up_thread.start()
+                _up_secs = 0
+                while not _up_done.wait(20):
+                    _up_secs += 20
+                    print(f"[upload] {out['variant']} pushing... {_up_secs}s", flush=True)
+                _up_thread.join()
+                if "exc" in _up_err:
+                    raise _up_err["exc"]
                 out["hf_repo_id"] = repo_id
                 out["hf_revision"] = "main"
                 out["hf_url"] = f"https://huggingface.co/{repo_id}"

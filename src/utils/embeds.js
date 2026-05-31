@@ -56,6 +56,40 @@ export function jobProgress({
     .setTimestamp();
 }
 
+export function jobProgressParallel({ url, userId, variants, state }) {
+  const ICON = {
+    Complete: '✅', Failed: '❌', Retrying: '🔁', Uploading: '⬆️',
+    Quantizing: '⚙️', Downloading: '⬇️', Provisioning: '⏳',
+  };
+  const done = variants.filter((v) => (state[v] || {}).stage === 'Complete').length;
+  const anyFailed = variants.some((v) => (state[v] || {}).stage === 'Failed');
+
+  const lines = variants.map((v) => {
+    const s = state[v] || {};
+    const stage = s.stage || 'Provisioning';
+    const icon = ICON[stage] || '⏳';
+    if (stage === 'Complete' && s.url) {
+      return `${icon} \`${v}\` **done** · [repo](${s.url})`;
+    }
+    const pct = Math.round(s.overall ?? 0);
+    const mins = s.startedAt ? Math.floor((Date.now() - s.startedAt) / 60000) : null;
+    const elapsed = mins != null ? ` · ${mins}m` : '';
+    const detail = s.message ? ` · ${truncate(s.message, 28)}` : '';
+    return `${icon} \`${v}\` ${stage.toLowerCase()} · ${pct}%${elapsed}${detail}`;
+  });
+
+  const color = anyFailed ? COLORS.warning : done === variants.length ? COLORS.success : COLORS.pending;
+  return new EmbedBuilder()
+    .setTitle(`⚙️ Quantizing · ${done}/${variants.length} done`)
+    .setColor(color)
+    .setDescription(`Requested by <@${userId}>`)
+    .addFields(
+      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Variants', value: lines.join('\n') || 'starting...', inline: false }
+    )
+    .setTimestamp();
+}
+
 export function jobComplete({ url, userId, results }) {
   const lines = results.map((r) => {
     const icon = r.reused ? '♻️' : r.pushed ? '✅' : '❌';

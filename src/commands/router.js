@@ -1,8 +1,9 @@
 import { getLogger } from '../logger.js';
 import { MessageFlags } from 'discord.js';
 import { handleQuant } from './quant.js';
-import { handleHealth, handleLeaderboard, handleHistory, handleQueueStatus, handleScore } from './info.js';
-import { handleCache, handleDiag, handleGive, handlePause, handleResume } from './admin.js';
+import { handleApproval } from './approval.js';
+import { handleHealth, handleHistory, handleQueueStatus } from './info.js';
+import { handleCache, handleDiag, handlePause, handleResume } from './admin.js';
 import { toUserMessage } from '../errors/taxonomy.js';
 
 const log = getLogger('commands');
@@ -11,10 +12,7 @@ const handlers = {
   quant: handleQuant,
   queue: handleQueueStatus,
   health: handleHealth,
-  score: handleScore,
-  leaderboard: handleLeaderboard,
   history: handleHistory,
-  give: handleGive,
   pause: handlePause,
   resume: handleResume,
   diag: handleDiag,
@@ -26,6 +24,23 @@ const handlers = {
  * Catches all errors so the bot never crashes from a command.
  */
 export async function routeCommand(interaction) {
+  // Approve / Deny buttons on pending quant requests.
+  if (interaction.isButton()) {
+    try {
+      await handleApproval(interaction);
+    } catch (err) {
+      log.error('Error handling button', { error: err.message, stack: err.stack });
+      try {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: toUserMessage(err), flags: MessageFlags.Ephemeral });
+        }
+      } catch {
+        // interaction expired
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const name = interaction.commandName;

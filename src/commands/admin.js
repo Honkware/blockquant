@@ -10,41 +10,6 @@ function isAdmin(userId) {
   return config.ADMIN_IDS.includes(userId);
 }
 
-export async function handleGive(interaction) {
-  if (!isAdmin(interaction.user.id)) {
-    return interaction.reply({
-      embeds: [embeds.error('🚫 Forbidden', 'Admin only.')],
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  const target = interaction.options.getUser('user', true);
-  const amount = interaction.options.getNumber('amount', true);
-
-  if (amount === 0) {
-    return interaction.reply({
-      embeds: [embeds.warning('🤔', 'Amount cannot be zero.')],
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  const users = await db.loadUsers();
-  if (!users[target.id]) users[target.id] = { exp: 0, lastQuant: 0 };
-  users[target.id].exp += amount;
-  await db.saveUsers(users);
-
-  const verb = amount > 0 ? 'Gave' : 'Deducted';
-  await interaction.reply({
-    embeds: [
-      embeds.success(
-        '💰 EXP Updated',
-        `${verb} **${Math.abs(amount)}** EXP ${amount > 0 ? 'to' : 'from'} <@${target.id}>.\nNew balance: **${users[target.id].exp}**`
-      ),
-    ],
-    allowedMentions: { users: [] },
-  });
-}
-
 export async function handlePause(interaction) {
   if (!isAdmin(interaction.user.id)) {
     return interaction.reply({

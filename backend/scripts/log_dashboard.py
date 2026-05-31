@@ -104,6 +104,11 @@ RULES: list[tuple[str, str, re.Pattern, Callable[[re.Match, str], dict] | None]]
     ("STOCK",    "warn", _r(r"out of stock(?:\s*\((?P<err>[^)]+)\))?"), None),
     ("POD_NEW",  "ok",   _r(r"Pod ID:\s*(?P<pod_id>\S+)\s*\(GPU:\s*(?P<gpu>[^)]+)\)"), None),
     ("SSH",      "ok",   _r(r"SSH ready at\s+(?P<host>[^:]+):(?P<port>\d+)"), None),
+    # The pod's own startup banner (printed by remote/quant.py). This is our
+    # only source of GPU/VRAM when the dashboard is fed a pod-stream-only log
+    # that never saw the controller's GPU_TRY / POD_NEW lines.
+    ("GPU_BANNER", "info",
+        _r(r"\[gpu\]\s*CUDA:\s*\S+\s*\|\s*(?P<gpu>[^|]+?)\s*\|\s*(?P<vram>[0-9.]+)\s*GB"), None),
 
     # Bootstrap stages
     ("INTERP",   "info", _r(r"remote python:\s*(?P<py>\S+)\s+torch:\s*(?P<torch>\S+)"), None),
@@ -160,6 +165,11 @@ class ParseResult:
     raw_tail: list[str]
 
 
+# Emit one ledger progress row every this many layers (a live pulse during the
+# long quant phase). 4 keeps the cadence visible without crowding out the
+# lifecycle events the ledger only keeps 25 of.
+LEDGER_LAYER_STRIDE = 4
+
 _TS_RE = re.compile(r"\b(\d{2}):(\d{2}):(\d{2})\b")
 
 
@@ -182,6 +192,7 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
         "hf_org": "",
         "pod_id": "",
         "gpu": "",
+        "gpu_vram_gb": 0.0,
         "cost_per_hr": 0.0,
         "remote_py": "",
         "torch_ver": "",
@@ -221,6 +232,7 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
     quant_last_clock: int | None = None
     layer_first_clock: dict[int, int] = {}
     layer_first_seen_order: list[int] = []
+    milestone_layers: set[int] = set()
 
     lines = text.splitlines()
     for ln_no, line in enumerate(lines, 1):
@@ -257,6 +269,16 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                     pod_create_clock = last_seen_clock
             elif kind == "SSH":
                 state["stage"] = "bootstrapping"
+            elif kind == "GPU_BANNER":
+                # Controller POD_NEW is authoritative for the GPU name (cleaner
+                # marketing string); only fill from the pod banner when we never
+                # saw it, e.g. a pod-stream-only log.
+                if not state["gpu"]:
+                    state["gpu"] = (fields.get("gpu") or "").strip()
+                try:
+                    state["gpu_vram_gb"] = float(fields.get("vram") or 0.0)
+                except ValueError:
+                    pass
             elif kind == "INTERP":
                 state["remote_py"] = fields.get("py", "")
                 state["torch_ver"] = fields.get("torch", "")
@@ -320,6 +342,18 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                         if layer not in layer_first_clock and last_seen_clock is not None:
                             layer_first_clock[layer] = last_seen_clock
                             layer_first_seen_order.append(layer)
+                        # Coarse progress milestone: one ledger row every few
+                        # layers so the timeline keeps a live pulse through the
+                        # long quant phase without the per-layer ETA flood (ETA
+                        # and the raw QUANT_TENSOR rows are both filtered out).
+                        if (layer > 0 and layer % LEDGER_LAYER_STRIDE == 0
+                                and layer not in milestone_layers):
+                            milestone_layers.add(layer)
+                            events.append(Event(
+                                kind="LAYER", severity="info",
+                                message=(f"layer {layer} quantized, "
+                                         f"{state['tensors_quantized']} tensors so far"),
+                                line_no=ln_no, fields={}))
                 except ValueError:
                     pass
                 try:
@@ -340,13 +374,28 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
                     state["stage"] = "terminated"
 
             # Only record one event per line — first matching rule wins.
-            # Filter QUANT_TENSOR (50k+ noise) and NET_RESET (handled by
-            # the retry layer; only adds ledger spam) out of the visible
-            # events stream. They still affect state/stats above.
-            if kind not in ("QUANT_TENSOR", "NET_RESET"):
+            # Filter the high-frequency noise out of the visible ledger:
+            # QUANT_TENSOR (50k+ rows), NET_RESET (handled by the retry layer),
+            # and ETA (fires once per layer and is already shown prominently as
+            # the figure's TIME REMAINING; left in, it floods out every
+            # lifecycle event since the ledger only keeps the last 25). All
+            # three still update state/stats above.
+            if kind not in ("QUANT_TENSOR", "NET_RESET", "ETA"):
                 events.append(Event(kind=kind, severity=sev, message=line.strip(),
                                     line_no=ln_no, fields=fields))
             break
+
+    # Bootstrap completion is a controller-side marker ("Bootstrap complete")
+    # that a pod-stream-only log never carries. But any downstream signal (the
+    # pod's [gpu] banner, a download line, or a quantized tensor) proves the
+    # pod finished bootstrapping, so light the stage from those too. Sentinel 1
+    # (not a real clock) keeps the pip-rendering truthy checks happy without
+    # implying a timestamp the runtime math would misuse.
+    if state["bootstrap_complete_at"] is None and (
+        state["gpu_vram_gb"] or state["download_started"]
+        or state["quantize_started"]
+    ):
+        state["bootstrap_complete_at"] = 1
 
     # Derived stats — all anchored on log timestamps + file mtime so they
     # survive a browser refresh (no client-side wall clock involved).
@@ -461,6 +510,10 @@ def _payload(path: Path, tail_n: int = 60) -> dict:
         "stats": parsed.stats,
         "events": visible_events,
         "tail": parsed.raw_tail,
+        # How long since the log file last changed. The SSE stream keeps
+        # re-rendering every 2 s, so without this a dead syncer or a finished
+        # pod looks indistinguishable from a live one.
+        "data_age_sec": (time.time() - mtime) if mtime else None,
     }
 
 
@@ -504,6 +557,58 @@ def _runpod_balance() -> dict | None:
     return _balance_cache["value"]
 
 
+_ETA_UNIT_RE = re.compile(r"(\d+)\s*(hour|hr|minute|min|second|sec)", re.I)
+
+
+def _eta_seconds(text: str) -> int | None:
+    """Parse an ExLlamaV3 ETA string ("1 hour, 14 minutes") into seconds.
+    Returns None when nothing parseable is present."""
+    total, found = 0, False
+    for val, unit in _ETA_UNIT_RE.findall(text or ""):
+        found = True
+        v, u = int(val), unit.lower()
+        if u.startswith(("hour", "hr")):
+            total += v * 3600
+        elif u.startswith("min"):
+            total += v * 60
+        else:
+            total += v
+    return total if found else None
+
+
+def _fleet_summary(jobs: dict[str, dict]) -> dict:
+    """Aggregate money across every tracked pod. The per-job headline only
+    shows the selected pod, which badly understates a parallel run, so the
+    masthead carries the fleet truth: spent so far + projected at completion.
+
+    Projection per job is rate x (elapsed + ETA remaining); jobs with no ETA
+    yet contribute their spend-so-far so the number is never below reality.
+    """
+    spent = projected = burn = 0.0
+    live = 0
+    for j in jobs.values():
+        s = j.get("state", {}) or {}
+        rt = float(s.get("pod_runtime_sec") or 0.0)
+        rate = float(s.get("cost_per_hr") or 0.0)
+        spent_j = float(s.get("pod_spent") or 0.0)
+        spent += spent_j
+        if s.get("pod_id") and not s.get("terminated"):
+            live += 1
+            burn += rate
+        remain = _eta_seconds(s.get("eta") or "")
+        if rate and rt and remain is not None:
+            projected += rate * (rt + remain) / 3600.0
+        else:
+            projected += spent_j
+    return {
+        "spent": round(spent, 2),
+        "projected": round(projected, 2),
+        "burn_per_hr": round(burn, 2),
+        "live_pods": live,
+        "job_count": len(jobs),
+    }
+
+
 def _multi_payload(tail_n: int = 60) -> dict:
     """Build a payload covering every known job. Single-job mode returns a
     shape that's a strict superset of the single-payload format (state/stats/
@@ -531,6 +636,8 @@ def _multi_payload(tail_n: int = 60) -> dict:
         "default_job_id": default_id,
         "job_mtimes": mtimes,
         "runpod_balance": _runpod_balance(),
+        "fleet": _fleet_summary(jobs),
+        "data_age_sec": (time.time() - mtimes[default_id]) if mtimes.get(default_id) else None,
     }
 
 
@@ -695,6 +802,19 @@ HTML = r"""<!doctype html>
     letter-spacing: 0.04em;
   }
   .balance-burn.live { color: var(--sage); }
+  .fleet-cost {
+    display: block;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-mute);
+    letter-spacing: 0.04em;
+    margin-bottom: 3px;
+  }
+  .fleet-cost b { color: var(--ink); font-weight: 600; }
+  .fleet-cost .proj { color: var(--vermillion); }
+  .freshness.live { color: var(--sage); }
+  .freshness.aging { color: var(--ink-mute); }
+  .freshness.stale { color: var(--vermillion); font-weight: 600; }
 
   /* ===== FLEET STRIP — top-of-page summary across N jobs ===== */
   .fleet-strip {
@@ -888,39 +1008,6 @@ HTML = r"""<!doctype html>
   .stage-line .pip.active { color: var(--ink); }
   .stage-line .pip.active .mark { color: var(--vermillion); }
   .stage-line .pip.bad { color: var(--vermillion); }
-
-  /* ===== FIGURE LABELS — quiet hairline rules ===== */
-  .figure-label {
-    font-family: var(--display);
-    font-style: italic;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--ink-mute);
-    text-transform: uppercase;
-    letter-spacing: 0.2em;
-    border-bottom: 1px solid var(--rule-cyan);
-    padding-bottom: 6px;
-    margin-bottom: 14px;
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-  }
-  .figure-label .num {
-    font-family: var(--display);
-    font-style: normal;
-    font-weight: 600;
-    font-variant: small-caps;
-    letter-spacing: 0.12em;
-    color: var(--ink-soft);
-  }
-  .figure-label .meta {
-    font-family: var(--mono);
-    font-style: normal;
-    font-size: 10px;
-    color: var(--ink-mute);
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-  }
 
   /* ===== MAIN GRID ===== */
   .grid {
@@ -1189,32 +1276,37 @@ HTML = r"""<!doctype html>
   .colophon {
     margin-top: 48px;
     padding-top: 18px;
-    border-top: 1px solid var(--rule);
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 24px;
     font-family: var(--mono);
     font-size: 10px;
     color: var(--ink-mute);
     text-transform: uppercase;
     letter-spacing: 0.2em;
-    align-items: center;
+    text-align: center;
   }
-  .colophon-mark {
-    font-family: var(--display);
-    font-style: italic;
-    font-weight: 400;
-    font-size: 13px;
-    text-transform: none;
-    letter-spacing: 0;
+
+  /* ===== MINIMAL SECTION LABELS ===== */
+  .section-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
     color: var(--ink-soft);
+    margin: 0 0 16px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--rule);
   }
-  .colophon .mid { text-align: center; }
-  .colophon .signal-pip {
-    display: inline-block; width: 5px; height: 5px;
-    background: var(--ink-soft); border-radius: 50%;
-    vertical-align: 1px; margin: 0 6px;
+  .section-meta { color: var(--ink-mute); letter-spacing: 0.08em; margin-left: 4px; }
+  .session-tag {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.16em;
+    color: var(--ink-mute); opacity: 0.55;
   }
+  /* More air, fewer hard edges: the layout leans on whitespace, not rules. */
+  .page { padding: 48px 56px; }
+  .grid { gap: 52px; }
+  .hero { margin-bottom: 8px; }
+  .stats-col > div { margin-bottom: 30px; }
+  .colophon { margin-top: 64px; border-top: none; opacity: 0.5; }
+  .ledger { margin-top: 44px; }
 
   /* responsive */
   @media (max-width: 980px) {
@@ -1239,8 +1331,8 @@ HTML = r"""<!doctype html>
     <div class="masthead-right">
       <span id="rp-balance" class="balance-chip" title="RunPod credit balance">Balance —</span>
       <span id="rp-burn" class="balance-burn"></span><br>
-      Vol. I · No. <b><span id="iter-count">—</span></b> &nbsp;·&nbsp;
-      <span id="session-id-short">SESSION __SESSION__</span>
+      <span id="fleet-cost" class="fleet-cost" title="Spent so far and projected total across every live pod" hidden></span>
+      <span id="session-id-short" class="session-tag">__SESSION__</span>
     </div>
   </header>
 
@@ -1292,18 +1384,12 @@ HTML = r"""<!doctype html>
       </div>
 
       <div>
-        <div class="figure-label">
-          <span class="num">Exhibit A.</span>
-          <span class="meta">Published Output</span>
-        </div>
-        <div id="hf-out"><span class="output-pending">— awaiting upload —</span></div>
+        <div class="section-label">Output</div>
+        <div id="hf-out"><span class="output-pending">awaiting upload</span></div>
       </div>
 
       <div>
-        <div class="figure-label">
-          <span class="num">Exhibit B.</span>
-          <span class="meta" id="sev-meta">no alerts</span>
-        </div>
+        <div class="section-label">Alerts <span class="section-meta" id="sev-meta">none</span></div>
         <div id="errs"><span class="alert-clear">no anomalies recorded</span></div>
       </div>
 
@@ -1311,10 +1397,7 @@ HTML = r"""<!doctype html>
 
     <!-- RIGHT: matrix + inline stats -->
     <main>
-      <div class="figure-label">
-        <span class="num">Figure I.</span>
-        <span class="meta">Expert Matrix · Live</span>
-      </div>
+      <div class="section-label">Expert Matrix <span class="section-meta">· <span id="data-freshness" class="freshness">Live</span></span></div>
 
       <div class="matrix-wrap">
         <div class="matrix-viewport">
@@ -1364,10 +1447,7 @@ HTML = r"""<!doctype html>
 
   <!-- LEDGER -->
   <section class="ledger">
-    <div class="figure-label">
-      <span class="num">Ledger.</span>
-      <span class="meta" id="events-meta">— entries</span>
-    </div>
+    <div class="section-label">Ledger <span class="section-meta" id="events-meta">0 entries</span></div>
     <div class="ledger-wrap">
       <table class="ledger-table">
         <thead>
@@ -1386,9 +1466,7 @@ HTML = r"""<!doctype html>
   </section>
 
   <footer class="colophon">
-    <span>Set in <em class="colophon-mark">Fraunces</em> &amp; <em class="colophon-mark">JetBrains Mono</em></span>
     <span class="mid" id="logsrc">streaming default log</span>
-    <span>signal <span class="signal-pip"></span></span>
   </footer>
 </div>
 
@@ -1625,7 +1703,7 @@ function resetDetailPanel() {
   $("errs").innerHTML = "";
   $("events").innerHTML = "";
   $("events-meta").textContent = "0 entries";
-  $("sev-meta").textContent = "no alerts";
+  $("sev-meta").textContent = "none";
   lastSeenEvents = 0;
 }
 
@@ -1785,7 +1863,51 @@ function renderFleetStrip(p) {
   return jobs[selectedJobId];
 }
 
+function renderFleetCost(p) {
+  // Fleet-wide money lives in the masthead (session scope); the hero
+  // RUNTIME/SPEND stay scoped to the selected pod. Hidden for a single pod,
+  // where the hero figure already tells the whole story.
+  const el = $("fleet-cost");
+  if (!el) return;
+  const f = p && p.fleet;
+  if (!f || f.job_count < 2 || (f.spent <= 0 && f.projected <= 0)) {
+    el.hidden = true;
+    return;
+  }
+  const pods = f.live_pods === 1 ? "1 pod" : `${f.live_pods} pods`;
+  let html = `Fleet <b>$${f.spent.toFixed(2)}</b> spent`;
+  if (f.projected > f.spent + 0.01) {
+    html += ` · <span class="proj">~$${f.projected.toFixed(2)} projected</span>`;
+  }
+  html += ` · ${pods}`;
+  el.innerHTML = html;
+  el.hidden = false;
+}
+
+function renderFreshness(p) {
+  // The SSE stream re-renders every 2s regardless of whether the underlying
+  // log changed, so a dead syncer or a finished pod would otherwise look just
+  // as "live" as a running one. Tie the figure's status word to log-file age.
+  const el = $("data-freshness");
+  if (!el) return;
+  const age = p && p.data_age_sec;
+  el.classList.remove("live", "aging", "stale");
+  if (age == null) { el.textContent = "Live"; el.classList.add("live"); return; }
+  // Syncers flush ~every 20s, so anything under ~30s is healthy "live"; a feed
+  // that has gone quiet for 30-120s is aging, and past two minutes is stale.
+  if (age < 30) {
+    el.textContent = "Live"; el.classList.add("live");
+  } else if (age < 120) {
+    el.textContent = `${Math.round(age)}s ago`; el.classList.add("aging");
+  } else {
+    const m = Math.floor(age / 60);
+    el.textContent = m >= 1 ? `stale ${m}m` : `stale ${Math.round(age)}s`;
+    el.classList.add("stale");
+  }
+}
+
 function renderRunpodBalance(p) {
+  renderFleetCost(p);
   const b = p && p.runpod_balance;
   const chip = $("rp-balance");
   const burn = $("rp-burn");
@@ -1814,6 +1936,7 @@ function update(p) {
   if (p.heartbeat) return;
   latestPayload = p;
   renderRunpodBalance(p);
+  renderFreshness(p);
   // Multi-job mode: render strip and pull the selected job's payload.
   // Single-job mode: strip stays hidden, payload passed through.
   const detailPayload = renderFleetStrip(p) || p;
@@ -1893,7 +2016,6 @@ function renderDetail(p) {
     tweenNumber("pod-spent", s.pod_spent, 1500, fmtDollar);
   }
 
-  $("iter-count").textContent = s.iteration_count || 1;
 
   // Stage pips
   setStage("st-bootstrap",
@@ -1972,7 +2094,7 @@ function renderDetail(p) {
   // Alerts
   const tally = (st.sev_count || {});
   const badCount = tally.bad || 0;
-  $("sev-meta").textContent = badCount === 0 ? "no alerts" : `${badCount} alerts`;
+  $("sev-meta").textContent = badCount === 0 ? "none" : `${badCount}`;
   const bad = (p.events || []).filter(e => e.severity === "bad");
   if (bad.length) {
     $("errs").innerHTML = bad.slice(-5).map(e =>

@@ -30,14 +30,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python -m pip install --upgrade pip
 
 # ---- Python deps ----------------------------------------------------------
-# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.30
+# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.37
 # on this base. Bumping any of these requires re-validating end-to-end on
 # at least one MoE model.
 RUN python -m pip install \
         "torch==2.6.0" \
         --index-url https://download.pytorch.org/whl/cu124
 
+# hf_transfer gives parallel, Rust-backed weight downloads (the 70GB+ pull is
+# the longest part of a run); remote/quant.py turns it on when it is present.
 RUN python -m pip install \
+        "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
         "transformers>=4.40" \
         "tokenizers>=0.20" \
@@ -57,31 +60,44 @@ RUN python -m pip install \
         "typing_extensions"
 
 # ---- ExLlamaV3 ------------------------------------------------------------
-# --no-deps mirrors what the bootstrap path does. The previous RUN block
-# already pinned every dep we actually need; including --no-deps here
-# stops pip from pulling flash-attn (which has no pre-built wheel for
-# this torch/CUDA combo and tries to compile from source — fails in CI).
-# Pin the version so the bake is reproducible; bump after each release
-# behind an end-to-end validation pass.
-ARG EXLLAMAV3_VERSION=0.0.30
-RUN python -m pip install --no-cache-dir --no-deps "exllamav3==${EXLLAMAV3_VERSION}"
+# Installed from a pinned git commit on master (not a PyPI release) so the
+# image carries architectures that are merged upstream but not yet released,
+# e.g. Lfm2MoeForCausalLM (LiquidAI LFM2 MoE). --no-deps stops pip pulling
+# flash-attn (no prebuilt wheel for this torch/CUDA; source build fails in CI);
+# the patch step below makes exllamav3 import + run without it.
+# Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
+# pre-baked health check still enforces a minimum reported version
+# (_MIN_EXLLAMAV3 in providers/runpod/provider.py); this commit reports 0.0.38.
+ARG EXLLAMAV3_REF=c18e9b40bed1d2bd9c30fbbc0ba0eeb19b4fbda1
+RUN python -m pip install --no-cache-dir --no-deps \
+        "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
-# ---- flash_attn import stub ----------------------------------------------
-# exllamav3 0.0.30+ does `from flash_attn import flash_attn_func, ...` at
-# the top of `modules/attn.py`. Real flash-attn has no prebuilt wheel for
-# our torch+CUDA combo and source builds fail in CI, so the prior image
-# (which installed exllamav3 with --no-deps and no stub) blew up at
-# `import exllamav3` runtime. The quantization path never invokes
-# flash_attn at runtime — only inference does — so this top-level module
-# stub with __getattr__ satisfies the current attribute imports from
-# `flash_attn` without requiring a real CUDA flash-attn build.
-COPY docker/flash_attn_stub.py /tmp/flash_attn_stub.py
-RUN python -c "import sysconfig, shutil, pathlib; \
-    dst = pathlib.Path(sysconfig.get_paths()['purelib']) / 'flash_attn.py'; \
-    shutil.copyfile('/tmp/flash_attn_stub.py', dst); \
-    print('flash_attn stub ->', dst)" \
- && python -c "from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func; print('flash_attn stub import OK')" \
- && rm /tmp/flash_attn_stub.py
+# ---- Make exllamav3 import + run without flash-attn -----------------------
+# exllamav3 hard-imports flash_attn in its attention dispatch (no prebuilt
+# wheel for this torch/CUDA). patch_flash_attn.py guards every
+# `from flash_attn import ...` in the installed package and routes the
+# dispatcher to exllamav3's own torch-SDPA backend. This is the exact patch
+# the in-pod bootstrap applies, baked in so the pre-baked path needs no
+# fix-up. It uses importlib.find_spec (no GPU, no exllamav3 import), so it
+# runs cleanly on a GPU-less CI builder. The old __getattr__ stub satisfied
+# `from flash_attn import X` but `import exllamav3` still failed downstream;
+# this patches the source instead.
+COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
+RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
+
+# ---- Bundled calibration corpus ------------------------------------------
+# exllamav3 wheels omit conversion/standard_cal_data/*.utf8, which convert.py
+# needs. Fetch it into the installed package (same script the bootstrap runs).
+COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
+RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
+
+# ---- Stub formatron (quant-only image) ------------------------------------
+# exllamav3's __init__ hard-imports FormatronFilter, and formatron is fragile
+# against pinned pydantic. The quant path never builds a filter, so replace
+# exllamav3's filter/formatron.py with a stub that imports cleanly and only
+# raises if actually instantiated. Mirrors the bootstrap's formatron handling.
+COPY docker/stub_formatron.py /tmp/stub_formatron.py
+RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 
 # ---- Pre-trigger the JIT C++ extension compile ---------------------------
 # ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
@@ -105,7 +121,7 @@ LABEL org.opencontainers.image.title="BlockQuant RunPod" \
       org.opencontainers.image.description="Pre-baked ExLlamaV3 quantization environment for RunPod pods." \
       org.opencontainers.image.source="https://github.com/Honkware/blockquant" \
       org.opencontainers.image.licenses="MIT" \
-      blockquant.exllamav3_version="${EXLLAMAV3_VERSION}" \
+      blockquant.exllamav3_ref="${EXLLAMAV3_REF}" \
       blockquant.torch_version="2.6.0+cu124" \
       blockquant.cuda_runtime="12.4.1"
 

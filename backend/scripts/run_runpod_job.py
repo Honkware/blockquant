@@ -34,18 +34,195 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
+# Blackwell-class GPUs (sm_100/sm_120) need CUDA 12.8+ / torch >= 2.7; our
+# torch 2.6 + cu124 has no kernels for them. Matched as substrings of the
+# RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
+_BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
+
+# Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
+# for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
+_WEAK_FOR_QUANT = {"NVIDIA L4"}
+
+# exllamav3 version is chosen by architecture. The stable release (0.0.37, what
+# the bootstrap path installs) handles the proven models incl. Qwen3.6. The
+# master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
+# (Qwen3.6 segfaults loading the first layer), so we only reach for the master
+# image when the model's architecture actually needs it.
+_MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
+_MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
+
+
+def _arch_needs_master(model_id: str, token: str) -> bool:
+    """True if the model's architecture is only supported on exllamav3 master."""
+    try:
+        import json as _json
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(model_id, "config.json", token=token or None)
+        with open(p) as f:
+            cfg = _json.load(f)
+        archs = " ".join(cfg.get("architectures") or [])
+        hay = f"{archs} {cfg.get('model_type', '')}".lower()
+        return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
+    except Exception:
+        return False
+
+
+def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
+    """True if a requested variant's exl3 repo is already on HF with a
+    config.json. Used as a fallback when the result file can't be read over a
+    dropped SSH connection -- the pod uploads to HF on its own, so an upload may
+    have succeeded even though the controller lost contact."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token or None)
+        base = model_id.split("/")[-1]
+        org = hf_org or (api.whoami() or {}).get("name", "")
+        for v in variants:
+            try:
+                info = api.model_info(f"{org}/{base}-exl3-{v}bpw")
+                if "config.json" in {s.rfilename for s in (info.siblings or [])}:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _recommend_max_price(base_gb: float | None) -> float:
+    """Price cap scaled to model size. The quant is compute-bound, so a big
+    model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
+    while a small model is plenty fast on the cheap tier. Tiers by HF download
+    GB (35B ~= 72 GB, 8B ~= 17 GB)."""
+    if not base_gb:
+        return 1.5
+    if base_gb <= 20:
+        return 0.80   # <= ~10B: cheap cards are fast enough
+    if base_gb <= 50:
+        return 1.30   # ~10-25B: RTX 5000 Ada / A40 / A6000 tier
+    if base_gb <= 100:
+        return 1.80   # ~25-50B: A100 tier (worth it, ~3x faster)
+    return 2.80       # 50B+: A100 80GB / H100
+
+
+def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
+    """GPU type ids with at least min_vram_gb, ordered by the model size.
+
+    Small models go cheapest-first (cheap cards quantize them fast). Big models
+    are compute-bound and would crawl on a cheap card, so they go capable-first
+    (priciest within the cap) and fall back to cheaper cards on a stock-out, so
+    they finish far faster for ~the same total cost without ever getting stuck.
+    """
+    from blockquant.providers.runpod.pricing import static_price
+    import runpod
+    runpod.api_key = api_key
+    cards = []
+    for g in runpod.get_gpus():
+        gid = (g.get("id") or "").strip()
+        mem = g.get("memoryInGb") or 0
+        if not gid or gid == "unknown" or "MIG" in gid or mem < min_vram_gb:
+            continue
+        # torch 2.6 / cu124 (the baked image AND the bootstrap path) has no
+        # kernels for Blackwell (sm_100/sm_120): the quant dies mid-run with
+        # "no kernel image is available for execution on the device". Skip
+        # Blackwell-class cards until the stack moves to a cu128 torch. Plenty
+        # of cheap Ada/Ampere/Hopper stock remains under the price cap.
+        if any(tok in gid for tok in _BLACKWELL_EXCLUDE):
+            continue
+        # Skip cards too weak to reliably quantize a large model. The L4 is a
+        # low-power inference card (~72W) that froze mid-quant on the 35B MoE
+        # while an RTX 5000 Ada on the same job finished fine. Exact match so we
+        # don't also drop the capable L40 / L40S. Plenty of cheap, more capable
+        # stock remains (3090, 4090, A5000, A40, RTX 5000 Ada...).
+        if gid in _WEAK_FOR_QUANT:
+            continue
+        cards.append((mem, gid))
+    # Big model (> ~25 GB download, ~12B+) -> capable-first: sort by price (then
+    # VRAM) DESCENDING so the fastest allowed card is tried first, falling back
+    # to cheaper ones. Small model -> cheapest/smallest first.
+    big = bool(base_gb and base_gb > 25)
+    cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
+    return [gid for _, gid in cards]
+
+
+def _terminate_stray_pods(api_key: str, prefix: str, keep_id: str = "") -> list[str]:
+    """Kill pods named ``{prefix}-*`` except keep_id.
+
+    RunPod's create_pod can create a pod AND still raise, so a failed launch
+    attempt can orphan a billing pod the controller never learned the id of.
+    The prefix is unique per run, so this only ever touches THIS run's strays,
+    never pods from other concurrent jobs. Uses the REST API (the GraphQL one
+    is flaky for rpa_ keys and has been timing out).
+    """
+    import json
+    import urllib.request as u
+    killed: list[str] = []
+    try:
+        req = u.Request("https://rest.runpod.io/v1/pods",
+                        headers={"Authorization": f"Bearer {api_key}"})
+        data = json.load(u.urlopen(req, timeout=30))
+        pods = data if isinstance(data, list) else data.get("pods", [])
+    except Exception:
+        return killed
+    for p in pods:
+        pid = p.get("id")
+        name = p.get("name") or ""
+        if pid and pid != keep_id and name.startswith(prefix + "-"):
+            try:
+                u.urlopen(u.Request(f"https://rest.runpod.io/v1/pods/{pid}", method="DELETE",
+                                    headers={"Authorization": f"Bearer {api_key}"}), timeout=20)
+                killed.append(pid)
+            except Exception:
+                pass
+    return killed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run EXL3 quantization on RunPod")
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--variants", default="4.5", help="Comma-separated BPW values")
-    parser.add_argument("--gpu", default="NVIDIA H100 80GB HBM3", help="Preferred RunPod GPU type")
+    parser.add_argument(
+        "--gpu", default="NVIDIA H100 80GB HBM3",
+        help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
+    )
     parser.add_argument(
         "--gpu-fallback",
         default="NVIDIA H100 NVL,NVIDIA H100 PCIe,NVIDIA A100-SXM4-80GB",
-        help=(
-            "Comma-separated GPU types to try if --gpu is out of stock "
-            "(on 'no instances available' only; other errors abort)."
-        ),
+        help="Comma-separated GPU types to try if --gpu is out of stock. Ignored when --gpu auto.",
+    )
+    parser.add_argument(
+        "--min-vram", type=int, default=24,
+        help="With --gpu auto, only consider cards with at least this many GB of VRAM "
+             "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
+    )
+    parser.add_argument(
+        "--max-price", default="auto",
+        help="With --gpu auto, skip any card over this $/hr. 'auto' scales the "
+             "cap to the model size (small models -> cheap cards; a big model -> "
+             "A100/H100 since it's compute-bound and ~3x faster for ~the same "
+             "total cost). A number pins it; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--container-disk", default="auto",
+        help="Container disk in GB, holding OS + torch/deps + the quantized "
+             "outputs and conversion work dir (the unquantized model lives on "
+             "the /workspace volume). 'auto' sizes from the model + variants; a "
+             "number pins it.",
+    )
+    parser.add_argument(
+        "--volume-disk", default="auto",
+        help="/workspace volume in GB, or 'auto' (default) to size it from the "
+             "model download plus the sum of all variant outputs plus a work "
+             "dir. This is the disk that actually fills. Pass a number to pin it.",
+    )
+    parser.add_argument(
+        "--launch-retries", type=int, default=6,
+        help="How many times to re-sweep all GPU candidates when none are free. "
+             "RunPod stock blips in and out per-GPU over minutes, so one pass is brittle.",
+    )
+    parser.add_argument(
+        "--launch-retry-delay", type=int, default=30,
+        help="Seconds to wait between GPU sweeps when everything was out of stock.",
     )
     parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
     parser.add_argument(
@@ -143,6 +320,46 @@ def main():
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
 
+    # Disk split: the VOLUME (/workspace) holds the unquantized model + HF cache;
+    # the CONTAINER disk (/quant) holds the quantized outputs + work dir. Each
+    # auto-sizes from the model + requested variants when set to "auto"; a number
+    # pins it.
+    _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    if str(args.container_disk).strip().lower() == "auto":
+        args.container_disk = RunPodProvider.recommend_container_gb(
+            args.model, _variants, args.hf_token)
+    else:
+        args.container_disk = int(args.container_disk)
+    if str(args.volume_disk).strip().lower() == "auto":
+        args.volume_disk = RunPodProvider.recommend_volume_gb(
+            args.model, _variants, args.hf_token)
+    else:
+        args.volume_disk = int(args.volume_disk)
+    print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
+          f"outputs+work -> container {args.container_disk} GB", flush=True)
+
+    # Model size (HF download GB) drives the price cap AND the card ordering:
+    # big models go to a capable card (compute-bound, ~3x faster for ~same total
+    # cost), small ones stay cheap. Computed once, reused for both.
+    _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
+    if str(args.max_price).strip().lower() == "auto":
+        args.max_price = _recommend_max_price(_base_gb)
+    else:
+        args.max_price = float(args.max_price)
+    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
+          f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
+
+    # Pick exllamav3 by architecture (unless an image was pinned explicitly).
+    # Stable 0.0.37 (the bootstrap path) for the proven models incl. Qwen3.6;
+    # the master image only for archs that need it (e.g. LFM2), since master
+    # regresses Qwen3.6.
+    if not args.image:
+        if _arch_needs_master(args.model, args.hf_token):
+            args.image = _MASTER_IMAGE
+            print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
+        else:
+            print("[image] bootstrap path (exllamav3 0.0.37, stable)", flush=True)
+
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
         # Look up live pricing for the preferred GPU so the cost band is honest.
@@ -195,47 +412,121 @@ def main():
         header += f" hf_org={args.hf_org}"
     print(header, flush=True)
 
-    gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
+    if args.gpu.strip().lower() == "auto":
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb)
+        if not gpu_candidates:
+            print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
+            sys.exit(1)
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, cheapest first")
+    else:
+        gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
     seen = set()
     gpu_candidates = [g for g in gpu_candidates if not (g in seen or seen.add(g))]
 
+    # Unique pod-name prefix for THIS run, so orphan cleanup only ever touches
+    # our own create-then-raise strays, never another concurrent job's pods.
+    run_tag = f"bq-{os.getpid()}-{int(time.time()) % 100000}"
+
+    # Try SECURE first (more reliable stock + network), then COMMUNITY, unless
+    # the user pinned a cloud. The --max-price cap already keeps both clouds on
+    # the cheap VRAM-appropriate tier, so SECURE-first costs nothing extra and
+    # just lands a pod faster.
+    cloud_order = [args.cloud] if cli_passed_cloud else ["SECURE", "COMMUNITY"]
+    candidate_pairs = [(g, c) for c in cloud_order for g in gpu_candidates]
+
     provider = None
     instance_id = None
     chosen_gpu = None
+    chosen_cloud = None
     hourly = 0.0
     last_err = None
-    for candidate in gpu_candidates:
-        attempt = RunPodProvider(
-            api_key=args.runpod_api_key,
-            gpu_type=candidate,
-            cloud_type=args.cloud,
-            install_flash_attn=args.install_flash_attn,
-            image=args.image,
-            network_volume_id=args.network_volume_id,
-            data_center_id=args.data_center_id,
-        )
-        rate = attempt.get_cost_per_hour()
-        print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {args.cloud})...", flush=True)
-        try:
-            instance_id = attempt.launch({})
-        except Exception as e:
-            msg = str(e).lower()
-            # Match any "no(t) ... instances available" / "no capacity" phrasing RunPod throws.
-            if ("instances available" in msg and ("no " in msg or "not " in msg)) or "capacity" in msg:
-                print(f"      out of stock ({type(e).__name__}), falling through", flush=True)
+    _price_cache: dict = {}
+    sweeps = max(1, args.launch_retries)
+    for sweep in range(1, sweeps + 1):
+        for candidate, cloud in candidate_pairs:
+            attempt = RunPodProvider(
+                api_key=args.runpod_api_key,
+                gpu_type=candidate,
+                cloud_type=cloud,
+                container_disk_gb=args.container_disk,
+                volume_gb=args.volume_disk,
+                install_flash_attn=args.install_flash_attn,
+                image=args.image,
+                network_volume_id=args.network_volume_id,
+                data_center_id=args.data_center_id,
+                name_prefix=run_tag,
+            )
+            # Price cap (cached per gpu+cloud so retries stay fast). Skip cards
+            # over --max-price so a stock-out can't push us onto an idle
+            # H100/A100 at several times the cost of a capable cheap card.
+            ckey = (candidate, cloud)
+            rate = _price_cache.get(ckey)
+            if rate is None:
+                try:
+                    rate = attempt.get_cost_per_hour()
+                except Exception:
+                    rate = 0.0
+                _price_cache[ckey] = rate
+            if args.max_price and rate and rate > args.max_price:
+                print(f"      {candidate} ({cloud}) ${rate:.2f}/hr over cap "
+                      f"${args.max_price:.2f}, skipping", flush=True)
+                continue
+            print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {cloud})...", flush=True)
+            try:
+                instance_id = attempt.launch({})
+            except Exception as e:
+                msg = str(e).lower()
+                # Out-of-stock is expected. But transient/rate-limit errors are
+                # also common when several controllers hammer the API at once,
+                # and re-raising here would crash the whole controller (and
+                # orphan any pod a create-then-raise leaked). So NEVER re-raise
+                # mid-sweep: log and try the next candidate. A genuinely fatal
+                # condition just exhausts the sweeps and exits cleanly below.
+                unavailable = (
+                    ("instances available" in msg and ("no " in msg or "not " in msg))
+                    or "capacity" in msg
+                    or "does not have the resources" in msg
+                    or "insufficient" in msg
+                )
+                label = "unavailable" if unavailable else "error"
+                print(f"      {label} ({type(e).__name__}: {str(e)[:80]}), falling through", flush=True)
                 last_err = e
                 continue
-            raise
-        provider = attempt
-        chosen_gpu = candidate
-        hourly = rate
-        break
+            provider = attempt
+            chosen_gpu = candidate
+            chosen_cloud = cloud
+            hourly = rate
+            break
+        if provider is not None:
+            break
+        # Whole sweep came up empty. Clean any create-then-raise orphans from
+        # this run, then wait for stock to blip back before re-sweeping.
+        strays = _terminate_stray_pods(args.runpod_api_key, run_tag)
+        if strays:
+            print(f"      cleaned {len(strays)} stray pod(s): {strays}", flush=True)
+        if sweep < sweeps:
+            print(f"[1/6] No GPU free (sweep {sweep}/{sweeps}); retrying in "
+                  f"{args.launch_retry_delay}s...", flush=True)
+            time.sleep(args.launch_retry_delay)
 
     if provider is None or instance_id is None:
-        print(f"ERROR: all GPU candidates out of stock. Last error: {last_err}")
+        _terminate_stray_pods(args.runpod_api_key, run_tag)
+        print(f"ERROR: all GPU candidates out of stock after {sweeps} sweeps. "
+              f"Last error: {last_err}")
         sys.exit(1)
-    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu})")
+    # Defensive: a create-then-raise earlier in the sweep may have orphaned a
+    # pod we never tracked; kill any of our strays that isn't the live one.
+    strays = _terminate_stray_pods(args.runpod_api_key, run_tag, keep_id=instance_id)
+    if strays:
+        print(f"      cleaned {len(strays)} stray pod(s): {strays}", flush=True)
+    # hourly was already cached during the sweep; only look it up if somehow unset.
+    if not hourly:
+        try:
+            hourly = provider.get_cost_per_hour()
+        except Exception:
+            hourly = 0.0
+    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu}, {chosen_cloud}, ~${hourly:.2f}/hr)")
 
     t_launch = time.time()
     try:
@@ -304,18 +595,37 @@ def main():
         # the last batch of remote output (final quantize layers, the
         # upload-complete line, status sentinel) — the routine 30-line
         # poll skips most of these when the run wraps up between ticks.
-        final_tail = provider.get_progress(instance_id, lines=500)
-        if final_tail and final_tail != last_tail:
-            new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
-            sys.stdout.write(new if new.endswith("\n") else new + "\n")
-            sys.stdout.flush()
+        try:
+            final_tail = provider.get_progress(instance_id, lines=500, raw=True)
+            if final_tail and final_tail != last_tail:
+                new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
+                sys.stdout.write(new if new.endswith("\n") else new + "\n")
+                sys.stdout.flush()
+        except Exception as e:
+            print(f"      (final drain skipped: {e})", flush=True)
 
         print(f"\n[6/6] Fetching result...")
-        result = provider.get_result()
+        # Reading the result is over SSH and can hit a transient reset right at
+        # the end; retry a few times before giving up.
+        result = None
+        for _attempt in range(5):
+            try:
+                result = provider.get_result()
+                if result is not None:
+                    break
+            except Exception as e:
+                print(f"      result read retry ({e})", flush=True)
+            time.sleep(8)
         elapsed = time.time() - t_launch
         cost = (elapsed / 3600) * hourly
         if result is None:
-            print("ERROR: no result file on pod — check log tail above")
+            # SSH unreachable / pod self-terminated. The pod uploads to HF on its
+            # own, so check there before declaring failure.
+            if _variant_uploaded(args.model, _variants, args.hf_org, args.hf_token):
+                print("      result unreadable over SSH, but the variant is on HF "
+                      "-> treating as complete", flush=True)
+                sys.exit(0)
+            print("ERROR: no result file on pod and nothing on HF — check log tail above")
             sys.exit(1)
         status = result.get("status", "unknown")
         print(f"      Status: {status}")

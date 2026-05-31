@@ -23,6 +23,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -33,6 +34,12 @@ from blockquant.providers.runpod.pricing import lookup_live_price, static_price
 from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Minimum ExLlamaV3 a pre-baked image must ship. Older bakes are rejected at
+# boot so they can't silently quantize with outdated kernels or fail on newer
+# model architectures. Keep in sync with EXLLAMAV3_VERSION in
+# docker/Dockerfile.runpod.
+_MIN_EXLLAMAV3 = (0, 0, 37)
 
 
 class RunPodProvider(Provider):
@@ -120,6 +127,7 @@ class RunPodProvider(Provider):
         data_center_id: str = "",
         install_flash_attn: bool = False,
         image: str = "",
+        name_prefix: str = "blockquant",
     ):
         api_key = api_key or os.environ.get("RUNPOD_API_KEY", "")
         if not api_key:
@@ -136,6 +144,10 @@ class RunPodProvider(Provider):
         self.network_volume_id = network_volume_id
         self.data_center_id = data_center_id
         self.install_flash_attn = install_flash_attn
+        # Pods are named "{name_prefix}-{ts}". A unique prefix per run lets the
+        # launcher clean up only its OWN create-then-raise orphans without
+        # touching pods from other concurrent jobs (e.g. run_parallel_quants).
+        self.name_prefix = name_prefix
         if not self.ssh_key_path.exists():
             raise ValueError(
                 f"SSH private key not found at {self.ssh_key_path}. "
@@ -166,6 +178,66 @@ class RunPodProvider(Provider):
         # ledger. Real ERROR-level output still passes through.
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
+    @staticmethod
+    @staticmethod
+    def _base_download_gb(model_id: str, token: str = "") -> float | None:
+        """Total HF download size of the base model in GB, or None on lookup
+        failure."""
+        try:
+            from huggingface_hub import HfApi
+            info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
+            base_gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
+        except Exception:
+            return None
+        return base_gb if base_gb > 0 else None
+
+    @staticmethod
+    def recommend_volume_gb(
+        model_id: str, variants, token: str = "", floor_gb: int = 60
+    ) -> int:
+        """Size the /workspace VOLUME, which now holds ONLY the unquantized model
+        plus its HF download cache (the quantized outputs + work dir live on the
+        container disk; see recommend_container_gb and remote/quant.py).
+
+        Sized as base_download x1.4 (model + any cache duplication during
+        download) + a margin. Falls back generously if the HF size lookup fails,
+        and never drops below floor_gb.
+        """
+        import math
+        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        if base_gb is None:
+            return max(floor_gb, 250)
+        needed = base_gb * 1.4 + 20.0
+        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+
+    @staticmethod
+    def recommend_container_gb(
+        model_id: str, variants, token: str = "", floor_gb: int = 120
+    ) -> int:
+        """Size the CONTAINER disk, which holds the OS + deps plus the quantized
+        outputs and the conversion work dir (remote/quant.py writes outputs +
+        work to /quant on the container disk).
+
+        remote/quant.py quantizes every requested variant before uploading, so
+        their outputs accumulate; size for the SUM of all outputs + one work dir
+        + an OS/deps margin. Never drops below floor_gb (the image + caches need
+        headroom regardless).
+        """
+        import math
+        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        if base_gb is None:
+            return max(floor_gb, 160)
+        bpws = []
+        for v in variants:
+            try:
+                bpws.append(float(v))
+            except (TypeError, ValueError):
+                bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
+        outputs = sum(base_gb * b / 16.0 for b in bpws)
+        work = base_gb * (max(bpws) if bpws else 8.0) / 16.0
+        needed = outputs + work + 40.0  # +40 for OS + torch/deps + scratch
+        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -188,12 +260,18 @@ class RunPodProvider(Provider):
         env.update(config.get("env", {}) or {})
 
         kwargs = dict(
-            name=f"blockquant-{int(time.time())}",
+            name=f"{self.name_prefix}-{int(time.time())}",
             image_name=image,
             gpu_type_id=self.gpu_type,
             cloud_type=self.cloud_type,
             container_disk_in_gb=self.container_disk_gb,
             volume_in_gb=self.volume_gb,
+            # Mount the volume at /workspace, where remote/quant.py puts the
+            # model, HF cache, work dir, and outputs. The runpod SDK defaults
+            # this to /runpod-volume, which left the volume unused and crammed
+            # everything onto the (smaller) container disk — the big 35B model
+            # then overflowed it and the quant never started.
+            volume_mount_path="/workspace",
             support_public_ip=True,
             start_ssh=True,
             ports="22/tcp",
@@ -451,6 +529,31 @@ class RunPodProvider(Provider):
             f"run() exhausted {retries} retries on {instance_id}: {last_err}"
         )
 
+    def run_detached(self, instance_id: str, command: str, read_timeout: int = 20) -> dict:
+        """Launch a fire-and-forget command without waiting for it to exit.
+
+        A backgrounded remote process keeps the SSH channel open long after it
+        has started, so run() (which blocks on recv_exit_status) stalls the
+        caller for minutes on a launch — which left the progress poll, and thus
+        the embed, frozen until the launch finally returned. Here we send the
+        command, read the one line it echoes (the pid), and return immediately,
+        leaving the process running.
+        """
+        client = self._connect_ssh(instance_id)
+        try:
+            stdin, stdout, stderr = client.exec_command(command, timeout=read_timeout)
+            try:
+                stdout.channel.settimeout(read_timeout)
+                out = stdout.readline()
+            except Exception:
+                out = ""
+            return {"stdout": out.strip(), "stderr": "", "code": 0}
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def _sftp_put_with_retry(self, instance_id: str, fn, retries: int = 5):
         """Run a single SFTP operation with reconnect-on-transient-error.
 
@@ -611,16 +714,51 @@ class RunPodProvider(Provider):
             py = self._probe_remote_python(instance_id)
             logger.info(f"Pre-baked image detected ({self.image}); skipping bootstrap")
             print(f"      pre-baked image: {self.image}", flush=True)
-            health = self.run(
-                instance_id,
-                f"{py} -c \"import torch, exllamav3; "
-                "print('[gpu]', torch.cuda.get_device_name(0)); "
-                "print('[ok] exllamav3', exllamav3.__version__)\"",
+            # Health check + hard version gate. The remote exits non-zero if
+            # torch/exllamav3 fail to import OR exllamav3 is older than the
+            # minimum, so a stale bake fails fast here instead of silently
+            # quantizing with outdated kernels.
+            # Read the version robustly: a git/source install (master) doesn't
+            # set exllamav3.__version__ at the top level the way a PyPI wheel
+            # does, so prefer installed package metadata and fall back through
+            # the module attrs. If the version can't be determined at all, the
+            # gate fails OPEN (import already succeeded, which is the real
+            # signal) rather than rejecting a working image.
+            mn = _MIN_EXLLAMAV3
+            health_code = (
+                "import torch, exllamav3, sys\n"
+                "print('[gpu]', torch.cuda.get_device_name(0))\n"
+                "v = ''\n"
+                "try:\n"
+                "    from importlib.metadata import version as _ver\n"
+                "    v = _ver('exllamav3')\n"
+                "except Exception:\n"
+                "    v = getattr(exllamav3, '__version__', '') or "
+                "getattr(getattr(exllamav3, 'version', None), '__version__', '') or ''\n"
+                "print('[ok] exllamav3', v or '(version unknown)')\n"
+                "p = tuple(int(x) for x in v.split('.')[:3] if x.isdigit())\n"
+                f"sys.exit(7 if (p and p < {mn}) else 0)\n"
             )
+            health = self.run(instance_id, f"{py} -c {shlex.quote(health_code)}")
+            if health["code"] == 7:
+                logger.error(
+                    f"Pre-baked image {self.image} ships an ExLlamaV3 older than "
+                    f"the required {'.'.join(map(str, mn))}; rebuild and push the "
+                    f"image (docker/Dockerfile.runpod) before using it.\n"
+                    f"{health['stdout'].strip()}"
+                )
+                return False
             if health["code"] != 0:
-                logger.error(f"Pre-baked health check failed: {health['stderr'][:2000]}")
+                logger.error(
+                    f"Pre-baked health check failed (code {health['code']}):\n"
+                    f"{health['stdout'].strip()}\n{health['stderr'][:1500]}"
+                )
                 return False
             logger.info(f"Health check output:\n{health['stdout'].strip()}")
+            # Ensure hf_transfer is present even on an older bake that predates
+            # it (idempotent + fast if already installed). remote/quant.py only
+            # enables the parallel downloader when the package imports.
+            self.run(instance_id, f"{py} -m pip install -q hf_transfer || true")
             return True
 
         # Always probe so run_pipeline has the right interpreter, even on fast-path.
@@ -681,7 +819,7 @@ class RunPodProvider(Provider):
         result = self.run(
             instance_id,
             f"{py} -m pip install --no-cache-dir --upgrade "
-            "huggingface-hub transformers tokenizers safetensors datasets "
+            "huggingface-hub hf_transfer transformers tokenizers safetensors datasets "
             "numpy Pillow marisa-trie pydantic kbnf formatron rich tqdm "
             "psutil sentencepiece pyyaml typing_extensions",
         )
@@ -893,17 +1031,21 @@ class RunPodProvider(Provider):
         # 2. Locate the remote quant script. On pre-baked images it lives
         # at /opt/blockquant/quant.py; otherwise we SFTP the canonical
         # source from `remote/quant.py`.
+        # ALWAYS upload the current remote/quant.py, even on pre-baked images.
+        # The baked copy can lag the repo (the image is rebuilt rarely), and a
+        # stale quant.py silently loses fixes like the download heartbeat. The
+        # script is a few KB, so re-uploading costs nothing. When a baked copy
+        # exists we overwrite it in place so cards.py stays a sibling; otherwise
+        # we drop it at /root. This way the image gives us fast deps while the
+        # code is always canonical.
         check = self.run(
             instance_id,
             f"test -f {self._BAKED_REMOTE_QUANT} && echo BAKED || echo MISSING",
         )
-        if "BAKED" in check["stdout"]:
-            script_path = self._BAKED_REMOTE_QUANT
-            logger.info(f"Using pre-baked quant script at {script_path}")
-        else:
-            script_path = REMOTE_SCRIPT
-            self._upload_bytes(instance_id, self._load_quant_script(), script_path)
-            self.run(instance_id, f"chmod +x {script_path}")
+        script_path = self._BAKED_REMOTE_QUANT if "BAKED" in check["stdout"] else REMOTE_SCRIPT
+        self._upload_bytes(instance_id, self._load_quant_script(), script_path)
+        self.run(instance_id, f"chmod +x {script_path}")
+        logger.info(f"Uploaded current quant script to {script_path}")
 
         # Ship the card renderer + template next to the script (idempotent;
         # gives even pre-baked pods the current card without an image rebuild).
@@ -922,23 +1064,40 @@ class RunPodProvider(Provider):
             f"nohup setsid {self._remote_py} {script_path} "
             f"> {REMOTE_LOG} 2>&1 < /dev/null & echo $!"
         )
-        result = self.run(instance_id, launch_cmd)
-        if result["code"] != 0:
-            return {"status": "failed", "error": f"launch failed: {result['stderr'][:2000]}"}
-        logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip()})")
+        # Detached: a normal run() here blocks on recv_exit_status until the
+        # backgrounded process releases the channel (minutes), freezing the
+        # progress poll. run_detached returns as soon as the pid is echoed.
+        result = self.run_detached(instance_id, launch_cmd)
+        logger.info(f"Remote pipeline started on {instance_id} (pid={result['stdout'].strip() or '?'})")
         return {"status": "started"}
 
-    def get_progress(self, instance_id: str, lines: int = 30) -> str:
-        """Return the tail of the remote log for progress reporting.
+    # Progress markers worth streaming to the controller/embed. Everything else
+    # in the log (exllamav3's per-submodule "Quantized: ...experts.N..." flood —
+    # hundreds of lines per MoE layer) is dropped so it can't drown the clean
+    # [progress] heartbeat or overwhelm the controller->bot stream, which left
+    # the embed frozen on a 35B MoE. The [progress] line already carries the
+    # quantize stage + percent, so we don't need the per-layer flood.
+    _PROGRESS_MARKERS = (
+        r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
+        r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
+    )
 
-        ``lines`` defaults to 30 for cheap routine polling; pass a larger
-        value (e.g. 500) for a final drain after the run completes so the
-        last batch of post-quantize + upload output is captured locally.
+    def get_progress(self, instance_id: str, lines: int = 15, raw: bool = False) -> str:
+        """Return recent progress-marker lines from the remote log.
+
+        By default the log is filtered to the meaningful markers (see
+        _PROGRESS_MARKERS) so the MoE per-submodule flood can't bury the
+        heartbeat. Pass ``raw=True`` (and a larger ``lines``) for a final drain
+        after the run to capture the full unfiltered tail.
         """
-        result = self.run(
-            instance_id,
-            f"tail -n {int(lines)} {REMOTE_LOG} 2>/dev/null || echo NO_LOG",
-        )
+        if raw:
+            cmd = f"tail -n {int(lines)} {REMOTE_LOG} 2>/dev/null || echo NO_LOG"
+        else:
+            cmd = (
+                f"grep -aE '{self._PROGRESS_MARKERS}' {REMOTE_LOG} 2>/dev/null "
+                f"| tail -n {int(lines)} || echo NO_LOG"
+            )
+        result = self.run(instance_id, cmd)
         return result["stdout"]
 
     def is_pipeline_running(self, instance_id: str) -> bool:

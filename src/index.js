@@ -7,8 +7,28 @@ import { commands } from './commands/definitions.js';
 import { routeCommand } from './commands/router.js';
 import { getJobStatus, pollJob } from './services/api-client.js';
 import * as embeds from './utils/embeds.js';
+import { listPods, terminatePod } from './services/runpod.js';
 
 const log = getLogger('bot');
+
+// Safety net: every RunPod controller names its pod `bq-<pid>-...`. If that
+// controller process is gone, the pod is orphaned (no one will terminate it).
+// Sweep periodically and kill any such pod so a dead/crashed controller can
+// never leave a pod billing. Only ever touches `bq-`-prefixed pods.
+function controllerAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+async function reapOrphans() {
+  let pods;
+  try { pods = await listPods(); } catch { return; }
+  for (const p of pods) {
+    const m = (p.name || '').match(/^bq-(\d+)-/);
+    if (!m) continue;
+    if (controllerAlive(Number(m[1]))) continue;
+    const ok = await terminatePod(p.id);
+    log.warn(`Reaped orphan pod ${p.id} (dead controller pid ${m[1]}): ${ok ? 'terminated' : 'FAILED'}`);
+  }
+}
 
 function trimPresence(text, max = 128) {
   return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
@@ -47,21 +67,6 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
-});
-
-// ── EXP on Message ──────────────────────────────────────────────────────────
-
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  try {
-    const users = await db.loadUsers();
-    const id = message.author.id;
-    if (!users[id]) users[id] = { exp: 0, lastQuant: 0 };
-    users[id].exp += 1;
-    await db.saveUsers(users);
-  } catch (err) {
-    log.debug(`EXP save failed: ${err.message}`);
-  }
 });
 
 // ── Command Handling ────────────────────────────────────────────────────────
@@ -169,9 +174,21 @@ async function start() {
   // 2. Init job queue
   jobQueue.setPresenceUpdater((payload) => applyPresence(client, payload));
   jobQueue.init();
-  const recoveredCount = await jobQueue.recoverPersistedJobs();
-  if (recoveredCount > 0) {
-    log.info(`Recovered ${recoveredCount} persisted job(s) after startup`);
+  // Do NOT auto-re-run persisted jobs on restart. RunPod runs are driven by
+  // separate controller processes that don't survive a bot restart, and the old
+  // recover path re-enqueued them to the LOCAL quantizer (a 70GB download on the
+  // host). Just mark any leftover non-terminal job interrupted; the operator
+  // re-fires what they want.
+  const stale = await db.listRecoverableJobs();
+  for (const job of stale) {
+    await db.patchJob(job.id, {
+      status: db.JOB_STATUS.failed,
+      error: 'interrupted by bot restart',
+      failedAt: Date.now(),
+    });
+  }
+  if (stale.length) {
+    log.info(`Marked ${stale.length} interrupted job(s) on startup (not re-run)`);
   }
 
   // 3. Recover API jobs (so restart doesn't orphan running Celery tasks)
@@ -182,6 +199,11 @@ async function start() {
 
   // 4. Login
   await client.login(config.BOT_TOKEN);
+
+  // 5. Orphan reaper: sweep on startup (catches pods leaked by a crashed
+  // previous session) and every 2 min thereafter.
+  reapOrphans().catch(() => {});
+  setInterval(() => reapOrphans().catch(() => {}), 120_000);
 }
 
 // ── Graceful Shutdown ───────────────────────────────────────────────────────

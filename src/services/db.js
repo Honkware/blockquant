@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'fs/promises';
 import path from 'path';
 import config from '../config.js';
 import { getLogger } from '../logger.js';
@@ -19,19 +19,32 @@ async function ensureDir() {
 }
 
 async function load(filename) {
+  let raw;
   try {
-    const raw = await readFile(path.join(dataDir, filename), 'utf8');
-    return JSON.parse(raw);
+    raw = await readFile(path.join(dataDir, filename), 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT') return {};
-    log.error(`Failed to load ${filename}`, { error: err.message });
-    throw err;
+    log.error(`Failed to read ${filename}, treating as empty`, { error: err.message });
+    return {};
+  }
+  // An empty or truncated file must never crash startup; treat it as empty.
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    log.error(`Corrupt ${filename}, treating as empty`, { error: err.message });
+    return {};
   }
 }
 
 async function saveRaw(filename, data) {
   await ensureDir();
-  await writeFile(path.join(dataDir, filename), JSON.stringify(data, null, 2));
+  // Atomic write: serialize to a temp file then rename, so a reader (or a
+  // concurrent writer) can never observe a half-written / truncated file.
+  const target = path.join(dataDir, filename);
+  const tmp = `${target}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, target);
 }
 
 async function save(filename, data) {
@@ -44,21 +57,17 @@ async function save(filename, data) {
 
 const FILES = { users: 'users.json', models: 'models.json' };
 const JOB_STATUS = Object.freeze({
+  pending_approval: 'pending_approval',
   queued: 'queued',
   running: 'running',
   interrupted: 'interrupted',
   failed: 'failed',
   completed: 'completed',
+  rejected: 'rejected',
 });
 
-export async function loadUsers() {
-  return load(FILES.users);
-}
 export async function loadModels() {
   return load(FILES.models);
-}
-export async function saveUsers(d) {
-  return save(FILES.users, d);
 }
 export async function saveModels(d) {
   return save(FILES.models, d);
@@ -97,64 +106,6 @@ export async function patchJob(jobId, patch) {
     };
     await saveRaw('jobs.json', jobs);
     return jobs[jobId];
-  });
-}
-
-export async function chargeForJob({ jobId, userId, cost }) {
-  return enqueue(async () => {
-    const jobs = await loadJobs();
-    const users = await loadUsers();
-    const job = jobs[jobId];
-    if (!job) throw new Error(`Unknown job: ${jobId}`);
-
-    const user = users[userId] ?? { exp: 0, lastQuant: 0 };
-    if (job.chargedAt) {
-      return { charged: false, balance: user.exp };
-    }
-    if (user.exp < cost) {
-      return { charged: false, balance: user.exp, insufficient: true };
-    }
-
-    user.exp -= cost;
-    user.lastQuant = Date.now();
-    users[userId] = user;
-
-    jobs[jobId] = {
-      ...job,
-      chargedAt: Date.now(),
-      cost,
-      updatedAt: Date.now(),
-    };
-
-    await saveRaw(FILES.users, users);
-    await saveRaw('jobs.json', jobs);
-    return { charged: true, balance: user.exp };
-  });
-}
-
-export async function refundForJob({ jobId, userId, cost }) {
-  return enqueue(async () => {
-    const jobs = await loadJobs();
-    const users = await loadUsers();
-    const job = jobs[jobId];
-    if (!job) throw new Error(`Unknown job: ${jobId}`);
-    if (!job.chargedAt || job.refundedAt) {
-      return { refunded: false, balance: users[userId]?.exp ?? 0 };
-    }
-
-    const user = users[userId] ?? { exp: 0, lastQuant: 0 };
-    user.exp += cost;
-    users[userId] = user;
-
-    jobs[jobId] = {
-      ...job,
-      refundedAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    await saveRaw(FILES.users, users);
-    await saveRaw('jobs.json', jobs);
-    return { refunded: true, balance: user.exp };
   });
 }
 

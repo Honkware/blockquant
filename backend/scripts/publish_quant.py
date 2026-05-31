@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,24 +44,31 @@ sys.path.insert(0, str(REPO_ROOT / "backend" / "src"))
 from blockquant import cards  # noqa: E402  (after sys.path setup)
 
 FIX_SCRIPT = REPO_ROOT / "backend" / "scripts" / "fix_repo_card_and_config.py"
-
 DEFAULT_VARIANTS = "3.0,4.0,4.5,5.0,6.0"
 
 
 def _real_size_gb(api, repo_id: str) -> float | None:
-    """Sum of every file in the repo. Returns None when the repo doesn't
-    exist yet OR is mid-upload (config.json not yet pushed) — either way
-    we treat it as 'not published' for table-rendering purposes."""
+    """Sum of every file in the repo, or None when the repo does not exist yet
+    or is mid-upload (config.json not pushed). Treated as 'not published'."""
     try:
         info = api.model_info(repo_id, files_metadata=True)
         names = {s.rfilename for s in info.siblings}
-        # The in-pod uploader pushes safetensors before config.json.
-        # If config.json is missing, the upload is still in flight.
         if "config.json" not in names:
             return None
         return sum((s.size or 0) for s in info.siblings) / 1e9
     except Exception:
         return None
+
+
+def _load_base_config(base_repo: str, token: str) -> dict:
+    """Fetch the base model's config.json for architecture facts."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(base_repo, "config.json", token=token or None)
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[dict]:
@@ -76,17 +84,6 @@ def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[d
     return rows
 
 
-def _load_base_config(base_repo: str, token: str) -> dict:
-    """Fetch the base model's config.json for architecture facts."""
-    try:
-        from huggingface_hub import hf_hub_download
-
-        path = hf_hub_download(base_repo, "config.json", token=token or None)
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
 def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
     """Hand the rendered card to fix_repo_card_and_config.py via --card-file
     so config.json's bits coercion stays in one place."""
@@ -97,9 +94,7 @@ def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
     try:
         cmd = [
             sys.executable, str(FIX_SCRIPT),
-            "--repo", repo_id,
-            "--base", base_repo,
-            "--bpw", bpw,
+            "--repo", repo_id, "--base", base_repo, "--bpw", bpw,
             "--card-file", tmp_path,
         ]
         print(f"[publish] -> {' '.join(cmd)}", flush=True)
@@ -108,18 +103,39 @@ def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
         os.unlink(tmp_path)
 
 
+def _discover_variants(api, base_name: str, hf_org: str) -> list[str]:
+    """Every bpw we actually published for this base, found by listing the org's
+    repos. Scoped to ``{hf_org}/{base_name}-exl3-<bpw>bpw`` so it only ever picks
+    up our own quants of THIS model (never another model or someone else's repo).
+    """
+    pat = re.compile(rf"^{re.escape(hf_org)}/{re.escape(base_name)}-exl3-([0-9.]+)bpw$")
+    found = []
+    try:
+        for m in api.list_models(author=hf_org, limit=1000):
+            rid = getattr(m, "id", None) or getattr(m, "modelId", "") or ""
+            mm = pat.match(rid)
+            if mm:
+                found.append(mm.group(1))
+    except Exception as e:
+        print(f"[publish] discovery failed ({e}); falling back to --variants", flush=True)
+        return []
+    return sorted(set(found), key=lambda x: float(x))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Finalize EXL3 cards + collection for a model.")
     ap.add_argument("--base", required=True,
                     help="Base model repo, e.g. huihui-ai/Huihui-Qwen3.6-35B-A3B-...-abliterated")
     ap.add_argument("--hf-org", default="",
                     help="Namespace the quants live under (default: the token owner).")
-    ap.add_argument("--variants", default=DEFAULT_VARIANTS,
-                    help="Comma list of bpws to consider; only those present on HF are rendered.")
+    ap.add_argument("--variants", default="",
+                    help="Comma list of bpws to cross-link. Default: auto-discover "
+                         "exactly the bpws we published for this model under --hf-org "
+                         "(so it never includes variants we didn't make).")
     ap.add_argument("--collection", default="auto",
                     help="'auto' to create/reuse a per-model collection, a collection slug to "
                          "add to, or 'off' to skip collections.")
-    ap.add_argument("--cal-rows", type=int, default=512,
+    ap.add_argument("--cal-rows", type=int, default=250,
                     help="Calibration rows shown in the recipe table.")
     ap.add_argument("--head-bits", type=int, default=8)
     ap.add_argument("--title", default=None,
@@ -140,11 +156,15 @@ def main():
         print("ERROR: could not resolve HF org (pass --hf-org)"); sys.exit(1)
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    if not variants:
+        variants = _discover_variants(api, base_name, hf_org)
+        print(f"[publish] discovered our variants on HF: {', '.join(variants) or 'none'}", flush=True)
     model_config = _load_base_config(args.base, token)
     license_id = cards.fetch_license(args.base, token)
     quant_rows = _quant_rows(api, base_name, hf_org, variants, args.cal_rows, args.head_bits)
 
-    # Resolve the collection slug once, up front.
+    # Resolve the collection slug once, up front. Splitting create from add keeps
+    # parallel finalizes concurrency-safe (each adds its own repo to one slug).
     if args.collection == "off":
         slug = ""
     elif args.collection == "auto":
