@@ -99,7 +99,12 @@ export function jobComplete({ url, userId, results }) {
       : r.error
         ? `Error: ${truncate(r.error, 60)}`
         : 'No URL';
-    return `${icon}  **${r.bpw} bpw** — ${r.duration} — ${link}`;
+    // Join only the parts we actually have, so an empty duration (the RunPod
+    // path doesn't set one) doesn't render a doubled "— —" separator.
+    const parts = [`${icon}  **${r.bpw} bpw**`];
+    if (r.duration) parts.push(r.duration);
+    parts.push(link);
+    return parts.join(' — ');
   });
 
   const embed = new EmbedBuilder()
