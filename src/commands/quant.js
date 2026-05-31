@@ -16,7 +16,7 @@ import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
-import { runViaCli, finalizeCollection } from '../services/runpodCli.js';
+import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 
 const log = getLogger('cmd:quant');
 
@@ -394,28 +394,31 @@ export async function runApprovedJob({ interaction, job }) {
         completedAt: Date.now(),
         partialResults: results,
       });
-
-      // Re-sync ALL of this model's EXL3 cards + collection, so variants done
-      // in separate runs (or earlier) cross-reference each other. Run it for any
-      // exl3 job regardless of what THIS run's result tracking says: the
-      // finalizer discovers the actual uploaded repos from HF, so it still
-      // cross-links variants even when a controller died/was marked failed but
-      // the quant had already uploaded. Best-effort: never fails the job.
-      if (format === 'exl3') {
-        try {
-          await thread.send('Cross-linking model cards + collection...');
-          const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
-          await thread.send(
-            fin.ok
-              ? `Cards cross-linked${fin.collectionUrl ? ` · [collection](${fin.collectionUrl})` : ''}.`
-              : 'Cross-link/collection step had an issue (any uploaded quants are still on HF).'
-          );
-        } catch (e) {
-          log.debug(`finalize step failed: ${e.message}`);
-        }
-      }
     } catch (err) {
       log.error('Completion callback error', { error: err.message });
+    }
+
+    // Re-sync ALL of this model's EXL3 cards + collection, so variants done in
+    // separate runs (or earlier) cross-reference each other. Run it for any
+    // exl3 job regardless of what THIS run's result tracking says: the finalizer
+    // discovers the actual uploaded repos from HF, so it cross-links whatever
+    // actually landed even when a controller died/was killed but the quant had
+    // already uploaded. Hoisted OUT of the try above (and the thread sends made
+    // non-fatal) so a dead thread / deleted progress message -- common when a
+    // job is force-cancelled, which is exactly when the cross-link was getting
+    // skipped -- can't stop the cross-link from running. Best-effort.
+    if (format === 'exl3') {
+      try {
+        await thread.send('Cross-linking model cards + collection...').catch(() => {});
+        const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
+        await thread.send(
+          fin.ok
+            ? `Cards cross-linked${fin.collectionUrl ? ` · [collection](${fin.collectionUrl})` : ''}.`
+            : 'Cross-link/collection step had an issue (any uploaded quants are still on HF).'
+        ).catch(() => {});
+      } catch (e) {
+        log.debug(`finalize step failed: ${e.message}`);
+      }
     }
   }
 
@@ -466,43 +469,39 @@ export async function runApprovedJob({ interaction, job }) {
     // (SSH/API blip, rate limit) that spikes under concurrency; a fresh attempt
     // almost always succeeds, and it self-heals in the embed instead of leaving
     // a dead "Failed" line. Each attempt's pod self-terminates, so retries
-    // never stack cost.
+    // never stack cost. The retry gate (err.retryable !== false) lives in
+    // runVariantWithRetry: a signal-killed or pod-created failure is terminal,
+    // so cancelling a broken model can't respawn a controller (the runaway).
     const MAX_ATTEMPTS = 3;
     async function runVariant(v) {
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        try {
-          const res = await runViaCli({
-            modelId,
-            variants: [v],
-            hfOrg: config.HF_ORG,
-            calRows: 250,
-            onProgress: (d) => {
-              pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
-              renderParallel();
-            },
-          });
-          const url = res && res[0] ? res[0].url : null;
-          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url };
-          renderParallel();
-          return res;
-        } catch (err) {
-          log.error(`RunPod CLI failed for ${v} bpw (attempt ${attempt}/${MAX_ATTEMPTS})`, {
-            error: err.message,
-          });
-          // Retry only transient launch failures (no pod was ever created).
-          // A pod that booted and then failed means the quant itself errored;
-          // retrying just boots another pod that fails the same way (the
-          // runaway we saw on the crashing arch), so surface it instead.
-          if (attempt < MAX_ATTEMPTS && err.retryable !== false) {
-            pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${attempt + 1}/${MAX_ATTEMPTS}` };
+      try {
+        return await runVariantWithRetry(v, {
+          maxAttempts: MAX_ATTEMPTS,
+          run: async () => {
+            const res = await runViaCli({
+              modelId,
+              variants: [v],
+              hfOrg: config.HF_ORG,
+              calRows: 250,
+              onProgress: (d) => {
+                pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+                renderParallel();
+              },
+            });
+            const url = res && res[0] ? res[0].url : null;
+            pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url };
             renderParallel();
-            await new Promise((r) => setTimeout(r, 5000));
-            continue;
-          }
-          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
-          renderParallel();
-          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
-        }
+            return res;
+          },
+          onRetry: (next, max) => {
+            pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${next}/${max}` };
+            renderParallel();
+          },
+        });
+      } catch (err) {
+        pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+        renderParallel();
+        return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
       }
     }
 

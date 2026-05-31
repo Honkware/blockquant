@@ -24,6 +24,56 @@ const RE = {
 };
 
 /**
+ * Decide whether a failed controller run is worth re-spawning a pod for. ONLY a
+ * genuine launch/stock failure is: a clean (non-signal) exit where no pod was
+ * ever created. Two cases are terminal and must NOT respawn:
+ *   - signal != null: the controller was killed (operator cancel of a broken
+ *     model, or bot shutdown). A controller that hits a real error exits with a
+ *     code; it never signals itself, so a signal is always a deliberate kill.
+ *     Respawning here is the runaway: cancelling a job boots a fresh pod for it.
+ *   - podId set: a pod booted and the run still failed, so the quant itself
+ *     errored (e.g. an unsupported arch on this exllamav3) and another pod just
+ *     fails the same way.
+ * A transient network blip does NOT kill the controller (it surfaces as a
+ * non-zero exit before any pod, handled inside run_runpod_job.py), so it stays
+ * retryable.
+ */
+export function isControllerRetryable({ signal, podId }) {
+  return signal == null && !podId;
+}
+
+/**
+ * Run one variant on its own pod via `run`, retrying ONLY a transient launch
+ * failure. A failure is retried when err.retryable !== false (set by runViaCli's
+ * close handler / isControllerRetryable): a clean exit before any pod existed. A
+ * signal-killed or pod-created failure is terminal, so a cancelled or broken job
+ * never respawns a pod. `run(attempt)` is called once per attempt; `onRetry` (if
+ * given) fires before each wait. Resolves run()'s result, or rethrows the last
+ * error after the final attempt. `sleep` is injectable so tests don't wait.
+ */
+export async function runVariantWithRetry(
+  variant,
+  { run, maxAttempts = 3, retryDelayMs = 5000, onRetry, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }
+) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await run(attempt);
+    } catch (err) {
+      lastErr = err;
+      log.error(`variant ${variant} failed (attempt ${attempt}/${maxAttempts}): ${err.message}`);
+      if (attempt < maxAttempts && err.retryable !== false) {
+        onRetry?.(attempt + 1, maxAttempts);
+        await sleep(retryDelayMs);
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Run an EXL3 quant on RunPod by driving the hardened CLI
  * (backend/scripts/run_runpod_job.py), which auto-sizes disk, auto-selects a
  * cheap GPU, self-terminates the pod, and streams remote progress to stdout.
@@ -172,7 +222,9 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     child.stderr.on('data', (c) => log.debug(`[cli] ${c.toString().trim().slice(0, 200)}`));
 
     child.on('error', reject);
-    child.on('close', (code) => {
+    // close passes (code, signal): on a signal kill (operator cancel, bot
+    // shutdown) code is null and signal is the name, e.g. 'SIGKILL'.
+    child.on('close', (code, signal) => {
       const out = variants.map((v) => {
         const url = results.get(v) || null;
         return {
@@ -183,19 +235,26 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
           pushed: !!url,
           reused: false,
           duration: '',
-          error: url ? null : code === 0 ? 'no upload URL seen' : `cli exit ${code}`,
+          error: url
+            ? null
+            : signal
+              ? `cli killed (${signal})`
+              : code === 0
+                ? 'no upload URL seen'
+                : `cli exit ${code}`,
         };
       });
       if (results.size > 0) {
         resolve(out); // full or partial success
       } else {
-        const err = new Error(`run_runpod_job.py exited ${code} with no uploads`);
-        // Only a launch/stock failure (we never got a pod) is worth retrying.
-        // If a pod WAS created and the run still failed, the quant itself
-        // errored (e.g. an unsupported arch on this exllamav3) — retrying just
-        // boots another pod that fails the same way, which is the runaway we
-        // saw. Mark those non-retryable so runVariant surfaces them instead.
-        err.retryable = !podId;
+        const err = new Error(
+          signal
+            ? `run_runpod_job.py killed by ${signal} with no uploads`
+            : `run_runpod_job.py exited ${code} with no uploads`
+        );
+        err.signal = signal || null;
+        err.podCreated = !!podId;
+        err.retryable = isControllerRetryable({ signal, podId });
         reject(err);
       }
     });
