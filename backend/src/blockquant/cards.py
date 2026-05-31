@@ -238,39 +238,60 @@ def fetch_license(base_repo: str, token: str | None = None) -> str:
         return "other"
 
 
-def ensure_collection(
-    *, owner: str, base_name: str, token: str, item_repo_ids: list[str] | None = None
-) -> str:
-    """Create (idempotently) a per-model EXL3 collection and add repos to it.
+def collection_url(slug: str) -> str:
+    return f"https://huggingface.co/collections/{slug}" if slug else ""
 
-    Returns the collection URL, or the owner's collections page as a fallback
-    if the API call fails for any reason.
+
+def create_model_collection(*, owner: str, base_name: str, token: str) -> str:
+    """Create-or-reuse the per-model EXL3 collection. Returns its slug, or "".
+
+    Do this once, before fanning out parallel jobs. Creating is the part that
+    races when many pods start at once; adding (below) is safe to do
+    concurrently, so parallel jobs only ever add.
     """
-    fallback = f"https://huggingface.co/{owner}"
     try:
-        from huggingface_hub import (
-            add_collection_item,
-            create_collection,
-        )
+        from huggingface_hub import create_collection
 
-        collection = create_collection(
+        coll = create_collection(
             title=f"{base_name} EXL3",
             namespace=owner,
             description=f"EXL3 quants of {base_name}, produced by BlockQuant.",
             exists_ok=True,
             token=token,
         )
-        for repo_id in item_repo_ids or []:
-            try:
-                add_collection_item(
-                    collection_slug=collection.slug,
-                    item_id=repo_id,
-                    item_type="model",
-                    token=token,
-                    exists_ok=True,
-                )
-            except Exception:
-                pass
-        return f"https://huggingface.co/collections/{collection.slug}"
+        return coll.slug
     except Exception:
-        return fallback
+        return ""
+
+
+def add_to_collection(slug: str, repo_id: str, token: str) -> None:
+    """Add a repo to an existing collection. Idempotent and concurrency-safe."""
+    if not slug:
+        return
+    try:
+        from huggingface_hub import add_collection_item
+
+        add_collection_item(
+            collection_slug=slug, item_id=repo_id, item_type="model",
+            token=token, exists_ok=True,
+        )
+    except Exception:
+        pass
+
+
+def ensure_collection(
+    *, owner: str, base_name: str, token: str, item_repo_ids: list[str] | None = None
+) -> str:
+    """Create-or-reuse the collection and add repos. Returns the URL, or the
+    owner's page on failure.
+
+    For a single run that owns every variant. Parallel runs should instead
+    create the collection once with create_model_collection() and have each
+    job add itself with add_to_collection(), to avoid the create race.
+    """
+    slug = create_model_collection(owner=owner, base_name=base_name, token=token)
+    if not slug:
+        return f"https://huggingface.co/{owner}"
+    for repo_id in item_repo_ids or []:
+        add_to_collection(slug, repo_id, token)
+    return collection_url(slug)

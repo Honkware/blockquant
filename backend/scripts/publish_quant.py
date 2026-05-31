@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Finalize EXL3 cards and the collection for a model.
 
-Run this once after the quants are uploaded (parallel pods or a single run).
-For the given base model it:
+Run this once after the quants have been uploaded (one variant per pod in a
+parallel run, or all variants in a single run). For the given base model it:
 
   1. Queries HuggingFace for which ``-exl3-{bpw}bpw`` repos exist and their
      real sizes.
@@ -12,7 +12,8 @@ For the given base model it:
      ``fix_repo_card_and_config.py --card-file``.
   4. Creates or reuses the per-model collection and adds every repo to it.
 
-Model-agnostic and idempotent, so it doubles as a resync.
+This is model-agnostic and idempotent, so it doubles as a resync: re-run it
+any time to bring every card's table back in sync.
 
 Usage::
 
@@ -71,6 +72,7 @@ def _load_base_config(base_repo: str, token: str) -> dict:
 
 
 def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[dict]:
+    """Build the Quants-table rows from which sibling repos exist on HF."""
     rows = []
     for v in variants:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
@@ -130,7 +132,11 @@ def main():
                     help="Comma list of bpws to cross-link. Default: auto-discover "
                          "exactly the bpws we published for this model under --hf-org "
                          "(so it never includes variants we didn't make).")
-    ap.add_argument("--cal-rows", type=int, default=250)
+    ap.add_argument("--collection", default="auto",
+                    help="'auto' to create/reuse a per-model collection, a collection slug to "
+                         "add to, or 'off' to skip collections.")
+    ap.add_argument("--cal-rows", type=int, default=250,
+                    help="Calibration rows shown in the recipe table.")
     ap.add_argument("--head-bits", type=int, default=8)
     ap.add_argument("--title", default=None,
                     help="Hand-curated card heading; auto-derived from the name when omitted.")
@@ -157,29 +163,37 @@ def main():
     license_id = cards.fetch_license(args.base, token)
     quant_rows = _quant_rows(api, base_name, hf_org, variants, args.cal_rows, args.head_bits)
 
+    # Resolve the collection slug once, up front. Splitting create from add keeps
+    # parallel finalizes concurrency-safe (each adds its own repo to one slug).
+    if args.collection == "off":
+        slug = ""
+    elif args.collection == "auto":
+        slug = cards.create_model_collection(owner=hf_org, base_name=base_name, token=token)
+    else:
+        slug = args.collection
+    coll_url = cards.collection_url(slug) or f"https://huggingface.co/{hf_org}"
+
     published = [r["variant"] for r in quant_rows if r["size_gb"] is not None]
     if not published:
-        print("[publish] no uploaded variants found on HF for this model yet."); sys.exit(1)
-    repo_ids = [f"{hf_org}/{base_name}-exl3-{v}bpw" for v in published]
-
-    # Create-or-reuse the collection and add every repo (idempotent).
-    coll_url = cards.ensure_collection(
-        owner=hf_org, base_name=base_name, token=token, item_repo_ids=repo_ids,
-    )
+        print("[publish] no uploaded variants found on HF for this model yet.")
+        sys.exit(1)
     print(f"[publish] finalizing cards for: {', '.join(published)}", flush=True)
 
     for v in published:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
+        size_gb = _real_size_gb(api, repo_id)
         rendered = cards.render_exl3_card(
             base_repo=args.base, repo_id=repo_id, variant=v,
-            head_bits=args.head_bits, cal_rows=args.cal_rows,
-            size_gb=_real_size_gb(api, repo_id), model_config=model_config,
-            quant_rows=quant_rows, collection_url=coll_url, license_id=license_id,
+            head_bits=args.head_bits, cal_rows=args.cal_rows, size_gb=size_gb,
+            model_config=model_config, quant_rows=quant_rows,
+            collection_url=coll_url, license_id=license_id,
             quantized_by=hf_org, title_override=args.title,
         )
         _push_card(repo_id, args.base, v, rendered)
+        cards.add_to_collection(slug, repo_id, token)
         print(f"[publish] {v} bpw done -> https://huggingface.co/{repo_id}", flush=True)
-    print(f"[publish] collection: {coll_url}", flush=True)
+    if slug:
+        print(f"[publish] collection: {coll_url}", flush=True)
 
 
 if __name__ == "__main__":
