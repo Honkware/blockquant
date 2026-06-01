@@ -440,6 +440,7 @@ def main():
     chosen_gpu = None
     chosen_cloud = None
     hourly = 0.0
+    ssh = None
     last_err = None
     _price_cache: dict = {}
     sweeps = max(1, args.launch_retries)
@@ -493,10 +494,35 @@ def main():
                 print(f"      {label} ({type(e).__name__}: {str(e)[:80]}), falling through", flush=True)
                 last_err = e
                 continue
+            # Got a pod, but RunPod occasionally hands out a dead host that never
+            # exposes SSH. That used to be fatal (sys.exit after a 10-min wait);
+            # instead, confirm it becomes active here and, if not, terminate it
+            # and fall through to the next card. So one bad host can't kill the
+            # run while other stock is free, and the launch budget covers dead
+            # hosts as well as stock-outs.
+            print(f"      Pod ID: {instance_id}  (GPU: {candidate}, {cloud}, ~${rate:.2f}/hr)", flush=True)
+            print("[2/6] Waiting for SSH (up to 10 min)...", flush=True)
+            try:
+                active = attempt.wait_for_active(instance_id)
+            except Exception as e:  # noqa: BLE001
+                active = {"status": "error", "error": str(e)}
+            if active.get("status") != "active":
+                print(f"      pod {instance_id} did not become active "
+                      f"({active.get('status')}); terminating and trying the next card",
+                      flush=True)
+                try:
+                    attempt.terminate(instance_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                last_err = RuntimeError(f"pod did not become active: {active}")
+                instance_id = None
+                continue
             provider = attempt
             chosen_gpu = candidate
             chosen_cloud = cloud
             hourly = rate
+            ssh = active["ssh"]
+            print(f"      SSH ready at {ssh['host']}:{ssh['port']}", flush=True)
             break
         if provider is not None:
             break
@@ -526,18 +552,11 @@ def main():
             hourly = provider.get_cost_per_hour()
         except Exception:
             hourly = 0.0
-    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu}, {chosen_cloud}, ~${hourly:.2f}/hr)")
+    # The chosen pod's "Pod ID" and "SSH ready" lines were already printed during
+    # the sweep, where SSH is now confirmed before a card is accepted.
 
     t_launch = time.time()
     try:
-        print(f"[2/6] Waiting for SSH (up to 10 min)...")
-        active = provider.wait_for_active(instance_id)
-        if active["status"] != "active":
-            print(f"ERROR: pod did not become active: {active}")
-            sys.exit(1)
-        ssh = active["ssh"]
-        print(f"      SSH ready at {ssh['host']}:{ssh['port']}")
-
         print(f"[3/6] Bootstrapping (PyTorch, transformers, exllamav3, flash-attn)...")
         local_exl = None if args.skip_local_exllama else args.local_exllama
         if local_exl is not None and not local_exl.exists():

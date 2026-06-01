@@ -301,6 +301,18 @@ class RunPodProvider(Provider):
             return "GONE"
         return pod.get("desiredStatus", "UNKNOWN")
 
+    def pod_is_gone(self, instance_id: str) -> bool:
+        """True when the pod no longer exists or has reached a terminal state,
+        per the RunPod control plane (not SSH). The poll loop uses this to tell
+        a self-terminated pod (the run finished and the pod tore itself down)
+        apart from a transient SSH blip, so it exits promptly instead of
+        waiting out the whole stall timeout. Fails closed (False) on an API
+        error so a flaky control-plane call can't end a live run early."""
+        try:
+            return self.get_pod_status(instance_id) in self._TERMINAL_STATES
+        except Exception:
+            return False
+
     def terminate(
         self,
         instance_id: str,
