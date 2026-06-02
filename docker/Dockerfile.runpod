@@ -16,7 +16,8 @@ FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3-pip \
@@ -113,14 +114,20 @@ RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 COPY docker/stub_formatron.py /tmp/stub_formatron.py
 RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 
-# ---- Pre-trigger the JIT C++ extension compile ---------------------------
-# ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
-# build time bakes the compiled .so into the image so the pod doesn't pay
-# the ~30s tax on every cold boot. Wrapped in a try so the build still
-# succeeds on a host without GPU access (the actual JIT compile may
-# fail at this stage and re-run on the pod — that's fine, deps are cached).
-RUN python -c "import exllamav3; print('exllamav3 import ok')" \
-    || echo "(JIT skipped at build — will compile on first pod boot)"
+# ---- Bake the compiled CUDA extension into the image ---------------------
+# ExLlamaV3 JIT-compiles its CUDA kernels on first import (~30 min on a cold
+# pod). TORCH_CUDA_ARCH_LIST (set above) lets that compile run here on the
+# GPU-less CI builder, targeting every card the pipeline uses (A100 8.0,
+# 3090/A40/A6000 8.6, RTX 6000 Ada/L40 8.9, H100 9.0). The .so lands in the
+# torch_extensions cache inside the image, and pods inherit the same arch list
+# so the cache key matches and they load it instead of recompiling. MAX_JOBS
+# is capped so the parallel nvcc build does not OOM the 16 GB CI runner.
+RUN MAX_JOBS=2 python -c "import exllamav3; print('exllamav3 import ok')" ; \
+    if find /root/.cache/torch_extensions -name '*.so' | grep -q . ; then \
+        echo "BAKE OK: $(find /root/.cache/torch_extensions -name '*.so' | tr '\n' ' ')" ; \
+    else \
+        echo "BAKE FAILED: no .so produced (pods will compile on first boot)" ; \
+    fi
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
