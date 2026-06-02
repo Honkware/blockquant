@@ -70,7 +70,7 @@ RUN python -m pip install \
 # pre-baked health check still enforces a minimum reported version
 # (_MIN_EXLLAMAV3 in providers/runpod/provider.py); this commit reports 0.0.38.
 ARG EXLLAMAV3_REPO=Honkware/exllamav3
-ARG EXLLAMAV3_REF=add-mellum
+ARG EXLLAMAV3_REF=2338b39cd99ffa0929b49d852addb4c191c9d2ef
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/${EXLLAMAV3_REPO}@${EXLLAMAV3_REF}"
 
