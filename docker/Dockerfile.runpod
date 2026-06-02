@@ -73,6 +73,19 @@ ARG EXLLAMAV3_REF=add-mellum
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/${EXLLAMAV3_REPO}@${EXLLAMAV3_REF}"
 
+# ---- flash-attn (required for sliding-window-attention models) ------------
+# exllamav3's non-flash attention backends all refuse sliding-window attention
+# (torch SDPA, xformers and bighead_scalar return None on is_swa), so a real
+# flash-attn-2 build is mandatory to quantize SWA models like Gemma3 and Mellum.
+# Install the prebuilt wheel matching the installed torch's C++ ABI (no source
+# build). The patch step below stays a no-op while flash_attn imports cleanly.
+RUN python -m pip install --no-cache-dir einops
+ARG FLASH_ATTN_VER=2.7.4.post1
+RUN ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')") \
+    && echo "torch cxx11abi=$ABI" \
+    && python -m pip install --no-cache-dir --no-deps \
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VER}/flash_attn-${FLASH_ATTN_VER}+cu12torch2.6cxx11abi${ABI}-cp311-cp311-linux_x86_64.whl"
+
 # ---- Make exllamav3 import + run without flash-attn -----------------------
 # exllamav3 hard-imports flash_attn in its attention dispatch (no prebuilt
 # wheel for this torch/CUDA). patch_flash_attn.py guards every
