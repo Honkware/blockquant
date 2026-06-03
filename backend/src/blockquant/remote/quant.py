@@ -94,6 +94,26 @@ def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
     }))
 
 
+def _ensure_fast_tokenizer(model_dir: Path) -> None:
+    """exllamav3's Tokenizer loads tokenizer.json (the fast format). Some models
+    ship only the legacy vocab.json + merges.txt (e.g. LocateAnything's Qwen2
+    tokenizer), so build tokenizer.json from them via transformers when absent.
+    """
+    if (model_dir / "tokenizer.json").exists():
+        return
+    from transformers import AutoTokenizer
+    last = None
+    for kw in ({"use_fast": True}, {"use_fast": True, "trust_remote_code": True}):
+        try:
+            tok = AutoTokenizer.from_pretrained(str(model_dir), **kw)
+            tok.save_pretrained(str(model_dir))
+            print("[tokenizer] built tokenizer.json from legacy vocab/merges", flush=True)
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+    print(f"[tokenizer] WARN could not build tokenizer.json: {last}", flush=True)
+
+
 def _write_cards(outputs, model_id, model_name, owner, hf_token,
                  head_bits, cal_rows, model_dir) -> None:
     """Render the polished card into each output dir before upload."""
@@ -241,6 +261,7 @@ def main() -> int:
         print("[download] complete", flush=True)
 
         _qwen2vl_preprocessor_shim(model_dir)
+        _ensure_fast_tokenizer(model_dir)
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
 
