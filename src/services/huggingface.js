@@ -227,6 +227,16 @@ export async function preflight(modelUrl) {
   });
   try {
     const result = JSON.parse(raw.trim().split('\n').pop());
+    if (result.archSupported === false) {
+      throw new AppError('ARCH_UNSUPPORTED', result.error || 'Unsupported architecture', {
+        publicMessage: result.error,
+      });
+    }
+    if (result.accessDenied) {
+      throw new AppError('ACCESS_DENIED', result.error || 'No access to model', {
+        publicMessage: result.error,
+      });
+    }
     if (result.error) throw new AppError('AUTH_INVALID', result.error);
     return result;
   } catch (err) {
