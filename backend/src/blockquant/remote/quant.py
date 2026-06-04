@@ -114,6 +114,48 @@ def _ensure_fast_tokenizer(model_dir: Path) -> None:
     print(f"[tokenizer] WARN could not build tokenizer.json: {last}", flush=True)
 
 
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 40,
+                 timeout: int = 2400) -> float | None:
+    """KL-divergence of the quant against the fp16 source, for the card.
+
+    Runs exllamav3's model_diff (vendored into the image next to this file) in
+    a subprocess. model_diff streams both models module-by-module, so it never
+    holds the full fp16 and quant in VRAM at once; that keeps the eval viable on
+    the same pod that just quantized. Parses KL(fp16 || quant), the mean over
+    `rows` wikitext rows. Best-effort: returns None on any failure so a finished
+    quant still uploads without a number.
+    """
+    import subprocess
+    import re as _re
+
+    candidates = [
+        Path(__file__).resolve().parent / "model_diff.py",
+        Path("/opt/blockquant/model_diff.py"),
+    ]
+    diff = next((p for p in candidates if p.exists()), None)
+    if diff is None:
+        print("[kl] WARN model_diff.py not in image, skipping eval", flush=True)
+        return None
+    # -ma is model A, -mb model B; model_diff reports KL(A, B) as
+    # KL(softmax(B) || softmax(A)), so A=quant B=fp16 gives KL(fp16 || quant).
+    cmd = [sys.executable, str(diff),
+           "-ma", str(quant_dir), "-mb", str(fp16_dir), "-r", str(int(rows))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        print(f"[kl] WARN eval skipped: {type(e).__name__}: {e}", flush=True)
+        return None
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-3:])
+        print(f"[kl] WARN eval exit {proc.returncode}: {tail}", flush=True)
+        return None
+    m = _re.search(r"KL divergence \(A, B\):\s*([0-9.]+)", proc.stdout)
+    if not m:
+        print("[kl] WARN no KL value in model_diff output", flush=True)
+        return None
+    return float(m.group(1))
+
+
 def _write_cards(outputs, model_id, model_name, owner, hf_token,
                  head_bits, cal_rows, model_dir) -> None:
     """Render the polished card into each output dir before upload."""
@@ -133,6 +175,7 @@ def _write_cards(outputs, model_id, model_name, owner, hf_token,
             "variant": out["variant"], "head_bits": head_bits,
             "cal_rows": rows_cal, "size_gb": out["_size_gb"],
             "url": f"https://huggingface.co/{repo_id}",
+            "kl_div": out.get("kl_div"),
         })
 
     license_id = cards.fetch_license(model_id, hf_token or None)
@@ -153,6 +196,140 @@ def _write_cards(outputs, model_id, model_name, owner, hf_token,
         print(f"[card] {out['variant']} written", flush=True)
 
 
+def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
+                         head_bits, cal_rows, kl_rows, model_dir, scratch_dir,
+                         max_eval=8) -> None:
+    """Retroactively fill KL for existing sibling quants of the same base.
+
+    The fp16 source is already on the pod, so any {owner}/{model_name}-exl3-Xbpw
+    repo missing a KL number only needs its (small) quant downloaded to measure.
+    Writes bq_quality.json into each, then re-renders every card in the
+    collection so the Quants table carries KL for all bpws. Fully best-effort:
+    the finished quant has already uploaded by the time this runs.
+    """
+    import re as _re
+    import shutil
+    import cards
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+    from huggingface_hub.utils import EntryNotFoundError
+
+    api = HfApi(token=hf_token)
+    rx = _re.compile(rf"^{_re.escape(model_name)}-exl3-([0-9.]+)bpw$")
+    new_variants = {o["variant"] for o in outputs}
+
+    def _repo_size_gb(repo_id: str):
+        try:
+            info = api.model_info(repo_id, files_metadata=True)
+            total = sum((s.size or 0) for s in info.siblings
+                        if s.rfilename.endswith(".safetensors"))
+            return (total / 1e9) or None
+        except Exception:
+            return None
+
+    # variant -> {repo, kl, size_gb}. Seed with this run's new variants.
+    table = {}
+    for o in outputs:
+        repo = f"{owner}/{model_name}-exl3-{o['variant']}bpw"
+        table[o["variant"]] = {"repo": repo, "kl": o.get("kl_div"),
+                               "size_gb": o.get("_size_gb")}
+
+    try:
+        found = list(api.list_models(author=owner, search=f"{model_name}-exl3"))
+    except Exception as e:
+        print(f"[backfill] WARN repo list failed: {e}", flush=True)
+        found = []
+    siblings = []
+    for m in found:
+        mm = rx.match(m.id.split("/")[-1])
+        if mm and mm.group(1) not in new_variants:
+            siblings.append((mm.group(1), m.id))
+
+    if not siblings:
+        print("[backfill] no existing siblings to fill", flush=True)
+        return
+    print(f"[backfill] siblings: {', '.join(v for v, _ in siblings)}", flush=True)
+
+    evaled = 0
+    for v, repo in sorted(siblings, key=lambda x: float(x[0])):
+        size_gb = _repo_size_gb(repo)
+        # Already measured? read it back and skip the eval.
+        existing = None
+        try:
+            qp = hf_hub_download(repo, "bq_quality.json", token=hf_token)
+            existing = json.loads(Path(qp).read_text()).get("kl_div")
+        except EntryNotFoundError:
+            existing = None
+        except Exception:
+            existing = None
+        if existing is not None:
+            table[v] = {"repo": repo, "kl": float(existing), "size_gb": size_gb}
+            print(f"[backfill] {v} already has KL={float(existing):.6f}", flush=True)
+            continue
+        if evaled >= max_eval:
+            print(f"[backfill] eval cap {max_eval} hit, leaving {v} for later",
+                  flush=True)
+            table[v] = {"repo": repo, "kl": None, "size_gb": size_gb}
+            continue
+
+        bdir = scratch_dir / f"backfill-{v}bpw"
+        kl = None
+        try:
+            print(f"[backfill] {v} downloading quant ...", flush=True)
+            snapshot_download(
+                repo, local_dir=str(bdir), token=hf_token,
+                allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model",
+                                "tokenizer*"],
+            )
+            print(f"[backfill] {v} measuring KL vs fp16 ...", flush=True)
+            kl = _kl_div_eval(bdir, model_dir, rows=kl_rows)
+        except Exception as e:
+            print(f"[backfill] {v} eval failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            shutil.rmtree(bdir, ignore_errors=True)
+        if kl is not None:
+            evaled += 1
+            try:
+                api.upload_file(
+                    path_or_fileobj=json.dumps(
+                        {"kl_div": kl, "kl_rows": kl_rows,
+                         "metric": "KL(fp16||quant)"}).encode(),
+                    path_in_repo="bq_quality.json", repo_id=repo,
+                )
+                print(f"[backfill] {v} KL={kl:.6f} -> bq_quality.json", flush=True)
+            except Exception as e:
+                print(f"[backfill] {v} quality upload failed: {e}", flush=True)
+        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb}
+
+    # Re-render every card so the Quants table shows KL for all bpws.
+    try:
+        model_config = json.loads((model_dir / "config.json").read_text())
+    except Exception:
+        model_config = {}
+    rows_cal = int(cal_rows) if cal_rows else 250
+    license_id = cards.fetch_license(model_id, hf_token or None)
+    collection_url = cards.ensure_collection(owner=owner, base_name=model_name,
+                                             token=hf_token)
+    quant_rows = [{
+        "variant": v, "head_bits": head_bits, "cal_rows": rows_cal,
+        "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
+        "kl_div": d["kl"],
+    } for v, d in table.items()]
+    for v, d in sorted(table.items(), key=lambda x: float(x[0])):
+        try:
+            card = cards.render_exl3_card(
+                base_repo=model_id, repo_id=d["repo"], variant=v,
+                head_bits=head_bits, cal_rows=rows_cal, size_gb=d["size_gb"],
+                model_config=model_config, quant_rows=quant_rows,
+                collection_url=collection_url, license_id=license_id,
+                quantized_by=owner,
+            )
+            api.upload_file(path_or_fileobj=card.encode(),
+                            path_in_repo="README.md", repo_id=d["repo"])
+            print(f"[backfill] re-rendered card for {v}", flush=True)
+        except Exception as e:
+            print(f"[backfill] {v} card re-render failed: {e}", flush=True)
+
+
 def main() -> int:
     try:
         cfg = json.loads(Path(CONFIG_PATH).read_text())
@@ -165,6 +342,13 @@ def main() -> int:
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
         cal_cols: int | None = cfg.get("cal_cols")
+        # Post-quant KL-divergence of the quant against the fp16, measured on
+        # the pod where both still live. Opt-in (the controller gates it to an
+        # allowlist) so a bare config never adds eval time. kl_rows trades
+        # accuracy for pod time; backfill_kl also fills existing siblings.
+        kl_eval: bool = bool(cfg.get("kl_eval", False))
+        kl_rows: int = int(cfg.get("kl_rows", 40))
+        backfill_kl: bool = bool(cfg.get("backfill_kl", False))
 
         t0 = time.time()
 
@@ -272,7 +456,14 @@ def main() -> int:
             work_dir = quant_root / f"work-{bpw}"
             if (out_dir / "config.json").exists():
                 print(f"[skip] {variant} exists at {out_dir}", flush=True)
-                outputs.append({"variant": variant, "path": str(out_dir)})
+                rec = {"variant": variant, "path": str(out_dir)}
+                try:
+                    q = json.loads((out_dir / "bq_quality.json").read_text())
+                    if q.get("kl_div") is not None:
+                        rec["kl_div"] = float(q["kl_div"])
+                except Exception:
+                    pass
+                outputs.append(rec)
                 continue
             print(f"[quantize] {variant} bpw ...", flush=True)
             old_argv = sys.argv
@@ -387,7 +578,23 @@ def main() -> int:
                 _q_done.set()
                 _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
-            outputs.append({"variant": variant, "path": str(out_dir)})
+            rec = {"variant": variant, "path": str(out_dir)}
+            if kl_eval:
+                print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
+                kl = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                if kl is not None:
+                    rec["kl_div"] = kl
+                    print(f"[kl] {variant} KL(fp16||quant) = {kl:.6f}", flush=True)
+                    # Persist next to the weights so a later card re-render
+                    # (publish_quant) and retroactive backfill can read it back.
+                    try:
+                        (out_dir / "bq_quality.json").write_text(
+                            json.dumps({"kl_div": kl, "kl_rows": kl_rows,
+                                        "metric": "KL(fp16||quant)"}),
+                            encoding="utf-8")
+                    except Exception:
+                        pass
+            outputs.append(rec)
 
         if hf_token:
             print("[upload] to HuggingFace ...", flush=True)
@@ -459,6 +666,21 @@ def main() -> int:
             except Exception as exc:
                 print(f"[collection] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
             print("[upload] complete", flush=True)
+
+            # Retroactive KL for existing siblings, reusing the fp16 on disk.
+            # Best-effort and runs after the quant has uploaded, so a failure
+            # here can never cost the finished variant.
+            if backfill_kl:
+                try:
+                    _backfill_sibling_kl(
+                        outputs=outputs, model_id=model_id, model_name=model_name,
+                        owner=owner, hf_token=hf_token, head_bits=head_bits,
+                        cal_rows=cal_rows, kl_rows=kl_rows, model_dir=model_dir,
+                        scratch_dir=workspace,
+                    )
+                except Exception:
+                    print("[backfill] WARN skipped:\n" + traceback.format_exc(),
+                          flush=True)
 
         emit_result({
             "status": "complete",

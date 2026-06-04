@@ -144,10 +144,15 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
     not-yet-published (shows an estimate + "queued").
     """
+    has_kl = any(r.get("kl_div") is not None for r in rows)
     header = (
         "| BPW &nbsp; | &nbsp; Head bits &nbsp; | "
-        "&nbsp; Calibration rows &nbsp; | &nbsp; Size &nbsp; | &nbsp; Status |\n"
-        "| :---: | :---: | :---: | ---: | :--- |"
+        "&nbsp; Calibration rows &nbsp; | &nbsp; Size &nbsp; |"
+        + (" &nbsp; KL&nbsp;&divide;&nbsp;fp16 &nbsp; |" if has_kl else "")
+        + " &nbsp; Status |\n"
+        "| :---: | :---: | :---: | ---: |"
+        + (" :---: |" if has_kl else "")
+        + " :--- |"
     )
     body = []
     for row in sorted(rows, key=lambda r: float(r["variant"])):
@@ -166,11 +171,23 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         if is_current:
             size_str = f"**{size_str}**"
         bpw_cell = f"**{v}**" if is_current else v
+        kl_cell = ""
+        if has_kl:
+            kl = row.get("kl_div")
+            kl_str = f"{kl:.4f}" if kl is not None else "&mdash;"
+            if is_current and kl is not None:
+                kl_str = f"**{kl_str}**"
+            kl_cell = f" {kl_str} |"
         body.append(
             f"| {bpw_cell} | {row.get('head_bits', 8)} | "
-            f"{row.get('cal_rows', 250)} | {size_str} | {status} |"
+            f"{row.get('cal_rows', 250)} | {size_str} |{kl_cell} {status} |"
         )
-    return header + "\n" + "\n".join(body)
+    table = header + "\n" + "\n".join(body)
+    if has_kl:
+        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence from the "
+                  "fp16 source over wikitext rows &mdash; lower is closer to the "
+                  "original.</sub>")
+    return table
 
 
 def _render(template: str, ctx: dict) -> str:

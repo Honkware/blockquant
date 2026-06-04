@@ -989,6 +989,10 @@ class RunPodProvider(Provider):
     # can produce the polished README. parents[2] is the blockquant package;
     # parents[4] is the backend/ root that holds templates/.
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
+    # exllamav3's eval/model_diff.py, vendored in remote/ (pip ships only the
+    # exllamav3/ package, not this top-level script). Shipped next to quant.py
+    # so the post-quant KL eval works without an image rebuild.
+    _MODEL_DIFF_PATH = Path(__file__).resolve().parents[2] / "remote" / "model_diff.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
     _FLASH_PATCH = Path(__file__).resolve().parents[5] / "docker" / "patch_flash_attn.py"
     _CAL_DATA_FETCH = Path(__file__).resolve().parents[5] / "docker" / "fetch_cal_data.py"
@@ -1020,6 +1024,14 @@ class RunPodProvider(Provider):
         # Reset any cached result from a prior call.
         self._last_result = None
 
+        # KL eval (forward per-variant measure + retroactive sibling backfill)
+        # is gated to an explicit model allowlist, so it only runs where we ask
+        # for it and never adds time to an ordinary job. Enable per model with
+        # BLOCKQUANT_KL_MODELS=org/model[,org/model2].
+        _kl_allow = {m.strip() for m in
+                     os.environ.get("BLOCKQUANT_KL_MODELS", "").split(",") if m.strip()}
+        do_kl = model_id in _kl_allow
+
         # 1. Config JSON (keeps secrets out of command lines / logs).
         # pod_id + runpod_api_key + keep_pod arm the in-pod self-terminate
         # backstop after [done] for the case where the local controller dies.
@@ -1033,6 +1045,11 @@ class RunPodProvider(Provider):
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),
+            # Measure KL(fp16||quant) for each new variant, and (since the fp16
+            # is already on the pod) retroactively fill KL for existing sibling
+            # quants of the same base. Both gated by the allowlist above.
+            "kl_eval": do_kl,
+            "backfill_kl": do_kl,
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)
@@ -1067,6 +1084,8 @@ class RunPodProvider(Provider):
                                f"{script_dir}/cards.py")
             self._upload_bytes(instance_id, self._TEMPLATE_PATH.read_bytes(),
                                f"{script_dir}/card_template.md")
+            self._upload_bytes(instance_id, self._MODEL_DIFF_PATH.read_bytes(),
+                               f"{script_dir}/model_diff.py")
         except Exception as exc:
             logger.warning(f"Could not ship card renderer to pod: {exc}")
 
