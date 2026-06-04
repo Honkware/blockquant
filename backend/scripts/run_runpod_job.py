@@ -43,6 +43,13 @@ _BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
 _WEAK_FOR_QUANT = {"NVIDIA L4"}
 
+# exllamav3 is CUDA-only (no ROCm), so AMD cards can't compile or run the
+# extension at all. RunPod lists e.g. "AMD Instinct MI300X OAM" whose huge VRAM
+# sorts to the top of the big-model capable-first order, so a big quant would
+# preferentially land on a card it cannot use and fail the health check. Matched
+# as substrings of the RunPod GPU id.
+_NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
+
 # exllamav3 version is chosen by architecture. The stable release (0.0.37, what
 # the bootstrap path installs) handles the proven models incl. Qwen3.6. The
 # master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
@@ -128,6 +135,12 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
         # Blackwell-class cards until the stack moves to a cu128 torch. Plenty
         # of cheap Ada/Ampere/Hopper stock remains under the price cap.
         if any(tok in gid for tok in _BLACKWELL_EXCLUDE):
+            continue
+        # exllamav3 has no ROCm support, so AMD GPUs can't run the CUDA extension
+        # (the baked .so is CUDA-only and the JIT recompile has no nvcc). Without
+        # this, an AMD MI300X -- top of the big-model capable-first list by VRAM
+        # -- fails the import/health check and kills the variant with no retry.
+        if any(tok in gid for tok in _NON_CUDA_EXCLUDE):
             continue
         # Skip cards too weak to reliably quantize a large model. The L4 is a
         # low-power inference card (~72W) that froze mid-quant on the 35B MoE
