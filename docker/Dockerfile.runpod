@@ -90,6 +90,24 @@ RUN ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_A
 # ever stops resolving.
 COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
 RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
+# exllamav3 uses .view() after flash-attn in decode_flash_attn_nc, which
+# fails for Gemma4's global-attention layers because flash-attn returns a
+# non-contiguous tensor when global_head_dim != head_dim. .reshape() handles
+# both contiguous and non-contiguous tensors.
+RUN python -c "
+import re, importlib.util, pathlib
+spec = importlib.util.find_spec('exllamav3')
+p = pathlib.Path(spec.origin).parent / 'modules' / 'attn.py'
+t = p.read_text()
+fixed = t.replace(
+    'o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))',
+    'o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))',
+)
+p.write_text(fixed)
+n = fixed.count('o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))')
+print(f'patched {n} occurrence(s) in {p}')
+assert n > 0
+"
 
 # ---- Bundled calibration corpus ------------------------------------------
 # exllamav3 wheels omit conversion/standard_cal_data/*.utf8, which convert.py
