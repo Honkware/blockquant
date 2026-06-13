@@ -72,16 +72,22 @@ ARG EXLLAMAV3_REF=c18e9b40bed1d2bd9c30fbbc0ba0eeb19b4fbda1
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
+# ---- flash-attn (required for sliding-window-attention models) ------------
+# exllamav3's non-flash backends all refuse SWA (torch SDPA, xformers and
+# bighead_scalar return None on is_swa), so flash-attn is mandatory for
+# models like Gemma4, Mellum and Gemma3 that use sliding-window attention.
+# Prebuilt wheel matching torch's C++ ABI — no source build needed.
+# patch_flash_attn.py below stays a no-op when flash_attn imports cleanly.
+RUN python -m pip install --no-cache-dir einops
+ARG FLASH_ATTN_VER=2.7.4.post1
+RUN ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')") \
+    && python -m pip install --no-cache-dir --no-deps \
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VER}/flash_attn-${FLASH_ATTN_VER}+cu12torch2.6cxx11abi${ABI}-cp311-cp311-linux_x86_64.whl"
+
 # ---- Make exllamav3 import + run without flash-attn -----------------------
-# exllamav3 hard-imports flash_attn in its attention dispatch (no prebuilt
-# wheel for this torch/CUDA). patch_flash_attn.py guards every
-# `from flash_attn import ...` in the installed package and routes the
-# dispatcher to exllamav3's own torch-SDPA backend. This is the exact patch
-# the in-pod bootstrap applies, baked in so the pre-baked path needs no
-# fix-up. It uses importlib.find_spec (no GPU, no exllamav3 import), so it
-# runs cleanly on a GPU-less CI builder. The old __getattr__ stub satisfied
-# `from flash_attn import X` but `import exllamav3` still failed downstream;
-# this patches the source instead.
+# Patches any remaining unguarded flash_attn imports (no-op if flash-attn is
+# installed above). Kept so the image degrades gracefully if the wheel URL
+# ever stops resolving.
 COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
 RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
 
