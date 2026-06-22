@@ -989,10 +989,6 @@ class RunPodProvider(Provider):
     # can produce the polished README. parents[2] is the blockquant package;
     # parents[4] is the backend/ root that holds templates/.
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
-    # exllamav3's eval/model_diff.py, vendored in remote/ (pip ships only the
-    # exllamav3/ package, not this top-level script). Shipped next to quant.py
-    # so the post-quant KL eval works without an image rebuild.
-    _MODEL_DIFF_PATH = Path(__file__).resolve().parents[2] / "remote" / "model_diff.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
     _FLASH_PATCH = Path(__file__).resolve().parents[5] / "docker" / "patch_flash_attn.py"
     _CAL_DATA_FETCH = Path(__file__).resolve().parents[5] / "docker" / "fetch_cal_data.py"
@@ -1088,8 +1084,6 @@ class RunPodProvider(Provider):
                                f"{script_dir}/cards.py")
             self._upload_bytes(instance_id, self._TEMPLATE_PATH.read_bytes(),
                                f"{script_dir}/card_template.md")
-            self._upload_bytes(instance_id, self._MODEL_DIFF_PATH.read_bytes(),
-                               f"{script_dir}/model_diff.py")
         except Exception as exc:
             logger.warning(f"Could not ship card renderer to pod: {exc}")
 

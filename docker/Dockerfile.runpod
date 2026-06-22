@@ -126,11 +126,6 @@ COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
 COPY backend/src/blockquant/cards.py /opt/blockquant/cards.py
 COPY backend/templates/card_template.md /opt/blockquant/card_template.md
 COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
-# exllamav3's eval/model_diff.py (a top-level script pip does NOT install, only
-# the exllamav3/ package), vendored in the repo and shipped next to quant.py.
-# quant.py shells out to it for the post-quant KL-divergence eval. The provider
-# also SFTPs the current copy on every run, so this is the cold-start fallback.
-COPY backend/src/blockquant/remote/model_diff.py /opt/blockquant/model_diff.py
 RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
 
 # ---- Image metadata ------------------------------------------------------
