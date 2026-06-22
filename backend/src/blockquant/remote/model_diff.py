@@ -40,11 +40,28 @@ def save_tensor(tensor, path: str, tensor_name: str = None):
 @disk_lru_cache("get_dataset_text")
 def get_dataset_text(spec: dict):
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
-    dataset_text = "\n\n".join(
-        load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
-        ["text"]
-    )
-    return dataset_text
+    # BlockQuant patch: the un-namespaced "wikitext" id is rejected by the
+    # pinned huggingface_hub ("Repository id must be 'namespace/name'"), so try
+    # the namespaced mirror, then fall back to exllamav3's bundled calibration
+    # corpus so the KL eval never depends on a live dataset download.
+    for ds in ("Salesforce/wikitext", "wikitext"):
+        try:
+            return "\n\n".join(
+                load_dataset(ds, "wikitext-2-raw-v1", split = "test")["text"]
+            )
+        except Exception as e:
+            print(f" -- dataset {ds} failed: {e}", flush = True)
+    import exllamav3, glob, os
+    base = os.path.join(os.path.dirname(exllamav3.__file__),
+                        "conversion", "standard_cal_data")
+    texts = []
+    for fn in sorted(glob.glob(os.path.join(base, "*.utf8"))):
+        with open(fn, encoding = "utf-8") as f:
+            texts.append(f.read())
+    if not texts:
+        raise RuntimeError("no eval text: wikitext unavailable and no bundled cal data")
+    print(f" -- using bundled cal data ({len(texts)} files) for KL eval", flush = True)
+    return "\n\n".join(texts)
 
 
 def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 2048):
