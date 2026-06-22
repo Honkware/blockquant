@@ -104,7 +104,13 @@ export function jobComplete({ url, userId, results }) {
     const parts = [`${icon}  **${r.bpw} bpw**`];
     if (r.duration) parts.push(r.duration);
     parts.push(link);
-    return parts.join(' — ');
+    let line = parts.join(' — ');
+    // Optional smoke-test reply: a one-line preview quoted under the variant.
+    if (r.sample) {
+      const preview = truncate(r.sample.replace(/\s*\n+\s*/g, ' ').trim(), 280);
+      if (preview) line += `\n> 💬 ${preview}`;
+    }
+    return line;
   });
 
   const embed = new EmbedBuilder()

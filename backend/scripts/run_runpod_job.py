@@ -195,6 +195,10 @@ def main():
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--variants", default="4.5", help="Comma-separated BPW values")
     parser.add_argument(
+        "--test-prompt", default=None,
+        help="Optional prompt to run on each finished quant; the reply is echoed for the bot.",
+    )
+    parser.add_argument(
         "--gpu", default="NVIDIA H100 80GB HBM3",
         help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
     )
@@ -593,6 +597,7 @@ def main():
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
+            test_prompt=args.test_prompt,
         )
         if launch_result.get("status") != "started":
             print(f"ERROR: run_pipeline failed: {launch_result}")

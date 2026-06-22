@@ -15,6 +15,12 @@ export const commands = [
         .setName('bpw')
         .setDescription('Bits per weight, comma-separated (e.g. 3.0,4.0,5.0)')
         .setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('prompt')
+        .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),

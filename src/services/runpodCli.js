@@ -21,6 +21,9 @@ const RE = {
   layer: /Quantized:\s*\S*?layers\.(\d+)/,
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
+  // Optional smoke-test reply, base64 so newlines/quotes survive the log relay:
+  // "[sample] 4.0 <base64>"
+  sample: /\[sample\]\s*([0-9.]+)\s+([A-Za-z0-9+/=]+)/,
 };
 
 /**
@@ -32,7 +35,7 @@ const RE = {
  * (so the embed shows the variant actually running, not just the first) and
  * resolves with one result row per variant.
  */
-export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress }) {
+export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt = null, onProgress }) {
   return new Promise((resolve, reject) => {
     const args = [
       SCRIPT,
@@ -64,6 +67,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
     // The controller health-checks a baked image's ExLlamaV3 version and fails
     // fast if it is too old, so passing a stale image can't silently regress.
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
+    if (testPrompt) args.push('--test-prompt', testPrompt);
 
     log.info(`spawn: ${PYTHON} ${args.join(' ')}`);
     // PYTHONUNBUFFERED so the child's stdout (which drives the progress embed)
@@ -76,6 +80,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
 
     const total = variants.length;
     const results = new Map(); // bpw -> url
+    const samples = new Map(); // bpw -> decoded smoke-test reply
     let curBpw = variants[0];
     let curDownloadPct = 0;   // from [download] N% (monotonic)
     let curQuantPct = 0;      // layer-based % from [progress] (monotonic)
@@ -116,6 +121,11 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
         results.set(m[1], m[2]);
         stage = 'Uploading';
         return report(`Uploaded ${m[1]} bpw`);
+      }
+      if ((m = RE.sample.exec(line))) {
+        try { samples.set(m[1], Buffer.from(m[2], 'base64').toString('utf8')); }
+        catch { /* ignore a malformed marker */ }
+        return;
       }
       if ((m = RE.quantProgress.exec(line))) {
         // pct is layer/total*100 (global, monotonic). "(preparing)" lines have
@@ -183,6 +193,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, onProgress 
           pushed: !!url,
           reused: false,
           duration: '',
+          sample: samples.get(v) || null,
           error: url ? null : code === 0 ? 'no upload URL seen' : `cli exit ${code}`,
         };
       });

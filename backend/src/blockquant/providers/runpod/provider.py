@@ -1015,6 +1015,7 @@ class RunPodProvider(Provider):
         cal_rows: int | None = None,
         cal_cols: int | None = None,
         keep_pod: bool = False,
+        test_prompt: str | None = None,
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1055,6 +1056,8 @@ class RunPodProvider(Provider):
             cfg["cal_rows"] = int(cal_rows)
         if cal_cols is not None:
             cfg["cal_cols"] = int(cal_cols)
+        if test_prompt:
+            cfg["test_prompt"] = str(test_prompt)
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
 
         # 2. Locate the remote quant script. On pre-baked images it lives

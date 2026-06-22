@@ -156,6 +156,66 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 40,
     return float(m.group(1))
 
 
+def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) -> str | None:
+    """Run a single prompt through the freshly quantized model for the card/embed.
+
+    Loads the quant (small, fits easily) and generates one greedy completion so
+    the requester sees how this bpw actually responds. Applies the model's chat
+    template when it has one, else treats the prompt as raw text. Best-effort:
+    returns None on any failure so a finished quant still uploads.
+    """
+    try:
+        import torch
+        from exllamav3 import Config, Model, Cache, Tokenizer, Generator, GreedySampler
+    except Exception as e:
+        print(f"[sample] WARN import failed: {type(e).__name__}: {e}", flush=True)
+        return None
+
+    model = None
+    try:
+        # Chat-template the prompt with transformers when the model ships one,
+        # so instruct models reply in-character; base models get the raw prompt.
+        text, special = prompt, False
+        try:
+            from transformers import AutoTokenizer
+            hf_tok = AutoTokenizer.from_pretrained(str(quant_dir))
+            if getattr(hf_tok, "chat_template", None):
+                text = hf_tok.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True, tokenize=False,
+                )
+                special = True
+        except Exception:
+            text, special = prompt, False
+
+        config = Config.from_directory(str(quant_dir))
+        model = Model.from_config(config)
+        cache = Cache(model, max_num_tokens=4096)
+        model.load()
+        tokenizer = Tokenizer.from_config(config)
+        gen = Generator(model, cache, tokenizer)
+        out = gen.generate(
+            prompt=text, max_new_tokens=max_new_tokens, sampler=GreedySampler(),
+            completion_only=True, encode_special_tokens=special, add_bos=not special,
+        )
+        resp = out if isinstance(out, str) else (out[0] if out else "")
+        return (resp or "").strip() or None
+    except Exception as e:
+        print(f"[sample] WARN generation failed: {type(e).__name__}: {e}", flush=True)
+        return None
+    finally:
+        try:
+            if model is not None:
+                model.unload()
+        except Exception:
+            pass
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def _write_cards(outputs, model_id, model_name, owner, hf_token,
                  head_bits, cal_rows, model_dir) -> None:
     """Render the polished card into each output dir before upload."""
@@ -349,6 +409,9 @@ def main() -> int:
         kl_eval: bool = bool(cfg.get("kl_eval", False))
         kl_rows: int = int(cfg.get("kl_rows", 40))
         backfill_kl: bool = bool(cfg.get("backfill_kl", False))
+        # Optional smoke-test prompt: run on each finished quant so the requester
+        # sees a real reply. The fp16 is already gone by here; we load the quant.
+        test_prompt: str = (cfg.get("test_prompt") or "").strip()
 
         t0 = time.time()
 
@@ -594,6 +657,15 @@ def main() -> int:
                             encoding="utf-8")
                     except Exception:
                         pass
+            if test_prompt:
+                print(f"[sample] {variant} generating reply ...", flush=True)
+                resp = _sample_generate(out_dir, test_prompt)
+                if resp:
+                    import base64
+                    b64 = base64.b64encode(resp.encode("utf-8")).decode("ascii")
+                    # Single-line, base64 marker so newlines/quotes in the reply
+                    # survive the log relay to the bot, which decodes + previews it.
+                    print(f"[sample] {variant} {b64}", flush=True)
             outputs.append(rec)
 
         if hf_token:
