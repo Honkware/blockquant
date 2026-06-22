@@ -1025,13 +1025,16 @@ class RunPodProvider(Provider):
         # Reset any cached result from a prior call.
         self._last_result = None
 
-        # KL eval (forward per-variant measure + retroactive sibling backfill)
-        # is gated to an explicit model allowlist, so it only runs where we ask
-        # for it and never adds time to an ordinary job. Enable per model with
-        # BLOCKQUANT_KL_MODELS=org/model[,org/model2].
-        _kl_allow = {m.strip() for m in
-                     os.environ.get("BLOCKQUANT_KL_MODELS", "").split(",") if m.strip()}
-        do_kl = model_id in _kl_allow
+        # Forward KL(fp16||quant) runs for every job by default -- the fp16 is
+        # already on the pod, so it's just one extra forward pass (best-effort:
+        # skips if the fp16 won't fit the GPU, e.g. a big MoE like Mixtral). Set
+        # BLOCKQUANT_KL_EVAL=0 to turn it off globally.
+        kl_eval = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
+        # Backfilling KL into existing sibling quants re-downloads each of them,
+        # so that stays opt-in per base via BLOCKQUANT_KL_BACKFILL_MODELS.
+        _bf_allow = {m.strip() for m in
+                     os.environ.get("BLOCKQUANT_KL_BACKFILL_MODELS", "").split(",") if m.strip()}
+        backfill_kl = model_id in _bf_allow
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
         # pod_id + runpod_api_key + keep_pod arm the in-pod self-terminate
@@ -1046,11 +1049,9 @@ class RunPodProvider(Provider):
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),
-            # Measure KL(fp16||quant) for each new variant, and (since the fp16
-            # is already on the pod) retroactively fill KL for existing sibling
-            # quants of the same base. Both gated by the allowlist above.
-            "kl_eval": do_kl,
-            "backfill_kl": do_kl,
+            # Forward KL per new variant (default on); sibling backfill opt-in.
+            "kl_eval": kl_eval,
+            "backfill_kl": backfill_kl,
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)

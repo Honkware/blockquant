@@ -490,10 +490,10 @@ def main() -> int:
         cal_rows: int | None = cfg.get("cal_rows")
         cal_cols: int | None = cfg.get("cal_cols")
         # Post-quant KL-divergence of the quant against the fp16, measured on
-        # the pod where both still live. Opt-in (the controller gates it to an
-        # allowlist) so a bare config never adds eval time. kl_rows trades
-        # accuracy for pod time; backfill_kl also fills existing siblings.
-        kl_eval: bool = bool(cfg.get("kl_eval", False))
+        # the pod where both still live. On by default (best-effort: skips if the
+        # fp16 won't fit the GPU). kl_rows trades accuracy for pod time.
+        # backfill_kl (re-eval existing siblings) is opt-in; off unless asked.
+        kl_eval: bool = bool(cfg.get("kl_eval", True))
         kl_rows: int = int(cfg.get("kl_rows", 40))
         backfill_kl: bool = bool(cfg.get("backfill_kl", False))
         # Optional smoke-test prompt: run on each finished quant so the requester
