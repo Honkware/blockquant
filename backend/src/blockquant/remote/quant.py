@@ -175,7 +175,11 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
     try:
         # Chat-template the prompt with transformers when the model ships one,
         # so instruct models reply in-character; base models get the raw prompt.
+        # Collect stop tokens too, so generation ends at the turn boundary
+        # instead of running the full budget and rambling past <|im_end|>.
         text, special = prompt, False
+        stop: list = []
+        end_strs = ("<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>")
         try:
             from transformers import AutoTokenizer
             hf_tok = AutoTokenizer.from_pretrained(str(quant_dir))
@@ -185,6 +189,12 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
                     add_generation_prompt=True, tokenize=False,
                 )
                 special = True
+            if hf_tok.eos_token_id is not None:
+                stop.append(hf_tok.eos_token_id)
+            for t in end_strs:
+                tid = hf_tok.convert_tokens_to_ids(t)
+                if isinstance(tid, int) and tid >= 0 and tid != hf_tok.unk_token_id:
+                    stop.append(tid)
         except Exception:
             text, special = prompt, False
 
@@ -197,9 +207,16 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
         out = gen.generate(
             prompt=text, max_new_tokens=max_new_tokens, sampler=GreedySampler(),
             completion_only=True, encode_special_tokens=special, add_bos=not special,
+            stop_conditions=(list(dict.fromkeys(stop)) or None),
         )
         resp = out if isinstance(out, str) else (out[0] if out else "")
-        return (resp or "").strip() or None
+        resp = (resp or "").strip()
+        # Belt-and-suspenders: drop anything past a turn-end marker the stop
+        # conditions didn't catch, and trim a trailing special token.
+        for t in end_strs + ("<|endoftext|>",):
+            if t in resp:
+                resp = resp.split(t, 1)[0].strip()
+        return resp or None
     except Exception as e:
         print(f"[sample] WARN generation failed: {type(e).__name__}: {e}", flush=True)
         return None
@@ -663,9 +680,10 @@ def main() -> int:
                 if resp:
                     import base64
                     b64 = base64.b64encode(resp.encode("utf-8")).decode("ascii")
-                    # Single-line, base64 marker so newlines/quotes in the reply
-                    # survive the log relay to the bot, which decodes + previews it.
-                    print(f"[sample] {variant} {b64}", flush=True)
+                    # Single-line base64 marker (the `b64` sentinel keeps the
+                    # status line above from being mis-parsed) so newlines/quotes
+                    # in the reply survive the log relay; the bot decodes + previews.
+                    print(f"[sample] {variant} b64 {b64}", flush=True)
             outputs.append(rec)
 
         if hf_token:

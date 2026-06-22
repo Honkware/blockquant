@@ -21,9 +21,10 @@ const RE = {
   layer: /Quantized:\s*\S*?layers\.(\d+)/,
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
-  // Optional smoke-test reply, base64 so newlines/quotes survive the log relay:
-  // "[sample] 4.0 <base64>"
-  sample: /\[sample\]\s*([0-9.]+)\s+([A-Za-z0-9+/=]+)/,
+  // Optional smoke-test reply, base64 so newlines/quotes survive the log relay.
+  // The `b64` sentinel avoids matching the "[sample] N generating..." status line:
+  // "[sample] 4.0 b64 <base64>"
+  sample: /\[sample\]\s*([0-9.]+)\s+b64\s+([A-Za-z0-9+/=]+)/,
 };
 
 /**
