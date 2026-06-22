@@ -114,46 +114,112 @@ def _ensure_fast_tokenizer(model_dir: Path) -> None:
     print(f"[tokenizer] WARN could not build tokenizer.json: {last}", flush=True)
 
 
-def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 40,
-                 timeout: int = 2400) -> float | None:
-    """KL-divergence of the quant against the fp16 source, for the card.
+def _eval_text() -> str:
+    """Eval text for the KL metric: exllamav3's bundled calibration corpus.
 
-    Runs exllamav3's model_diff (vendored into the image next to this file) in
-    a subprocess. model_diff streams both models module-by-module, so it never
-    holds the full fp16 and quant in VRAM at once; that keeps the eval viable on
-    the same pod that just quantized. Parses KL(fp16 || quant), the mean over
-    `rows` wikitext rows. Best-effort: returns None on any failure so a finished
-    quant still uploads without a number.
+    Read straight off disk (the image bakes conversion/standard_cal_data/*.utf8),
+    so the eval never depends on a live dataset download.
     """
-    import subprocess
-    import re as _re
+    import glob
+    import os
+    import exllamav3
+    base = os.path.join(os.path.dirname(exllamav3.__file__),
+                        "conversion", "standard_cal_data")
+    parts = []
+    for fn in sorted(glob.glob(os.path.join(base, "*.utf8"))):
+        try:
+            with open(fn, encoding="utf-8") as f:
+                parts.append(f.read())
+        except Exception:
+            pass
+    return "\n\n".join(parts)
 
-    candidates = [
-        Path(__file__).resolve().parent / "model_diff.py",
-        Path("/opt/blockquant/model_diff.py"),
-    ]
-    diff = next((p for p in candidates if p.exists()), None)
-    if diff is None:
-        print("[kl] WARN model_diff.py not in image, skipping eval", flush=True)
-        return None
-    # -ma is model A, -mb model B; model_diff reports KL(A, B) as
-    # KL(softmax(B) || softmax(A)), so A=quant B=fp16 gives KL(fp16 || quant).
-    cmd = [sys.executable, str(diff),
-           "-ma", str(quant_dir), "-mb", str(fp16_dir), "-r", str(int(rows))]
+
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
+                 seq_len: int = 2048) -> float | None:
+    """Mean KL(fp16 || quant) over a few rows of calibration text, for the card.
+
+    Loads ONE model at a time (fp16, then quant) via the high-level Model API
+    that the smoke-test path already proved works, forwards each row to get
+    logits, and compares the distributions with compute_kl_div. The fp16 logits
+    are staged to disk between passes so only one model is ever resident -- this
+    sidesteps the segfault in exllamav3's low-level model_diff forward and fits
+    any model whose fp16 loads alone (up to ~35B on an 80GB card; a bigger fp16
+    like Mixtral will OOM and skip). Best-effort: returns None on any failure so
+    a finished quant still uploads without a number.
+    """
+    import shutil
+    import tempfile
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        import torch
+        from exllamav3 import Config, Model, Cache, Tokenizer
+        from exllamav3.util.measures import compute_kl_div
     except Exception as e:
-        print(f"[kl] WARN eval skipped: {type(e).__name__}: {e}", flush=True)
+        print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
         return None
-    if proc.returncode != 0:
-        tail = " | ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-3:])
-        print(f"[kl] WARN eval exit {proc.returncode}: {tail}", flush=True)
+
+    # Tokenize the eval text once, with the quant's tokenizer, into fixed rows.
+    try:
+        text = _eval_text()
+        if not text:
+            print("[kl] WARN no bundled eval text found", flush=True)
+            return None
+        tcfg = Config.from_directory(str(quant_dir))
+        tokenizer = Tokenizer.from_config(tcfg)
+        all_ids = tokenizer.encode(text)
+        vocab = tokenizer.actual_vocab_size
+        n = all_ids.shape[-1]
+        seqs = [all_ids[:, a:a + seq_len]
+                for a in range(0, n - seq_len, seq_len)][:rows]
+        if not seqs:
+            print("[kl] WARN not enough eval tokens", flush=True)
+            return None
+    except Exception as e:
+        print(f"[kl] WARN tokenize failed: {type(e).__name__}: {e}", flush=True)
         return None
-    m = _re.search(r"KL divergence \(A, B\):\s*([0-9.]+)", proc.stdout)
-    if not m:
-        print("[kl] WARN no KL value in model_diff output", flush=True)
+
+    def _forward_rows(model_dir, on_row) -> None:
+        """Load model_dir, forward each seq, call on_row(i, logits_2d), unload."""
+        config = Config.from_directory(str(model_dir))
+        config.override_dynamic_seq_len(seq_len)
+        model = Model.from_config(config)
+        cache = Cache(model, max_num_tokens=seq_len)
+        model.load()
+        try:
+            for i, seq in enumerate(seqs):
+                params = {"attn_mode": "flash_attn", "cache": cache,
+                          "past_len": 0, "batch_shape": (1, seq_len)}
+                logits = model.forward(seq, params=params)  # (1, L, vocab)
+                on_row(i, logits[0])
+        finally:
+            try:
+                model.unload()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+
+    stage = Path(tempfile.mkdtemp(prefix="klstage-", dir=str(quant_dir.parent)))
+    try:
+        # Pass 1: fp16 -> stage each row's logits (fp16 on disk to halve size).
+        _forward_rows(fp16_dir, lambda i, lg: torch.save(lg.half().cpu(), stage / f"f{i}.pt"))
+
+        # Pass 2: quant -> KL vs the staged fp16 logits.
+        kls: list[float] = []
+
+        def _cmp(i, q_logits):
+            f_logits = torch.load(stage / f"f{i}.pt").to(q_logits.device).float()
+            kv = min(vocab, q_logits.shape[-1], f_logits.shape[-1])
+            # compute_kl_div(input, target) = KL(softmax(target)||softmax(input)),
+            # so input=quant, target=fp16 gives KL(fp16 || quant).
+            kls.append(compute_kl_div(q_logits.float(), f_logits, kv).mean().item())
+
+        _forward_rows(quant_dir, _cmp)
+        return (sum(kls) / len(kls)) if kls else None
+    except Exception as e:
+        print(f"[kl] WARN eval failed: {type(e).__name__}: {e}", flush=True)
         return None
-    return float(m.group(1))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) -> str | None:
