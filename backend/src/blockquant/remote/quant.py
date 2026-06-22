@@ -153,7 +153,6 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer
-        from exllamav3.util.measures import compute_kl_div
     except Exception as e:
         print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
         return None
@@ -209,9 +208,14 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
         def _cmp(i, q_logits):
             f_logits = torch.load(stage / f"f{i}.pt").to(q_logits.device).float()
             kv = min(vocab, q_logits.shape[-1], f_logits.shape[-1])
-            # compute_kl_div(input, target) = KL(softmax(target)||softmax(input)),
-            # so input=quant, target=fp16 gives KL(fp16 || quant).
-            kls.append(compute_kl_div(q_logits.float(), f_logits, kv).mean().item())
+            qi = q_logits[..., :kv].float()
+            fi = f_logits[..., :kv]
+            # KL(P_fp16 || P_quant), pure torch. exllamav3's compute_kl_div uses
+            # a custom kernel that segfaults here, so do the math directly.
+            kl = (torch.softmax(fi, dim=-1)
+                  * (torch.log_softmax(fi, dim=-1) - torch.log_softmax(qi, dim=-1))
+                  ).sum(-1).mean().item()
+            kls.append(kl)
 
         _forward_rows(quant_dir, _cmp)
         return (sum(kls) / len(kls)) if kls else None
