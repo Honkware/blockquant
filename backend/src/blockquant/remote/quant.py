@@ -234,6 +234,10 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
     template when it has one, else treats the prompt as raw text. Best-effort:
     returns None on any failure so a finished quant still uploads.
     """
+    # "Draw an SVG" prompts (the catbench) need room to emit the whole drawing;
+    # short Q&A still stops early on the eos token, so a bigger cap is free there.
+    if "svg" in prompt.lower():
+        max_new_tokens = max(max_new_tokens, 2048)
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer, Generator, GreedySampler

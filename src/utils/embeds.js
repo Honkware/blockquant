@@ -105,10 +105,15 @@ export function jobComplete({ url, userId, results }) {
     if (r.duration) parts.push(r.duration);
     parts.push(link);
     let line = parts.join(' — ');
-    // Optional smoke-test reply: a one-line preview quoted under the variant.
+    // Optional smoke-test reply: an SVG is rendered + attached separately, so
+    // just flag it; otherwise quote a one-line text preview under the variant.
     if (r.sample) {
-      const preview = truncate(r.sample.replace(/\s*\n+\s*/g, ' ').trim(), 280);
-      if (preview) line += `\n> 💬 ${preview}`;
+      if (/<svg[\s\S]*?<\/svg>/i.test(r.sample)) {
+        line += `\n> 🎨 SVG rendered below`;
+      } else {
+        const preview = truncate(r.sample.replace(/\s*\n+\s*/g, ' ').trim(), 280);
+        if (preview) line += `\n> 💬 ${preview}`;
+      }
     }
     return line;
   });
