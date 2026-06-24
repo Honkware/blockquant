@@ -43,6 +43,13 @@ _BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
 _WEAK_FOR_QUANT = {"NVIDIA L4"}
 
+# exllamav3 is CUDA-only (no ROCm), so AMD cards can't compile or run the
+# extension at all. RunPod lists e.g. "AMD Instinct MI300X OAM" whose huge VRAM
+# sorts to the top of the big-model capable-first order, so a big quant would
+# preferentially land on a card it cannot use and fail the health check. Matched
+# as substrings of the RunPod GPU id.
+_NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
+
 # exllamav3 version is chosen by architecture. The stable release (0.0.37, what
 # the bootstrap path installs) handles the proven models incl. Qwen3.6. The
 # master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
@@ -129,6 +136,12 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
         # of cheap Ada/Ampere/Hopper stock remains under the price cap.
         if any(tok in gid for tok in _BLACKWELL_EXCLUDE):
             continue
+        # exllamav3 has no ROCm support, so AMD GPUs can't run the CUDA extension
+        # (the baked .so is CUDA-only and the JIT recompile has no nvcc). Without
+        # this, an AMD MI300X -- top of the big-model capable-first list by VRAM
+        # -- fails the import/health check and kills the variant with no retry.
+        if any(tok in gid for tok in _NON_CUDA_EXCLUDE):
+            continue
         # Skip cards too weak to reliably quantize a large model. The L4 is a
         # low-power inference card (~72W) that froze mid-quant on the 35B MoE
         # while an RTX 5000 Ada on the same job finished fine. Exact match so we
@@ -181,6 +194,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run EXL3 quantization on RunPod")
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--variants", default="4.5", help="Comma-separated BPW values")
+    parser.add_argument(
+        "--test-prompt", default=None,
+        help="Optional prompt to run on each finished quant; the reply is echoed for the bot.",
+    )
     parser.add_argument(
         "--gpu", default="NVIDIA H100 80GB HBM3",
         help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
@@ -440,6 +457,7 @@ def main():
     chosen_gpu = None
     chosen_cloud = None
     hourly = 0.0
+    ssh = None
     last_err = None
     _price_cache: dict = {}
     sweeps = max(1, args.launch_retries)
@@ -493,10 +511,35 @@ def main():
                 print(f"      {label} ({type(e).__name__}: {str(e)[:80]}), falling through", flush=True)
                 last_err = e
                 continue
+            # Got a pod, but RunPod occasionally hands out a dead host that never
+            # exposes SSH. That used to be fatal (sys.exit after a 10-min wait);
+            # instead, confirm it becomes active here and, if not, terminate it
+            # and fall through to the next card. So one bad host can't kill the
+            # run while other stock is free, and the launch budget covers dead
+            # hosts as well as stock-outs.
+            print(f"      Pod ID: {instance_id}  (GPU: {candidate}, {cloud}, ~${rate:.2f}/hr)", flush=True)
+            print("[2/6] Waiting for SSH (up to 10 min)...", flush=True)
+            try:
+                active = attempt.wait_for_active(instance_id)
+            except Exception as e:  # noqa: BLE001
+                active = {"status": "error", "error": str(e)}
+            if active.get("status") != "active":
+                print(f"      pod {instance_id} did not become active "
+                      f"({active.get('status')}); terminating and trying the next card",
+                      flush=True)
+                try:
+                    attempt.terminate(instance_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                last_err = RuntimeError(f"pod did not become active: {active}")
+                instance_id = None
+                continue
             provider = attempt
             chosen_gpu = candidate
             chosen_cloud = cloud
             hourly = rate
+            ssh = active["ssh"]
+            print(f"      SSH ready at {ssh['host']}:{ssh['port']}", flush=True)
             break
         if provider is not None:
             break
@@ -526,18 +569,11 @@ def main():
             hourly = provider.get_cost_per_hour()
         except Exception:
             hourly = 0.0
-    print(f"      Pod ID: {instance_id}  (GPU: {chosen_gpu}, {chosen_cloud}, ~${hourly:.2f}/hr)")
+    # The chosen pod's "Pod ID" and "SSH ready" lines were already printed during
+    # the sweep, where SSH is now confirmed before a card is accepted.
 
     t_launch = time.time()
     try:
-        print(f"[2/6] Waiting for SSH (up to 10 min)...")
-        active = provider.wait_for_active(instance_id)
-        if active["status"] != "active":
-            print(f"ERROR: pod did not become active: {active}")
-            sys.exit(1)
-        ssh = active["ssh"]
-        print(f"      SSH ready at {ssh['host']}:{ssh['port']}")
-
         print(f"[3/6] Bootstrapping (PyTorch, transformers, exllamav3, flash-attn)...")
         local_exl = None if args.skip_local_exllama else args.local_exllama
         if local_exl is not None and not local_exl.exists():
@@ -561,6 +597,7 @@ def main():
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
+            test_prompt=args.test_prompt,
         )
         if launch_result.get("status") != "started":
             print(f"ERROR: run_pipeline failed: {launch_result}")

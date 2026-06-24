@@ -301,6 +301,18 @@ class RunPodProvider(Provider):
             return "GONE"
         return pod.get("desiredStatus", "UNKNOWN")
 
+    def pod_is_gone(self, instance_id: str) -> bool:
+        """True when the pod no longer exists or has reached a terminal state,
+        per the RunPod control plane (not SSH). The poll loop uses this to tell
+        a self-terminated pod (the run finished and the pod tore itself down)
+        apart from a transient SSH blip, so it exits promptly instead of
+        waiting out the whole stall timeout. Fails closed (False) on an API
+        error so a flaky control-plane call can't end a live run early."""
+        try:
+            return self.get_pod_status(instance_id) in self._TERMINAL_STATES
+        except Exception:
+            return False
+
     def terminate(
         self,
         instance_id: str,
@@ -999,6 +1011,7 @@ class RunPodProvider(Provider):
         cal_rows: int | None = None,
         cal_cols: int | None = None,
         keep_pod: bool = False,
+        test_prompt: str | None = None,
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1007,6 +1020,17 @@ class RunPodProvider(Provider):
         """
         # Reset any cached result from a prior call.
         self._last_result = None
+
+        # Forward KL(fp16||quant) runs for every job by default -- the fp16 is
+        # already on the pod, so it's just one extra forward pass (best-effort:
+        # skips if the fp16 won't fit the GPU, e.g. a big MoE like Mixtral). Set
+        # BLOCKQUANT_KL_EVAL=0 to turn it off globally.
+        kl_eval = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
+        # Backfilling KL into existing sibling quants re-downloads each of them,
+        # so that stays opt-in per base via BLOCKQUANT_KL_BACKFILL_MODELS.
+        _bf_allow = {m.strip() for m in
+                     os.environ.get("BLOCKQUANT_KL_BACKFILL_MODELS", "").split(",") if m.strip()}
+        backfill_kl = model_id in _bf_allow
 
         # 1. Config JSON (keeps secrets out of command lines / logs).
         # pod_id + runpod_api_key + keep_pod arm the in-pod self-terminate
@@ -1021,11 +1045,16 @@ class RunPodProvider(Provider):
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),
+            # Forward KL per new variant (default on); sibling backfill opt-in.
+            "kl_eval": kl_eval,
+            "backfill_kl": backfill_kl,
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)
         if cal_cols is not None:
             cfg["cal_cols"] = int(cal_cols)
+        if test_prompt:
+            cfg["test_prompt"] = str(test_prompt)
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
 
         # 2. Locate the remote quant script. On pre-baked images it lives

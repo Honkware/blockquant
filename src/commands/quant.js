@@ -76,6 +76,9 @@ export async function handleQuant(interaction) {
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
+  // Optional smoke-test prompt: run on each finished quant so the requester
+  // sees a real reply. Capped so it stays a quick check, not a chat session.
+  const testPrompt = (interaction.options.getString('prompt') || '').trim().slice(0, 1000) || null;
   const userId = interaction.user.id;
 
   // The request is intentionally just model + bpw. Everything else is a fixed
@@ -257,6 +260,7 @@ export async function handleQuant(interaction) {
     format,
     variants,
     bpws,
+    testPrompt,
     categories: [category],
     profile,
     quantOptions,
@@ -316,6 +320,7 @@ export async function runApprovedJob({ interaction, job }) {
     format,
     variants,
     bpws,
+    testPrompt = null,
     categories,
     profile,
     quantOptions,
@@ -483,13 +488,15 @@ export async function runApprovedJob({ interaction, job }) {
               variants: [v],
               hfOrg: config.HF_ORG,
               calRows: 250,
+              testPrompt,
               onProgress: (d) => {
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();
               },
             });
             const url = res && res[0] ? res[0].url : null;
-            pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url };
+            const sample = res && res[0] ? res[0].sample : null;
+            pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url, sample };
             renderParallel();
             return res;
           },

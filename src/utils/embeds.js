@@ -99,7 +99,18 @@ export function jobComplete({ url, userId, results }) {
       : r.error
         ? `Error: ${truncate(r.error, 60)}`
         : 'No URL';
-    return `${icon}  **${r.bpw} bpw** — ${r.duration} — ${link}`;
+    // Join only the parts we actually have, so an empty duration (the RunPod
+    // path doesn't set one) doesn't render a doubled "— —" separator.
+    const parts = [`${icon}  **${r.bpw} bpw**`];
+    if (r.duration) parts.push(r.duration);
+    parts.push(link);
+    let line = parts.join(' — ');
+    // Optional smoke-test reply: a one-line preview quoted under the variant.
+    if (r.sample) {
+      const preview = truncate(r.sample.replace(/\s*\n+\s*/g, ' ').trim(), 280);
+      if (preview) line += `\n> 💬 ${preview}`;
+    }
+    return line;
   });
 
   const embed = new EmbedBuilder()

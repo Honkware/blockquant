@@ -14,6 +14,8 @@ export class AppError extends Error {
 const USER_COPY = {
   AUTH_INVALID: 'Authentication failed. Check your Hugging Face token.',
   AUTH_READ_ONLY: 'Your Hugging Face token is read-only. A write token is required.',
+  ARCH_UNSUPPORTED: 'This model architecture is not supported by exllamav3 and cannot be quantized to EXL3.',
+  ACCESS_DENIED: 'You do not have access to this gated or private model. Accept its license on Hugging Face first.',
   MODEL_INVALID: 'Invalid model URL or ID. Use format `org/model`.',
   MODEL_NOT_FOUND: 'Model not found or inaccessible with current token.',
   WORKSPACE_INVALID: 'Model files are incomplete on disk. Please retry.',
