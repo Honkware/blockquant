@@ -8,6 +8,7 @@ import { routeCommand } from './commands/router.js';
 import { getJobStatus, pollJob } from './services/api-client.js';
 import * as embeds from './utils/embeds.js';
 import { listPods, terminatePod } from './services/runpod.js';
+import { registerChat } from './chat/index.js';
 
 const log = getLogger('bot');
 
@@ -72,6 +73,10 @@ const client = new Client({
 // ── Command Handling ────────────────────────────────────────────────────────
 
 client.on('interactionCreate', routeCommand);
+
+// Optional Kimi chat module — no-op unless CHAT_ENABLED + KIMI_API_KEY are set.
+// Delete this line + src/chat/ to remove the feature entirely.
+registerChat(client);
 
 // ── Ready ───────────────────────────────────────────────────────────────────
 

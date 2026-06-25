@@ -110,6 +110,19 @@ const config = Object.freeze({
     .map((s) => s.trim())
     .filter(Boolean),
 
+  // Chat module (optional, self-contained — see src/chat/, delete to remove).
+  // Powered by Kimi (Moonshot, OpenAI-compatible). Off unless CHAT_ENABLED=1
+  // and a KIMI_API_KEY is set, so it never affects the quant pipeline.
+  CHAT_ENABLED: boolEnv('CHAT_ENABLED', false),
+  KIMI_API_KEY: process.env.KIMI_API_KEY || '',
+  KIMI_BASE_URL: process.env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1',
+  KIMI_MODEL: process.env.KIMI_MODEL || 'kimi-k2.7-code',
+  CHAT_SYSTEM_PROMPT: process.env.CHAT_SYSTEM_PROMPT || '',
+  // Optional comma list of channel IDs the chat may reply in (empty = anywhere
+  // it's @mentioned). Lets you pen the chat into one channel.
+  CHAT_CHANNELS: process.env.CHAT_CHANNELS || '',
+  CHAT_MAX_TOKENS: intEnv('CHAT_MAX_TOKENS', 1024),
+
   // Paths (.env file overrides inherited env for these two)
   WORKSPACE_DIR: resolveRepoPath(workspaceDirRaw, './tmp/workdir'),
   EXLLAMAV3_DIR: resolveRepoPath(exllamav3DirRaw, './exllamav3'),
