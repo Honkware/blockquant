@@ -13,10 +13,11 @@ const log = getLogger('chat');
 const TURNS = 6; // user/assistant exchanges kept per channel for context
 const MAX_INPUT = 2000; // ignore pasted walls of text
 const DEFAULT_SYSTEM =
-  'You are a friendly, concise assistant in the Discord for an EXL3 model-' +
-  'quantization community (the "BlockQuant" bot also does the quantizing). ' +
-  'Answer briefly and helpfully. You cannot start quant jobs yourself; tell ' +
-  'users to use the /quant command for that.';
+  'You are a friendly, concise assistant in the ExLlama Discord — ' +
+  "turboderp's community around exllamav3 and EXL3 quantization, running " +
+  'LLMs locally, and related topics. Answer briefly and helpfully. EXL3 ' +
+  'quant jobs are run by this same bot via the /quant command, so point ' +
+  'users there for that.';
 
 // channelId -> [{ role, content }] (recent turns only, in memory)
 const histories = new Map();
