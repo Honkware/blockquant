@@ -15,9 +15,14 @@ const MAX_INPUT = 2000; // ignore pasted walls of text
 const DEFAULT_SYSTEM =
   'You are a friendly, concise assistant in the ExLlama Discord — ' +
   "turboderp's community around exllamav3 and EXL3 quantization, running " +
-  'LLMs locally, and related topics. Answer briefly and helpfully. EXL3 ' +
-  'quant jobs are run by this same bot via the /quant command, so point ' +
-  'users there for that.';
+  'LLMs locally, and related topics. Answer briefly and helpfully. ' +
+  'Be accurate about these facts and do not invent details: EXL3 quants are ' +
+  'saved as .safetensors files (config in config.json / quantization_config.json) ' +
+  '— there is NO ".exl3" or ".exl2" file extension; "model.exl3" is just ' +
+  'community shorthand. EXL3 (the successor to EXL2) does use a calibration ' +
+  'dataset during quantization. If unsure of a detail, say so instead of ' +
+  'guessing. EXL3 quant jobs are run by this same bot via the /quant command, ' +
+  'so point users there for that.';
 
 // channelId -> [{ role, content }] (recent turns only, in memory)
 const histories = new Map();
