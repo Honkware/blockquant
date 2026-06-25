@@ -19,9 +19,10 @@ export async function kimiChat(messages, { signal } = {}) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
+      // No temperature: kimi-for-coding rejects anything but its default, and
+      // omitting it is fine for other OpenAI-compatible providers too.
       model: config.KIMI_MODEL || 'kimi-k2.7-code',
       messages,
-      temperature: 0.6,
       max_tokens: config.CHAT_MAX_TOKENS || 1024,
     }),
     signal,
