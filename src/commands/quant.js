@@ -17,6 +17,7 @@ import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
 import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
+import { extractSvg, renderSvgToPng } from '../utils/svg.js';
 
 const log = getLogger('cmd:quant');
 
@@ -127,11 +128,11 @@ export async function handleQuant(interaction) {
         embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
       });
     }
-    const invalid = bpws.filter((b) => b < 1.5 || b > 8.5);
+    const invalid = bpws.filter((b) => b < 1 || b > 8);
     if (invalid.length) {
       return interaction.editReply({
         embeds: [
-          embeds.error('BPW Out of Range', `Values must be between 1.5-8.5. Got: ${invalid.join(', ')}`),
+          embeds.error('BPW Out of Range', `Values must be between 1-8. Got: ${invalid.join(', ')}`),
         ],
       });
     }
@@ -382,6 +383,27 @@ export async function runApprovedJob({ interaction, job }) {
           'Please retry upload or contact an admin.';
       }
       await thread.send(completionNote);
+
+      // Catbench: if a smoke-test reply was an SVG (e.g. "draw a kitten"),
+      // render it to PNG and post one per bpw so they can be compared. Static
+      // render, best-effort: a malformed/truncated SVG from the model is skipped.
+      try {
+        const svgFiles = [];
+        for (const r of results) {
+          const svg = extractSvg(r.sample);
+          if (!svg) continue;
+          try {
+            svgFiles.push({ attachment: renderSvgToPng(svg), name: `sample-${r.bpw}bpw.png` });
+          } catch (e) {
+            log.debug(`SVG render failed for ${r.bpw} bpw: ${e.message}`);
+          }
+        }
+        if (svgFiles.length) {
+          await thread.send({ content: '🎨 Rendered SVG replies:', files: svgFiles.slice(0, 10) });
+        }
+      } catch (e) {
+        log.warn(`SVG attach skipped: ${e.message}`);
+      }
 
       const models = await db.loadModels();
       models[modelId] = {
