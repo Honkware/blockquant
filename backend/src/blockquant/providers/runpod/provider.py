@@ -619,10 +619,12 @@ class RunPodProvider(Provider):
             lambda sftp: sftp.put(str(local_path), remote_path),
         )
 
-    def _upload_bytes(self, instance_id: str, data: bytes, remote_path: str):
+    def _upload_bytes(self, instance_id: str, data: bytes, remote_path: str, mode: int | None = None):
         def _put(sftp):
             with sftp.file(remote_path, "wb") as f:
                 f.write(data)
+            if mode is not None:
+                sftp.chmod(remote_path, mode)
         self._sftp_put_with_retry(instance_id, _put)
 
     def _upload_directory(self, instance_id: str, local_dir: Path, remote_dir: str):
@@ -1062,7 +1064,8 @@ class RunPodProvider(Provider):
             cfg["cal_cols"] = int(cal_cols)
         if test_prompt:
             cfg["test_prompt"] = str(test_prompt)
-        self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
+        # 0600 + quant.py unlinks it right after parse: it holds the HF token + key.
+        self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json", mode=0o600)
 
         # 2. Locate the remote quant script. On pre-baked images it lives
         # at /opt/blockquant/quant.py; otherwise we SFTP the canonical

@@ -63,14 +63,16 @@ def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float
     endpoint returns 403 for rpa_ keys. No dependency on the runpod SDK.
     """
     import subprocess
+    # Pass pod id + key via env, NOT argv -- argv shows up in `ps`/proc/cmdline.
     code = (
-        "import time, urllib.request as u;"
+        "import os, time, urllib.request as u;"
         f"time.sleep({float(grace_seconds)});"
-        f"u.urlopen(u.Request('https://rest.runpod.io/v1/pods/{pod_id}', "
-        f"method='DELETE', headers={{'Authorization': 'Bearer {api_key}'}}), timeout=20)"
+        "u.urlopen(u.Request('https://rest.runpod.io/v1/pods/' + os.environ['BQ_POD'], "
+        "method='DELETE', headers={'Authorization': 'Bearer ' + os.environ['BQ_KEY']}), timeout=20)"
     )
     subprocess.Popen(
         [sys.executable, "-c", code],
+        env={**os.environ, "BQ_POD": pod_id, "BQ_KEY": api_key},
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -553,6 +555,12 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
 def main() -> int:
     try:
         cfg = json.loads(Path(CONFIG_PATH).read_text())
+        # cfg holds the HF token + RunPod key -- shred it now that it's in memory
+        # so it isn't sitting world-readable on disk for the pod's whole life.
+        try:
+            os.unlink(CONFIG_PATH)
+        except OSError:
+            pass
         model_id: str = cfg["model_id"]
         variants: list[str] = cfg["variants"]
         hf_token: str = cfg.get("hf_token", "")
