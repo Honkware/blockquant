@@ -94,13 +94,8 @@ COPY docker/stub_formatron.py /tmp/stub_formatron.py
 RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 
 # ---- Verify the stack at build time (CPU-only) ----------------------------
-# Hard-assert torch stayed 2.8/cu129 (FLA must NOT have moved it) and that the
-# fla gated-delta op the qwen3_5 path needs is importable. exllamav3's CUDA ext
-# JITs on import; that needs nvcc (present) but can be flaky GPU-less, so its
-# import is guarded and deferred to the pod's first boot if it doesn't compile.
-# Hard-verify the stack assembles (CPU-safe): torch stayed 2.8, triton is the
-# pinned 3.3.1, and -- the load-bearing check -- `import fla` succeeds, which is
-# pure source parsing (no GPU) and was the exact thing failing on the pod.
+# Hard-assert torch stayed 2.8/cu129 and triton is the pinned 3.3.1 (the fix for
+# the 3.4.0 JIT source-parser bug that broke fla import on the pod).
 RUN python - <<'PY'
 import torch, importlib.metadata as m
 assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
@@ -108,11 +103,12 @@ assert m.version("triton").startswith("3.3"), f"triton not 3.3.x: {m.version('tr
 print("torch", torch.__version__, "| triton", m.version("triton"),
       "| fla", m.version("flash-linear-attention"),
       "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))
-# `import fla` decorates triton kernels (parsing -- CPU) then inits the CUDA
-# driver. On this GPU-less builder it must reach the driver init: that proves
-# the triton-3.4 parse bug is GONE. The driver error is expected here and is
-# satisfied on the actual pod; any OTHER error (e.g. the parse AttributeError)
-# is a real regression and fails the build.
+PY
+
+# `import fla` decorates triton kernels (parse -- CPU) then inits the CUDA driver.
+# On this GPU-less builder it must REACH the driver init: that proves the
+# triton-3.4 parse bug is gone. The driver error is expected here (satisfied on
+# the pod); any OTHER error (e.g. the parse AttributeError) fails the build.
 RUN python - <<'PY'
 try:
     import fla
@@ -121,6 +117,7 @@ except RuntimeError as e:
     assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
     print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
+
 # exllamav3's CUDA ext JITs on import (needs nvcc; flaky GPU-less) -> best-effort.
 RUN python -c "import exllamav3; print('exllamav3 import ok')" \
     || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
