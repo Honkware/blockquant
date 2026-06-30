@@ -741,8 +741,13 @@ class RunPodProvider(Provider):
             # signal) rather than rejecting a working image.
             mn = _MIN_EXLLAMAV3
             health_code = (
-                "import torch, exllamav3, sys\n"
+                "import torch, sys\n"
                 "print('[gpu]', torch.cuda.get_device_name(0))\n"
+                "try:\n"
+                "    import triton; print('[triton]', triton.__version__)\n"
+                "except Exception as e:\n"
+                "    print('[triton] ERR', repr(e))\n"
+                "import exllamav3\n"
                 "v = ''\n"
                 "try:\n"
                 "    from importlib.metadata import version as _ver\n"
@@ -766,7 +771,7 @@ class RunPodProvider(Provider):
             if health["code"] != 0:
                 logger.error(
                     f"Pre-baked health check failed (code {health['code']}):\n"
-                    f"{health['stdout'].strip()}\n{health['stderr'][:1500]}"
+                    f"{health['stdout'].strip()}\n...\n{health['stderr'][-2500:]}"
                 )
                 return False
             logger.info(f"Health check output:\n{health['stdout'].strip()}")
