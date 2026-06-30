@@ -91,7 +91,7 @@ def _arch_needs_master(model_id: str, token: str) -> bool:
 
 
 def _arch_needs_exl3_043(model_id: str, token: str) -> bool:
-    """True for archs needing the fresh exllamav3 0.0.43 image (qwen3_5*, ministral3)."""
+    """True for archs needing the 0.0.43/py3.12 image (qwen3_5*, qwen3_next -- linear attn + fla)."""
     hay = _arch_markers(model_id, token)
     return any(m in hay for m in _EXL3_043_ARCH_MARKERS)
 
