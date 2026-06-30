@@ -1,0 +1,123 @@
+# BlockQuant pre-baked RunPod image — Qwen3.5 variant.
+#
+# Same shape as Dockerfile.runpod but bakes exllamav3 c5d9c65 (0.0.43) on a
+# torch-2.8/cu129 base + flash-linear-attention, which 0.0.43 needs for the
+# qwen3_5 / qwen3_5_moe linear (gated-delta) attention path (gdn.cu + fla ops).
+# run_runpod_job.py routes ONLY those archs here; every proven model stays on
+# Dockerfile.runpod (0.0.38), since 0.0.43 regresses them (e.g. Qwen3.6).
+#
+# Why a separate file/base: flash-linear-attention 0.5.x needs torch>=2.7, so it
+# cannot be built on Dockerfile.runpod's torch-2.6/cu124 base. flash-attn is
+# intentionally NOT installed (SDPA is adequate for quant calibration, as in the
+# default bootstrap path); patch_flash_attn.py keeps exllamav3 importing without it.
+
+# ---- Base ----------------------------------------------------------------
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3-pip \
+        git wget ca-certificates \
+        ninja-build build-essential \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && python -m pip install --upgrade pip
+
+# ---- torch 2.8 / cu129 (flash-linear-attention needs torch>=2.7) ----------
+RUN python -m pip install \
+        "torch==2.8.0" \
+        --index-url https://download.pytorch.org/whl/cu129
+
+# ---- Python deps ----------------------------------------------------------
+# transformers>=4.45 + numpy>=2.1 are exllamav3 0.0.43 / FLA floors; the rest
+# mirror Dockerfile.runpod.
+RUN python -m pip install \
+        "hf_transfer>=0.1.6" \
+        "huggingface-hub>=0.21" \
+        "transformers>=4.45.0" \
+        "tokenizers>=0.21.1" \
+        "safetensors>=0.4" \
+        "datasets>=2.0" \
+        "numpy>=2.1.0" \
+        "Pillow>=10.0" \
+        "marisa-trie>=1.2" \
+        "pydantic==2.11.0" \
+        "kbnf>=0.4.2" \
+        "formatron>=0.5.0" \
+        "rich>=13.0" \
+        "tqdm" \
+        "psutil" \
+        "sentencepiece" \
+        "pyyaml" \
+        "typing_extensions" \
+        "einops"
+
+# ---- ExLlamaV3 0.0.43 -----------------------------------------------------
+# --no-deps as on the proven image (its metadata hard-requires flash-attn/
+# xformers; we own those paths). The qwen3_5 fixes + gdn.cu kernels are in this
+# commit. Bump behind an end-to-end Qwen3.5 pass.
+ARG EXLLAMAV3_REF=c5d9c65
+RUN python -m pip install --no-cache-dir --no-deps \
+        "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
+
+# ---- flash-linear-attention (the qwen3_5 gated-delta-net path) ------------
+# Required by exllamav3 0.0.43 for linear-attention archs (fla.ops.gated_delta_rule).
+# Bare install — FLA 0.5.x no longer pulls torch/triton, so it uses the baked
+# torch-2.8 + its triton and can't move them. Pulls fla-core + transformers.
+RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
+
+# ---- Make exllamav3 import without flash-attn (not installed here) ---------
+COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
+RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
+COPY docker/patch_attn_reshape.py /tmp/patch_attn_reshape.py
+RUN python /tmp/patch_attn_reshape.py && rm /tmp/patch_attn_reshape.py
+
+# ---- Bundled calibration corpus ------------------------------------------
+COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
+RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
+
+# ---- Stub formatron (quant-only image) ------------------------------------
+COPY docker/stub_formatron.py /tmp/stub_formatron.py
+RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
+
+# ---- Verify the stack at build time (CPU-only) ----------------------------
+# Hard-assert torch stayed 2.8/cu129 (FLA must NOT have moved it) and that the
+# fla gated-delta op the qwen3_5 path needs is importable. exllamav3's CUDA ext
+# JITs on import; that needs nvcc (present) but can be flaky GPU-less, so its
+# import is guarded and deferred to the pod's first boot if it doesn't compile.
+RUN python - <<'PY'
+import torch
+import importlib.metadata as m
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: F401
+assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
+print("torch", torch.__version__, "| exllamav3", m.version("exllamav3"), "| fla ok")
+PY
+RUN python -c "import exllamav3; print('exllamav3 import ok')" \
+    || echo "(exllamav3 JIT deferred to first pod boot — deps are cached)"
+
+# ---- BlockQuant remote entrypoint ----------------------------------------
+RUN mkdir -p /opt/blockquant
+COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
+COPY backend/src/blockquant/cards.py /opt/blockquant/cards.py
+COPY backend/templates/card_template.md /opt/blockquant/card_template.md
+COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
+RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
+
+LABEL org.opencontainers.image.title="BlockQuant RunPod Qwen3.5" \
+      org.opencontainers.image.description="exllamav3 0.0.43 + flash-linear-attention; qwen3_5/qwen3_5_moe only." \
+      org.opencontainers.image.source="https://github.com/Honkware/blockquant" \
+      org.opencontainers.image.licenses="MIT" \
+      blockquant.exllamav3_ref="${EXLLAMAV3_REF}" \
+      blockquant.torch_version="2.8.0+cu129" \
+      blockquant.cuda_runtime="12.9.1"
+
+WORKDIR /workspace
+EXPOSE 22
+CMD ["/opt/blockquant/entrypoint.sh"]

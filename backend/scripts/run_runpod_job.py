@@ -58,9 +58,18 @@ _NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
 _MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
 _MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
 
+# Qwen3.5 (qwen3_5 / qwen3_5_moe, linear/gated-delta attention) crashes at the
+# first layer on the proven 0.0.38 image. Route ONLY those archs to an image
+# baked at exllamav3 c5d9c65 (0.0.43) WITH flash-linear-attention, which carries
+# the qwen3_5 fixes + gdn.cu kernels. 0.0.43 regresses proven models (Qwen3.6),
+# so everyone else stays put. Substring "qwen3_5" matches the dense AND the MoE
+# variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
+_QWEN35_IMAGE = os.environ.get("RUNPOD_QWEN35_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43")
+_QWEN35_ARCH_MARKERS = ("qwen3_5",)
 
-def _arch_needs_master(model_id: str, token: str) -> bool:
-    """True if the model's architecture is only supported on exllamav3 master."""
+
+def _arch_markers(model_id: str, token: str) -> str:
+    """Lowercased 'architectures + model_type' from config.json, '' on failure."""
     try:
         import json as _json
         from huggingface_hub import hf_hub_download
@@ -68,10 +77,21 @@ def _arch_needs_master(model_id: str, token: str) -> bool:
         with open(p) as f:
             cfg = _json.load(f)
         archs = " ".join(cfg.get("architectures") or [])
-        hay = f"{archs} {cfg.get('model_type', '')}".lower()
-        return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
+        return f"{archs} {cfg.get('model_type', '')}".lower()
     except Exception:
-        return False
+        return ""
+
+
+def _arch_needs_master(model_id: str, token: str) -> bool:
+    """True if the model's architecture is only supported on exllamav3 master."""
+    hay = _arch_markers(model_id, token)
+    return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
+
+
+def _arch_needs_qwen35(model_id: str, token: str) -> bool:
+    """True for Qwen3.5 archs (qwen3_5 / qwen3_5_moe)."""
+    hay = _arch_markers(model_id, token)
+    return any(m in hay for m in _QWEN35_ARCH_MARKERS)
 
 
 def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
@@ -366,11 +386,16 @@ def main():
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
 
-    # Pick exllamav3 by architecture (unless an image was pinned explicitly).
-    # Stable 0.0.37 (the bootstrap path) for the proven models incl. Qwen3.6;
-    # the master image only for archs that need it (e.g. LFM2), since master
-    # regresses Qwen3.6.
-    if not args.image:
+    # Pick exllamav3 by architecture. Qwen3.5 (qwen3_5 / qwen3_5_moe) segfaults
+    # on the proven image, so it OVERRIDES even an explicitly-pinned --image (the
+    # bot always passes the baked RUNPOD_IMAGE) and forces the 0.0.43 + FLA image.
+    # Everything else keeps its pinned image; if none was pinned, fall through to
+    # the lfm2->master / stable-bootstrap pick so proven models (incl. Qwen3.6)
+    # never move off today's image.
+    if _arch_needs_qwen35(args.model, args.hf_token):
+        args.image = _QWEN35_IMAGE
+        print(f"[image] {args.model} is Qwen3.5; forcing {args.image} (exllamav3 0.0.43 + FLA)", flush=True)
+    elif not args.image:
         if _arch_needs_master(args.model, args.hf_token):
             args.image = _MASTER_IMAGE
             print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
