@@ -1,18 +1,20 @@
 # BlockQuant pre-baked RunPod image — Qwen3.5 variant.
 #
-# Same shape as Dockerfile.runpod but bakes exllamav3 c5d9c65 (0.0.43) on a
-# torch-2.8/cu129 base + flash-linear-attention, which 0.0.43 needs for the
-# qwen3_5 / qwen3_5_moe linear (gated-delta) attention path (gdn.cu + fla ops).
-# run_runpod_job.py routes ONLY those archs here; every proven model stays on
-# Dockerfile.runpod (0.0.38), since 0.0.43 regresses them (e.g. Qwen3.6).
+# Bakes exllamav3 c5d9c65 (0.0.43) + flash-linear-attention for the qwen3_5 /
+# qwen3_5_moe linear (gated-delta) attention path (gdn.cu + fla ops). Routed to
+# ONLY those archs by run_runpod_job.py; proven models stay on Dockerfile.runpod.
 #
-# Why a separate file/base: flash-linear-attention 0.5.x needs torch>=2.7, so it
-# cannot be built on Dockerfile.runpod's torch-2.6/cu124 base. flash-attn is
-# intentionally NOT installed (SDPA is adequate for quant calibration, as in the
-# default bootstrap path); patch_flash_attn.py keeps exllamav3 importing without it.
+# **Python 3.12** is load-bearing here. fla 0.5.1's triton kernels trip triton
+# bug #5224 (multi-decorator @triton.jit -> inspect.getsource returns only the
+# decorators -> `import fla` AttributeError) on Python 3.11, but NOT on 3.12
+# (different inspect/tokenize). Verified on a GPU pod: py3.11 fails, py3.12
+# imports fla cleanly. So ubuntu24.04 (native py3.12), torch 2.8/cu129, and
+# triton stays at its native 3.4.0 (no downgrade — the bug was python, not triton).
+# flash-attn is intentionally NOT installed (SDPA is fine for quant calibration);
+# patch_flash_attn.py keeps exllamav3 importing without it.
 
-# ---- Base ----------------------------------------------------------------
-FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
+# ---- Base (ubuntu24.04 -> Python 3.12) ------------------------------------
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -20,24 +22,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3-pip \
+        python3.12 python3.12-dev python3-pip \
         git wget ca-certificates \
         ninja-build build-essential \
         openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && python -m pip install --upgrade pip
 
-# ---- torch 2.8 / cu129 (flash-linear-attention needs torch>=2.7) ----------
+# ---- torch 2.8 / cu129 (pip auto-selects the cp312 wheel) ------------------
 RUN python -m pip install \
         "torch==2.8.0" \
         --index-url https://download.pytorch.org/whl/cu129
 
 # ---- Python deps ----------------------------------------------------------
-# transformers>=4.45 + numpy>=2.1 are exllamav3 0.0.43 / FLA floors; the rest
-# mirror Dockerfile.runpod.
 RUN python -m pip install \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
@@ -60,24 +61,15 @@ RUN python -m pip install \
         "einops"
 
 # ---- ExLlamaV3 0.0.43 -----------------------------------------------------
-# --no-deps as on the proven image (its metadata hard-requires flash-attn/
-# xformers; we own those paths). The qwen3_5 fixes + gdn.cu kernels are in this
-# commit. Bump behind an end-to-end Qwen3.5 pass.
 ARG EXLLAMAV3_REF=c5d9c65
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
 # ---- flash-linear-attention (the qwen3_5 gated-delta-net path) ------------
-# Required by exllamav3 0.0.43 for linear-attention archs (fla.ops.gated_delta_rule).
-# Bare install — FLA 0.5.x no longer pulls torch/triton, so it uses the baked
-# torch-2.8 + its triton and can't move them. Pulls fla-core + transformers.
+# Required by exllamav3 0.0.43 for linear-attention archs. Bare install — FLA
+# 0.5.x no longer pulls torch/triton, so it uses the baked torch-2.8 + its native
+# triton 3.4.0 (which imports fine under python 3.12).
 RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
-
-# torch 2.8 ships triton 3.4.0, whose JITFunction source parser (jit.py) chokes
-# on fla 0.5.1's autotuned kernels at IMPORT (re.search(...).start() on None ->
-# import fla fails). Pin triton 3.3.1, which parses them cleanly. Quant uses
-# triton only via fla, never torch.compile, so this is safe under torch 2.8.
-RUN python -m pip install --no-cache-dir "triton==3.3.1"
 
 # ---- Make exllamav3 import without flash-attn (not installed here) ---------
 COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
@@ -93,22 +85,20 @@ RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 COPY docker/stub_formatron.py /tmp/stub_formatron.py
 RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 
-# ---- Verify the stack at build time (CPU-only) ----------------------------
-# Hard-assert torch stayed 2.8/cu129 and triton is the pinned 3.3.1 (the fix for
-# the 3.4.0 JIT source-parser bug that broke fla import on the pod).
+# ---- Verify the stack at build time ---------------------------------------
+# Hard-assert python 3.12 + torch 2.8 (the combo that makes `import fla` work).
 RUN python - <<'PY'
-import torch, importlib.metadata as m
-assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
-assert m.version("triton").startswith("3.3"), f"triton not 3.3.x: {m.version('triton')}"
-print("torch", torch.__version__, "| triton", m.version("triton"),
-      "| fla", m.version("flash-linear-attention"),
+import sys, torch, importlib.metadata as m
+assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
+assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
+print("python", sys.version.split()[0], "| torch", torch.__version__,
+      "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
       "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))
 PY
-
-# `import fla` decorates triton kernels (parse -- CPU) then inits the CUDA driver.
-# On this GPU-less builder it must REACH the driver init: that proves the
-# triton-3.4 parse bug is gone. The driver error is expected here (satisfied on
-# the pod); any OTHER error (e.g. the parse AttributeError) fails the build.
+# `import fla` parses triton kernels (CPU) then inits the CUDA driver. On the
+# GPU-less builder it must REACH the driver init -- proving the #5224 parse bug
+# is gone under py3.12. The driver error is expected here (satisfied on the pod);
+# the parse AttributeError (the py3.11 failure) would fail the build instead.
 RUN python - <<'PY'
 try:
     import fla
@@ -117,8 +107,7 @@ except RuntimeError as e:
     assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
     print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
-
-# exllamav3's CUDA ext JITs on import (needs nvcc; flaky GPU-less) -> best-effort.
+# exllamav3's CUDA ext JITs on import (ninja present) -> best-effort GPU-less.
 RUN python -c "import exllamav3; print('exllamav3 import ok')" \
     || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
 
@@ -131,10 +120,11 @@ COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
 RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
 
 LABEL org.opencontainers.image.title="BlockQuant RunPod Qwen3.5" \
-      org.opencontainers.image.description="exllamav3 0.0.43 + flash-linear-attention; qwen3_5/qwen3_5_moe only." \
+      org.opencontainers.image.description="exllamav3 0.0.43 + flash-linear-attention on python 3.12; qwen3_5/qwen3_5_moe only." \
       org.opencontainers.image.source="https://github.com/Honkware/blockquant" \
       org.opencontainers.image.licenses="MIT" \
       blockquant.exllamav3_ref="${EXLLAMAV3_REF}" \
+      blockquant.python_version="3.12" \
       blockquant.torch_version="2.8.0+cu129" \
       blockquant.cuda_runtime="12.9.1"
 
