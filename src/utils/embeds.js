@@ -18,7 +18,7 @@ export function jobQueued({ url, bpws, categories, userId }) {
     .setColor(COLORS.info)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'BPW', value: bpws.map((b) => `\`${b}\``).join('  '), inline: true },
       { name: 'Categories', value: categories.join(', ') || 'None', inline: true }
     )
@@ -47,7 +47,7 @@ export function jobProgress({
     .setColor(COLORS.pending)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Stage', value: stage ?? 'Working…', inline: true },
       { name: 'Current', value: bpwText, inline: true },
       { name: 'Progress', value: bar, inline: false },
@@ -84,7 +84,7 @@ export function jobProgressParallel({ url, userId, variants, state }) {
     .setColor(color)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Variants', value: lines.join('\n') || 'starting...', inline: false }
     )
     .setTimestamp();
@@ -122,7 +122,7 @@ export function jobComplete({ url, userId, results }) {
     .setTitle('✅ Quantization Complete')
     .setColor(COLORS.success)
     .setDescription(`Requested by <@${userId}>`)
-    .addFields({ name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false });
+    .addFields({ name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false });
 
   // Chunk result lines into fields of ≤1024 characters each
   const FIELD_LIMIT = 1024;
@@ -152,7 +152,7 @@ export function jobFailed({ url, userId, error }) {
     .setColor(COLORS.error)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Error', value: `\`\`\`${truncate(safeError, 500)}\`\`\``, inline: false }
     )
     .setTimestamp();
