@@ -73,6 +73,12 @@ RUN python -m pip install --no-cache-dir --no-deps \
 # torch-2.8 + its triton and can't move them. Pulls fla-core + transformers.
 RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
 
+# torch 2.8 ships triton 3.4.0, whose JITFunction source parser (jit.py) chokes
+# on fla 0.5.1's autotuned kernels at IMPORT (re.search(...).start() on None ->
+# import fla fails). Pin triton 3.3.1, which parses them cleanly. Quant uses
+# triton only via fla, never torch.compile, so this is safe under torch 2.8.
+RUN python -m pip install --no-cache-dir "triton==3.3.1"
+
 # ---- Make exllamav3 import without flash-attn (not installed here) ---------
 COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
 RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
@@ -92,23 +98,21 @@ RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 # fla gated-delta op the qwen3_5 path needs is importable. exllamav3's CUDA ext
 # JITs on import; that needs nvcc (present) but can be flaky GPU-less, so its
 # import is guarded and deferred to the pod's first boot if it doesn't compile.
+# Hard-verify the stack assembles (CPU-safe): torch stayed 2.8, triton is the
+# pinned 3.3.1, and -- the load-bearing check -- `import fla` succeeds, which is
+# pure source parsing (no GPU) and was the exact thing failing on the pod.
 RUN python - <<'PY'
-import torch, importlib.metadata as m, traceback
-print("VERS torch", torch.__version__)
-for pkg in ("triton", "pytorch-triton", "flash-linear-attention", "fla-core",
-            "exllamav3", "transformers", "xformers"):
-    try:
-        print("VERS", pkg, m.version(pkg))
-    except Exception:
-        print("VERS", pkg, "NOT-INSTALLED")
+import torch, importlib.metadata as m
+import fla  # MUST import: the triton-3.4 parse bug is what broke the pod
 assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
-try:
-    import fla
-    print("FLA IMPORT OK")
-except Exception:
-    print("FLA IMPORT FAILED:")
-    traceback.print_exc()
+assert m.version("triton").startswith("3.3"), f"triton not 3.3.x: {m.version('triton')}"
+print("torch", torch.__version__, "| triton", m.version("triton"),
+      "| fla", m.version("flash-linear-attention"),
+      "| exllamav3", m.version("exllamav3"), "| FLA IMPORT OK")
 PY
+# exllamav3's CUDA ext JITs on import (needs nvcc; flaky GPU-less) -> best-effort.
+RUN python -c "import exllamav3; print('exllamav3 import ok')" \
+    || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
