@@ -115,6 +115,49 @@ def _ensure_fast_tokenizer(model_dir: Path) -> None:
     print(f"[tokenizer] WARN could not build tokenizer.json: {last}", flush=True)
 
 
+# Config fields exllamav3 reads as ints. Fine-tunes/merges sometimes emit them
+# as floats (e.g. "original_max_position_embeddings": 16384.0), and a float where
+# an int is expected makes ext.rope() raise "incompatible function arguments"
+# (this killed pagestorm-14b / ministral3 -- diagnosed by turboderp).
+_INT_CFG_FIELDS = {
+    "original_max_position_embeddings", "max_position_embeddings",
+    "head_dim", "hidden_size", "intermediate_size", "moe_intermediate_size",
+    "shared_expert_intermediate_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "num_experts", "num_experts_per_tok", "num_local_experts",
+    "sliding_window", "vocab_size", "bos_token_id", "eos_token_id", "pad_token_id",
+}
+
+
+def _sanitize_config(model_dir: Path) -> None:
+    """Coerce known integer config fields that ship as floats back to ints, incl.
+    nested configs (llama_4_scaling, rope_parameters, text_config, ...). Only
+    rewrites integral floats of allow-listed int fields, so genuine floats
+    (rope_theta, scaling factors) are untouched."""
+    cfg_path = model_dir / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    fixed = []
+
+    def walk(o, pfx=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in _INT_CFG_FIELDS and isinstance(v, float) and v == int(v):
+                    o[k] = int(v)
+                    fixed.append(f"{pfx}{k}: {v} -> {int(v)}")
+                else:
+                    walk(v, f"{pfx}{k}.")
+        elif isinstance(o, list):
+            for x in o:
+                walk(x, pfx)
+
+    walk(cfg)
+    if fixed:
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        print(f"[config] coerced float int-fields: {', '.join(fixed)}", flush=True)
+
+
 def _eval_text() -> str:
     """Eval text for the KL metric: exllamav3's bundled calibration corpus.
 
@@ -624,6 +667,7 @@ def main() -> int:
             raise _dl_err["exc"]
         print("[download] complete", flush=True)
 
+        _sanitize_config(model_dir)
         _qwen2vl_preprocessor_shim(model_dir)
         _ensure_fast_tokenizer(model_dir)
 

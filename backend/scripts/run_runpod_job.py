@@ -58,17 +58,16 @@ _NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
 _MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
 _MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
 
-# Some newer archs crash on the proven 0.0.38 image and need exllamav3 c5d9c65
-# (0.0.43) on python 3.12, with the ext compiled FRESH on the pod (the 0.0.38
-# image's baked ext is stale vs its own rope.py). Route ONLY these:
-#   - qwen3_5 / qwen3_5_moe: gated-delta linear attention (needs flash-linear-attention;
-#     fla's triton kernels only import on py3.12, see triton #5224)
-#   - ministral3: rope() arg mismatch against the stale 0.0.38 ext
-# 0.0.43 regresses proven models (Qwen3.6), so everyone else stays on 0.0.38.
+# Qwen3.5 (qwen3_5 / qwen3_5_moe) and Qwen3-Next use gated-delta linear attention,
+# which exllamav3 only handles in 0.0.43 via flash-linear-attention -- and fla's
+# triton kernels only import on python 3.12 (triton #5224). So route ONLY those
+# archs to the 0.0.43 / py3.12 image. 0.0.43 regresses proven models (Qwen3.6),
+# so everyone else stays on 0.0.38. (ministral3's layer-0 crash was NOT this -- it
+# was a float config field; remote/quant.py _sanitize_config fixes it on any image.)
 # Markers are substrings of the lowercased arch+model_type; "qwen3_5" matches the
 # dense AND MoE variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
 _EXL3_043_IMAGE = os.environ.get("RUNPOD_EXL3_043_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312")
-_EXL3_043_ARCH_MARKERS = ("qwen3_5", "ministral3")
+_EXL3_043_ARCH_MARKERS = ("qwen3_5", "qwen3_next")
 
 
 def _arch_markers(model_id: str, token: str) -> str:
