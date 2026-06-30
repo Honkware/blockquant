@@ -30,8 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/run/sshd \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
-    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED \
-    && python -m pip install --upgrade pip
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
 
 # ---- torch 2.8 / cu129 (pip auto-selects the cp312 wheel) ------------------
 RUN python -m pip install \
