@@ -516,21 +516,17 @@ def main() -> int:
 
         from huggingface_hub import HfApi, snapshot_download, login as hf_login
 
-        # Disk split: the unquantized model + HF cache live on the VOLUME
-        # (/workspace, sized for the model), and the quantized outputs + work dir
-        # live on the CONTAINER disk (/quant). Keeping the big input and the
-        # outputs on separate disks means neither has to be sized for both, and
-        # both disks get used. Only /workspace is the mounted volume; everything
-        # else (so /quant) is the container disk.
-        workspace = Path("/workspace/blockquant")   # VOLUME: unquantized model + cache
+        # Everything on the LOCAL container disk (/quant): model, HF cache, work
+        # dir, and outputs. RunPod's /workspace volume is network-backed (mfs) in
+        # some data centers and throws IO errors under big-model load -- Xet
+        # reconstruction failures on download and stalled layer reads during
+        # convert. Local NVMe is reliable; the container is sized for all of it.
+        quant_root = Path("/quant")
+        quant_root.mkdir(parents=True, exist_ok=True)
+        workspace = quant_root / "blockquant"        # model + HF cache (local now)
         workspace.mkdir(parents=True, exist_ok=True)
         model_dir = workspace / "model"
 
-        quant_root = Path("/quant")                  # CONTAINER disk: outputs + work
-        quant_root.mkdir(parents=True, exist_ok=True)
-
-        # HF download cache sits next to the model on the volume, so the download
-        # can't fill the container disk regardless of hf_hub version.
         hf_cache = workspace / ".hf-cache"
         hf_cache.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_cache))
@@ -539,8 +535,8 @@ def main() -> int:
         # on big repos written to the RunPod network volume; the plain HTTP path
         # (accelerated by hf_transfer below) is reliable.
         os.environ["HF_HUB_DISABLE_XET"] = "1"
-        print(f"[disk] model+cache -> {workspace} (volume) | outputs+work -> "
-              f"{quant_root} (container)", flush=True)
+        print(f"[disk] all on local container disk: model+cache -> {workspace} | "
+              f"outputs+work -> {quant_root}", flush=True)
 
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token

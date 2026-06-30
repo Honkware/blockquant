@@ -337,19 +337,19 @@ def main():
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
 
-    # Disk split: the VOLUME (/workspace) holds the unquantized model + HF cache;
-    # the CONTAINER disk (/quant) holds the quantized outputs + work dir. Each
-    # auto-sizes from the model + requested variants when set to "auto"; a number
-    # pins it.
+    # Model, cache, work, and outputs ALL live on the LOCAL container disk now --
+    # RunPod's /workspace volume is network-backed (mfs) in some DCs and throws
+    # IO errors under big-model load. Size the container for everything (model +
+    # outputs + work); the volume is a small unused stub.
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
-        args.container_disk = RunPodProvider.recommend_container_gb(
-            args.model, _variants, args.hf_token)
+        args.container_disk = (
+            RunPodProvider.recommend_container_gb(args.model, _variants, args.hf_token)
+            + RunPodProvider.recommend_volume_gb(args.model, _variants, args.hf_token))
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
-        args.volume_disk = RunPodProvider.recommend_volume_gb(
-            args.model, _variants, args.hf_token)
+        args.volume_disk = 10
     else:
         args.volume_disk = int(args.volume_disk)
     print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
