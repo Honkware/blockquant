@@ -58,14 +58,17 @@ _NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
 _MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
 _MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
 
-# Qwen3.5 (qwen3_5 / qwen3_5_moe, linear/gated-delta attention) crashes at the
-# first layer on the proven 0.0.38 image. Route ONLY those archs to an image
-# baked at exllamav3 c5d9c65 (0.0.43) WITH flash-linear-attention, which carries
-# the qwen3_5 fixes + gdn.cu kernels. 0.0.43 regresses proven models (Qwen3.6),
-# so everyone else stays put. Substring "qwen3_5" matches the dense AND the MoE
-# variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
-_QWEN35_IMAGE = os.environ.get("RUNPOD_QWEN35_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312")
-_QWEN35_ARCH_MARKERS = ("qwen3_5",)
+# Some newer archs crash on the proven 0.0.38 image and need exllamav3 c5d9c65
+# (0.0.43) on python 3.12, with the ext compiled FRESH on the pod (the 0.0.38
+# image's baked ext is stale vs its own rope.py). Route ONLY these:
+#   - qwen3_5 / qwen3_5_moe: gated-delta linear attention (needs flash-linear-attention;
+#     fla's triton kernels only import on py3.12, see triton #5224)
+#   - ministral3: rope() arg mismatch against the stale 0.0.38 ext
+# 0.0.43 regresses proven models (Qwen3.6), so everyone else stays on 0.0.38.
+# Markers are substrings of the lowercased arch+model_type; "qwen3_5" matches the
+# dense AND MoE variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
+_EXL3_043_IMAGE = os.environ.get("RUNPOD_EXL3_043_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312")
+_EXL3_043_ARCH_MARKERS = ("qwen3_5", "ministral3")
 
 
 def _arch_markers(model_id: str, token: str) -> str:
@@ -88,10 +91,10 @@ def _arch_needs_master(model_id: str, token: str) -> bool:
     return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
 
 
-def _arch_needs_qwen35(model_id: str, token: str) -> bool:
-    """True for Qwen3.5 archs (qwen3_5 / qwen3_5_moe)."""
+def _arch_needs_exl3_043(model_id: str, token: str) -> bool:
+    """True for archs needing the fresh exllamav3 0.0.43 image (qwen3_5*, ministral3)."""
     hay = _arch_markers(model_id, token)
-    return any(m in hay for m in _QWEN35_ARCH_MARKERS)
+    return any(m in hay for m in _EXL3_043_ARCH_MARKERS)
 
 
 def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
@@ -392,9 +395,9 @@ def main():
     # Everything else keeps its pinned image; if none was pinned, fall through to
     # the lfm2->master / stable-bootstrap pick so proven models (incl. Qwen3.6)
     # never move off today's image.
-    if _arch_needs_qwen35(args.model, args.hf_token):
-        args.image = _QWEN35_IMAGE
-        print(f"[image] {args.model} is Qwen3.5; forcing {args.image} (exllamav3 0.0.43 + FLA)", flush=True)
+    if _arch_needs_exl3_043(args.model, args.hf_token):
+        args.image = _EXL3_043_IMAGE
+        print(f"[image] {args.model} needs exllamav3 0.0.43; forcing {args.image} (py3.12 fresh-ext)", flush=True)
     elif not args.image:
         if _arch_needs_master(args.model, args.hf_token):
             args.image = _MASTER_IMAGE
