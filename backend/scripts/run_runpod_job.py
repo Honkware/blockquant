@@ -64,7 +64,7 @@ _MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
 # the qwen3_5 fixes + gdn.cu kernels. 0.0.43 regresses proven models (Qwen3.6),
 # so everyone else stays put. Substring "qwen3_5" matches the dense AND the MoE
 # variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
-_QWEN35_IMAGE = os.environ.get("RUNPOD_QWEN35_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43")
+_QWEN35_IMAGE = os.environ.get("RUNPOD_QWEN35_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-t331")
 _QWEN35_ARCH_MARKERS = ("qwen3_5",)
 
 

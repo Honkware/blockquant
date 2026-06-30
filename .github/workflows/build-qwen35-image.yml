@@ -8,7 +8,7 @@ name: build-qwen35-image
 # untouched. The Dockerfile's build-time check hard-asserts torch stayed 2.8
 # and that fla imports, so a broken build never pushes.
 #
-# Image lands at: ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43
+# Image lands at: ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-t331
 on:
   # Auto-rebuild when the Qwen3.5 Dockerfile (or this workflow) changes on the
   # working branch — lets us iterate without the workflow_dispatch-needs-default-
@@ -23,7 +23,7 @@ on:
       tag:
         description: "Image tag"
         required: false
-        default: "qwen35-exl3-0.0.43"
+        default: "qwen35-exl3-0.0.43-t331"
 
 jobs:
   build-and-push:
@@ -56,7 +56,7 @@ jobs:
           context: .
           file: docker/Dockerfile.runpod-qwen35
           push: true
-          tags: ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}
+          tags: ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43-t331' }}
           cache-from: type=gha,scope=qwen35
           cache-to: type=gha,mode=max,scope=qwen35
 
@@ -64,4 +64,4 @@ jobs:
         run: |
           echo "## Built Qwen3.5 image" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Tag: \`ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: \`ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43-t331' }}\`" >> $GITHUB_STEP_SUMMARY
