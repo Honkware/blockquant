@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
@@ -9,6 +10,7 @@ const ROOT = config.ROOT_DIR;
 const SCRIPT = path.join(ROOT, 'backend', 'scripts', 'run_runpod_job.py');
 const PUBLISH = path.join(ROOT, 'backend', 'scripts', 'publish_quant.py');
 const PYTHON = config.PYTHON_BIN || path.join(ROOT, 'backend', 'venv', 'bin', 'python');
+const LOG_DIR = path.join(ROOT, 'backend', 'logs');
 
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
@@ -120,14 +122,25 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (testPrompt) args.push('--test-prompt', testPrompt);
 
-    log.info(`spawn: ${PYTHON} ${args.join(' ')}`);
-    // PYTHONUNBUFFERED so the child's stdout (which drives the progress embed)
-    // streams line-by-line instead of block-buffering ~8KB when piped, which
-    // freezes the embed through the quiet bootstrap/download phases.
+    // Detached, own process group, stdout+stderr to a log file. A bot restart
+    // or crash then leaves the controller running: it finishes the quant,
+    // uploads, and self-terminates its pod normally — instead of dying and
+    // having its pod reaped (the pod name encodes this controller's pid). The
+    // bot tails the log file for progress while it is alive. PYTHONUNBUFFERED
+    // keeps the log line-buffered so the tail isn't ~8KB behind.
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const slug = modelId.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const logPath = path.join(LOG_DIR, `ctrl-${slug}-${variants.join('-')}-${Date.now()}.log`);
+    const logFd = fs.openSync(logPath, 'a');
+    log.info(`spawn (detached): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
     const child = spawn(PYTHON, args, {
       cwd: ROOT,
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
     });
+    child.unref();
+    fs.closeSync(logFd);
 
     const total = variants.length;
     const results = new Map(); // bpw -> url
@@ -220,22 +233,35 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
       }
     }
 
+    // Tail the log file (the controller writes to it, not to a pipe) and feed
+    // whole lines to the same parser. Polling is fine — progress lines arrive
+    // every few seconds at most.
     let buf = '';
-    child.stdout.on('data', (chunk) => {
-      buf += chunk.toString();
+    let readOffset = 0;
+    const drain = () => {
+      let stat;
+      try { stat = fs.statSync(logPath); } catch { return; }
+      if (stat.size <= readOffset) return;
+      const fd = fs.openSync(logPath, 'r');
+      const b = Buffer.alloc(stat.size - readOffset);
+      try { fs.readSync(fd, b, 0, b.length, readOffset); } finally { fs.closeSync(fd); }
+      readOffset = stat.size;
+      buf += b.toString('utf8');
       const lines = buf.split('\n');
       buf = lines.pop();
       for (const line of lines) {
         if (process.env.BQ_DEBUG_RAW) log.info(`[raw] ${line.slice(0, 140)}`);
         try { handleLine(line); } catch (e) { log.debug(`parse: ${e.message}`); }
       }
-    });
-    child.stderr.on('data', (c) => log.debug(`[cli] ${c.toString().trim().slice(0, 200)}`));
+    };
+    const tailTimer = setInterval(drain, 1000);
 
-    child.on('error', reject);
-    // close passes (code, signal): on a signal kill (operator cancel, bot
-    // shutdown) code is null and signal is the name, e.g. 'SIGKILL'.
-    child.on('close', (code, signal) => {
+    child.on('error', (err) => { clearInterval(tailTimer); reject(err); });
+    // exit fires while the bot is alive (it still tracks the detached child). On
+    // a deliberate kill, signal is set; a real error always exits with a code.
+    child.on('exit', (code, signal) => {
+      clearInterval(tailTimer);
+      drain(); // flush any final lines (esp. the last [upload] done)
       const out = variants.map((v) => {
         const url = results.get(v) || null;
         return {
