@@ -41,7 +41,7 @@ RUN python -m pip install \
 RUN python -m pip install \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
-        "transformers>=4.45.0" \
+        "transformers>=4.45.0,<5" \
         "tokenizers>=0.21.1" \
         "safetensors>=0.4" \
         "datasets>=2.0" \
@@ -103,12 +103,23 @@ RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 # pure source parsing (no GPU) and was the exact thing failing on the pod.
 RUN python - <<'PY'
 import torch, importlib.metadata as m
-import fla  # MUST import: the triton-3.4 parse bug is what broke the pod
 assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
 assert m.version("triton").startswith("3.3"), f"triton not 3.3.x: {m.version('triton')}"
 print("torch", torch.__version__, "| triton", m.version("triton"),
       "| fla", m.version("flash-linear-attention"),
-      "| exllamav3", m.version("exllamav3"), "| FLA IMPORT OK")
+      "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))
+# `import fla` decorates triton kernels (parsing -- CPU) then inits the CUDA
+# driver. On this GPU-less builder it must reach the driver init: that proves
+# the triton-3.4 parse bug is GONE. The driver error is expected here and is
+# satisfied on the actual pod; any OTHER error (e.g. the parse AttributeError)
+# is a real regression and fails the build.
+RUN python - <<'PY'
+try:
+    import fla
+    print("FLA IMPORT OK (gpu driver present)")
+except RuntimeError as e:
+    assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
+    print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
 # exllamav3's CUDA ext JITs on import (needs nvcc; flaky GPU-less) -> best-effort.
 RUN python -c "import exllamav3; print('exllamav3 import ok')" \
