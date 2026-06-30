@@ -154,6 +154,21 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     return False
 
 
+def _drain_failure(provider, instance_id, outcome: str) -> str:
+    """Distill a one-line reason from the remote log for a non-done outcome, so a
+    failure surfaces as the real cause instead of a bare exit code."""
+    try:
+        tail = provider.get_progress(instance_id, lines=500, raw=True) or ""
+    except Exception:
+        tail = ""
+    lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+    exc = next((ln.strip() for ln in reversed(lines)
+                if ln[:1].isalpha() and ("Error" in ln or "Exception" in ln) and ":" in ln), "")
+    if outcome == "failed":
+        return f"remote quant crashed: {exc or (lines[-1] if lines else 'see controller log')}"
+    return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
+
+
 def _recommend_max_price(base_gb: float | None) -> float:
     """Price cap scaled to model size. The quant is compute-bound, so a big
     model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
@@ -699,10 +714,8 @@ def main():
             on_progress=_print_new,
         )
         if outcome != "done":
-            print(
-                f"\n[watchdog] remote run hit the '{outcome}' limit; terminating pod.",
-                flush=True,
-            )
+            print(f"\n[joberror] {_drain_failure(provider, instance_id, outcome)}; terminating pod.",
+                  flush=True)
             sys.exit(3)  # finally still terminates the pod
 
         # One deep final drain (last ~500 lines) so the local log captures
