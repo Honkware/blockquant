@@ -60,8 +60,11 @@ RUN python -m pip install \
         "einops"
 
 # ---- ExLlamaV3 0.0.43 -----------------------------------------------------
+# EXLLAMA_NOCOMPILE: install without building the CUDA ext (the GPU-less CI
+# builder can't auto-detect an arch -> _get_cuda_arch_flags IndexError). The
+# ext JIT-builds on the pod's first boot (GPU + ninja present).
 ARG EXLLAMAV3_REF=c5d9c65
-RUN python -m pip install --no-cache-dir --no-deps \
+RUN EXLLAMA_NOCOMPILE=1 python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
 # ---- flash-linear-attention (the qwen3_5 gated-delta-net path) ------------
