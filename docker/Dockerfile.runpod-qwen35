@@ -95,12 +95,18 @@ RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
 RUN python - <<'PY'
 import torch
 import importlib.metadata as m
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: F401
 assert torch.__version__.startswith("2.8"), f"torch moved off 2.8: {torch.__version__}"
-print("torch", torch.__version__, "| exllamav3", m.version("exllamav3"), "| fla ok")
+print("torch", torch.__version__,
+      "| exllamav3", m.version("exllamav3"),
+      "| flash-linear-attention", m.version("flash-linear-attention"))
 PY
+# exllamav3's CUDA ext and fla's gated-delta triton kernels query the device at
+# import, so they can't load on the GPU-less CI builder; they import/JIT on the
+# pod's first boot. Attempt them here only for an informational signal.
 RUN python -c "import exllamav3; print('exllamav3 import ok')" \
-    || echo "(exllamav3 JIT deferred to first pod boot — deps are cached)"
+    || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
+RUN python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule; print('fla gdn ok')" \
+    || echo "(fla gated-delta import deferred to pod -- needs GPU at import)"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
