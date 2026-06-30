@@ -57,8 +57,8 @@ jobs:
           file: docker/Dockerfile.runpod-qwen35
           push: true
           tags: ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43-py312' }}
-          cache-from: type=gha,scope=qwen35
-          cache-to: type=gha,mode=max,scope=qwen35
+          # No gha layer cache: exporting a ~10GB image to it thrashes (slower than
+          # a clean full build). The Dockerfile is stable, so full builds are fine.
 
       - name: Image summary
         run: |
