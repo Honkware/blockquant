@@ -179,7 +179,6 @@ class RunPodProvider(Provider):
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     @staticmethod
-    @staticmethod
     def _base_download_gb(model_id: str, token: str = "") -> float | None:
         """Total HF download size of the base model in GB, or None on lookup
         failure."""
