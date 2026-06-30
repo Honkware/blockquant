@@ -68,7 +68,7 @@ export async function handleApproval(interaction) {
     embeds[color](
       `Request ${verb}`,
       [
-        `**Model:** \`${job.modelId}\``,
+        `**Model:** [\`${job.modelId}\`](https://huggingface.co/${job.modelId})`,
         `**Variants:** ${job.variants.join(', ')}`,
         `**Requested by:** <@${job.userId}>`,
         `**${verb} by:** <@${interaction.user.id}>`,
