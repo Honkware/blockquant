@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -307,44 +308,69 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
             pass
 
 
-def _write_cards(outputs, model_id, model_name, owner, hf_token,
-                 head_bits, cal_rows, model_dir) -> None:
-    """Render the polished card into each output dir before upload."""
-    import cards
+def _upload_folder_hb(api, path, repo_id, variant) -> None:
+    """upload_folder on a worker thread with a 20s heartbeat -- pushing tens of
+    GB is silent for minutes, the last quiet phase that could trip the
+    controller's stall watchdog. Raises on failure (after join)."""
+    import threading
+    done, err = threading.Event(), {}
 
+    def _do():
+        try:
+            api.upload_folder(folder_path=path, repo_id=repo_id, repo_type="model")
+        except Exception as exc:
+            err["exc"] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    secs = 0
+    while not done.wait(20):
+        secs += 20
+        print(f"[upload] {variant} pushing... {secs}s", flush=True)
+    t.join()
+    if "exc" in err:
+        raise err["exc"]
+
+
+def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
+                    head_bits, cal_rows, model_dir) -> None:
+    """Render each variant's card with the full cross-variant table and push
+    README.md to its repo. Runs after the serial upload+delete, so the out_dir
+    is gone -- sizes/KL come from the recs and the card goes up via the API."""
+    import cards
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
     rows_cal = int(cal_rows) if cal_rows else 250
     try:
         model_config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     except Exception:
         model_config = {}
 
-    quant_rows = []
-    for out in outputs:
-        out["_size_gb"] = _dir_size_gb(Path(out["path"]))
-        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
-        quant_rows.append({
-            "variant": out["variant"], "head_bits": head_bits,
-            "cal_rows": rows_cal, "size_gb": out["_size_gb"],
-            "url": f"https://huggingface.co/{repo_id}",
-            "kl_div": out.get("kl_div"),
-        })
+    quant_rows = [{
+        "variant": o["variant"], "head_bits": head_bits, "cal_rows": rows_cal,
+        "size_gb": o.get("_size_gb"),
+        "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
+        "kl_div": o.get("kl_div"),
+    } for o in outputs]
 
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(
-        owner=owner, base_name=model_name, token=hf_token,
-    )
+    collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
 
-    for out in outputs:
-        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
+    for o in outputs:
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
         card = cards.render_exl3_card(
-            base_repo=model_id, repo_id=repo_id, variant=out["variant"],
-            head_bits=head_bits, cal_rows=rows_cal, size_gb=out.get("_size_gb"),
+            base_repo=model_id, repo_id=repo_id, variant=o["variant"],
+            head_bits=head_bits, cal_rows=rows_cal, size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
             quantized_by=owner,
         )
-        (Path(out["path"]) / "README.md").write_text(card, encoding="utf-8")
-        print(f"[card] {out['variant']} written", flush=True)
+        api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
+                        repo_id=repo_id, repo_type="model")
+        print(f"[card] {o['variant']} written", flush=True)
 
 
 def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
@@ -603,13 +629,44 @@ def main() -> int:
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
 
+        api = owner = model_name = None
+        repo_ids = []
+        if hf_token:
+            api = HfApi(token=hf_token)
+            model_name = model_id.split("/")[-1]
+            # Resolve the user portion when no org was supplied -- HF rejects
+            # bare slugs without a namespace.
+            owner = hf_org or api.whoami()["name"]
+
+        def _publish(variant, out_dir, work_dir, rec):
+            # Serial: upload one variant and free its disk before the next, so
+            # peak = model + one output + one work dir + one kl-stage, not the
+            # sum over all variants. rmtree only AFTER a confirmed upload -- on
+            # failure the dirs stay for rescue_upload.py.
+            rec["_size_gb"] = _dir_size_gb(out_dir)
+            if not hf_token:
+                return
+            repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
+            print(f"[upload] {variant} -> {repo_id} ...", flush=True)
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
+            _upload_folder_hb(api, str(out_dir), repo_id, variant)
+            rec["hf_repo_id"] = repo_id
+            rec["hf_revision"] = "main"
+            rec["hf_url"] = f"https://huggingface.co/{repo_id}"
+            repo_ids.append(repo_id)
+            # Echo the URL so the dashboard's HF_URL parser rule can populate
+            # state["hf_url"].
+            print(f"[upload] {variant} done -> {rec['hf_url']}", flush=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+
         outputs = []
         for variant in variants:
             bpw = float(variant)
             out_dir = quant_root / f"output-{bpw}bpw"
             work_dir = quant_root / f"work-{bpw}"
             if (out_dir / "config.json").exists():
-                print(f"[skip] {variant} exists at {out_dir}", flush=True)
+                print(f"[skip] {variant} already quantized at {out_dir}", flush=True)
                 rec = {"variant": variant, "path": str(out_dir)}
                 try:
                     q = json.loads((out_dir / "bq_quality.json").read_text())
@@ -617,6 +674,7 @@ def main() -> int:
                         rec["kl_div"] = float(q["kl_div"])
                 except Exception:
                     pass
+                _publish(variant, out_dir, work_dir, rec)
                 outputs.append(rec)
                 continue
             print(f"[quantize] {variant} bpw ...", flush=True)
@@ -758,70 +816,20 @@ def main() -> int:
                     # status line above from being mis-parsed) so newlines/quotes
                     # in the reply survive the log relay; the bot decodes + previews.
                     print(f"[sample] {variant} b64 {b64}", flush=True)
+            _publish(variant, out_dir, work_dir, rec)
             outputs.append(rec)
 
         if hf_token:
-            print("[upload] to HuggingFace ...", flush=True)
-            api = HfApi(token=hf_token)
-            model_name = model_id.split("/")[-1]
-            # Resolve the user portion when no org was supplied — HF rejects
-            # bare slugs without a namespace.
-            owner = hf_org or api.whoami()["name"]
-
-            # Write the polished card into each output dir before upload, so
-            # upload_folder ships README.md with the weights. Best-effort:
-            # a card failure must never lose a finished quant.
+            # Re-render each card with the full cross-variant table now that every
+            # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
-                _write_cards(outputs, model_id, model_name, owner, hf_token,
-                             head_bits, cal_rows, model_dir)
+                _finalize_cards(outputs, model_id, model_name, owner, hf_token,
+                                head_bits, cal_rows, model_dir)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an
                 # UnboundLocalError in the outer handler's traceback.print_exc().
                 print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
-
-            repo_ids = []
-            for out in outputs:
-                slug = f"{model_name}-exl3-{out['variant']}bpw"
-                repo_id = f"{owner}/{slug}"
-                print(f"[upload] {out['variant']} -> {repo_id} ...", flush=True)
-                api.create_repo(
-                    repo_id=repo_id, repo_type="model",
-                    exist_ok=True, private=False,
-                )
-                # Upload on a worker thread with a heartbeat: pushing tens of GB
-                # is silent for minutes, the last quiet phase that could trip the
-                # controller's stall watchdog. Regular "[upload] still pushing"
-                # lines keep it alive. Errors surface after join().
-                import threading
-                _up_done = threading.Event()
-                _up_err: dict = {}
-
-                def _do_upload(path=out["path"], rid=repo_id) -> None:
-                    try:
-                        api.upload_folder(folder_path=path, repo_id=rid, repo_type="model")
-                    except Exception as exc:
-                        _up_err["exc"] = exc
-                    finally:
-                        _up_done.set()
-
-                _up_thread = threading.Thread(target=_do_upload, daemon=True)
-                _up_thread.start()
-                _up_secs = 0
-                while not _up_done.wait(20):
-                    _up_secs += 20
-                    print(f"[upload] {out['variant']} pushing... {_up_secs}s", flush=True)
-                _up_thread.join()
-                if "exc" in _up_err:
-                    raise _up_err["exc"]
-                out["hf_repo_id"] = repo_id
-                out["hf_revision"] = "main"
-                out["hf_url"] = f"https://huggingface.co/{repo_id}"
-                repo_ids.append(repo_id)
-                # Echo the URL so the dashboard's HF_URL parser rule can
-                # populate state["hf_url"] — without this, the run's last
-                # log line is just "[upload] complete" with no URL.
-                print(f"[upload] {out['variant']} done -> {out['hf_url']}", flush=True)
 
             try:
                 import cards

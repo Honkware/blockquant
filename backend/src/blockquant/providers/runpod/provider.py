@@ -192,50 +192,53 @@ class RunPodProvider(Provider):
         return base_gb if base_gb > 0 else None
 
     @staticmethod
-    def recommend_volume_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 60
-    ) -> int:
-        """Size the /workspace VOLUME, which now holds ONLY the unquantized model
-        plus its HF download cache (the quantized outputs + work dir live on the
-        container disk; see recommend_container_gb and remote/quant.py).
-
-        Sized as base_download x1.4 (model + any cache duplication during
-        download) + a margin. Falls back generously if the HF size lookup fails,
-        and never drops below floor_gb.
-        """
-        import math
-        base_gb = RunPodProvider._base_download_gb(model_id, token)
-        if base_gb is None:
-            return max(floor_gb, 250)
-        needed = base_gb * 1.4 + 20.0
-        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+    def _base_vocab(model_id: str, token: str = "") -> int | None:
+        """vocab_size from the model's config.json, or None on lookup failure.
+        Drives the KL-stage term in recommend_container_gb."""
+        import json
+        from pathlib import Path
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(model_id, "config.json", token=token or None)
+            cfg = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        v = cfg.get("vocab_size") or (cfg.get("text_config") or {}).get("vocab_size")
+        return int(v) if v else None
 
     @staticmethod
     def recommend_container_gb(
         model_id: str, variants, token: str = "", floor_gb: int = 120
     ) -> int:
-        """Size the CONTAINER disk, which holds the OS + deps plus the quantized
-        outputs and the conversion work dir (remote/quant.py writes outputs +
-        work to /quant on the container disk).
+        """Size the local-NVMe container disk for the SERIAL pipeline. remote/
+        quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
+        before the next, and everything (model, cache, work, outputs) lives on
+        the container disk -- the /workspace volume is a stub. So the peak is
+        bounded to one variant, NOT the sum:
 
-        remote/quant.py quantizes every requested variant before uploading, so
-        their outputs accumulate; size for the SUM of all outputs + one work dir
-        + an OS/deps margin. Never drops below floor_gb (the image + caches need
-        headroom regardless).
+            base_gb                       fp16 download, ~1x on disk via local_dir
+          + base_gb * max_bpw/16          largest single output
+          + base_gb * max_bpw/16          largest single work dir (~one output)
+          + kl_rows*seq_len*vocab*2        fp16 logits staged for the KL eval
+          + 30                             OS + torch/deps + scratch
+
+        Falls back generously when the HF lookups fail; never below floor_gb.
         """
         import math
         base_gb = RunPodProvider._base_download_gb(model_id, token)
         if base_gb is None:
-            return max(floor_gb, 160)
+            return max(floor_gb, 200)
         bpws = []
         for v in variants:
             try:
                 bpws.append(float(v))
             except (TypeError, ValueError):
                 bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
-        outputs = sum(base_gb * b / 16.0 for b in bpws)
-        work = base_gb * (max(bpws) if bpws else 8.0) / 16.0
-        needed = outputs + work + 40.0  # +40 for OS + torch/deps + scratch
+        max_bpw = max(bpws) if bpws else 8.0
+        out = work = base_gb * max_bpw / 16.0
+        vocab = RunPodProvider._base_vocab(model_id, token) or 200000
+        kl = 32 * 2048 * vocab * 2 / 1024**3
+        needed = base_gb + out + work + kl + 30.0
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------

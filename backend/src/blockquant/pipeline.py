@@ -57,21 +57,21 @@ def _run_remote_pipeline(
         provider_kwargs["api_key"] = config.runpod_api_key
         provider_kwargs["gpu_type"] = config.runpod_gpu_type
         provider_kwargs["cloud_type"] = config.runpod_cloud_type.value
-        provider_kwargs["container_disk_gb"] = config.runpod_container_disk_gb
-        # Size the /workspace VOLUME (where the model, work dir, and all outputs
-        # live) so the final safetensors write can't ENOSPC. Never below the
-        # configured value, so an explicit larger setting still wins.
+        # Everything (model, cache, work, outputs) lives on the local NVMe
+        # container disk now (remote/quant.py); the /workspace volume is a stub.
+        # Size the container for the bounded serial peak, never below configured.
         from blockquant.providers.runpod.provider import RunPodProvider as _RP
-        _recommended_vol = _RP.recommend_volume_gb(
+        _rec_container = _RP.recommend_container_gb(
             config.model_id, config.variants, config.hf_token
         )
-        _vol = max(config.runpod_volume_gb, _recommended_vol)
-        if _vol != config.runpod_volume_gb:
+        _container = max(config.runpod_container_disk_gb, _rec_container)
+        if _container != config.runpod_container_disk_gb:
             logger.info(
-                f"Volume disk: {_vol} GB "
-                f"(configured {config.runpod_volume_gb}, model needs ~{_recommended_vol})"
+                f"Container disk: {_container} GB "
+                f"(configured {config.runpod_container_disk_gb}, model needs ~{_rec_container})"
             )
-        provider_kwargs["volume_gb"] = _vol
+        provider_kwargs["container_disk_gb"] = _container
+        provider_kwargs["volume_gb"] = 10
         provider_kwargs["ssh_key_path"] = config.runpod_ssh_key_path
 
     provider = None

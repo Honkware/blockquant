@@ -339,21 +339,21 @@ def main():
 
     # Model, cache, work, and outputs ALL live on the LOCAL container disk now --
     # RunPod's /workspace volume is network-backed (mfs) in some DCs and throws
-    # IO errors under big-model load. Size the container for everything (model +
-    # outputs + work); the volume is a small unused stub.
+    # IO errors under big-model load. recommend_container_gb sizes the bounded
+    # serial peak (model + one output + one work + one kl-stage); the volume is
+    # a small unused stub.
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
-        args.container_disk = (
-            RunPodProvider.recommend_container_gb(args.model, _variants, args.hf_token)
-            + RunPodProvider.recommend_volume_gb(args.model, _variants, args.hf_token))
+        args.container_disk = RunPodProvider.recommend_container_gb(
+            args.model, _variants, args.hf_token)
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
         args.volume_disk = 10
     else:
         args.volume_disk = int(args.volume_disk)
-    print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
-          f"outputs+work -> container {args.container_disk} GB", flush=True)
+    print(f"[disk] all on local NVMe container -> /quant ({args.container_disk} GB) | "
+          f"/workspace volume {args.volume_disk} GB stub", flush=True)
 
     # Model size (HF download GB) drives the price cap AND the card ordering:
     # big models go to a capable card (compute-bound, ~3x faster for ~same total
