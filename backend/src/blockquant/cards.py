@@ -83,6 +83,16 @@ def _params_b_from_name(model_name: str, default: float = 35.0) -> float:
     return float(m.group(1)) if m else default
 
 
+def _arch_family(archs: list) -> str:
+    """Architecture family from a HF ``architectures`` entry, dropping the task
+    suffix: MistralForCausalLM -> Mistral, Qwen3MoeForCausalLM -> Qwen3Moe,
+    Gemma3ForConditionalGeneration -> Gemma3. Empty when the config lists none."""
+    if not archs:
+        return ""
+    a = archs[0]
+    return re.sub(r"(For[A-Z]\w*|LMHeadModel|Model)$", "", a) or a
+
+
 def derive_model_facts(config: dict, model_name: str = "") -> dict:
     """Pull architecture facts out of a HuggingFace ``config.json`` dict."""
     archs = config.get("architectures") or []
@@ -112,8 +122,12 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
         arch_line = "Dense"
 
     kind = "MoE" if is_moe else "Dense"
+    # The badge names the architecture family (Mistral, Qwen3Moe, ...); the
+    # dense/MoE split already lives in arch_line. Fall back to the split when the
+    # config carries no architectures entry.
     size = _size_tokens(model_name)
-    badge_text = f"{kind}_{size}" if size else kind
+    badge_label = _arch_family(archs) or kind
+    badge_text = f"{badge_label}_{size}" if size else badge_label
     # shields.io: literal hyphens must be doubled.
     arch_badge = badge_text.replace("-", "--")
 
