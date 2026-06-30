@@ -160,6 +160,61 @@ def _sanitize_config(model_dir: Path) -> None:
         print(f"[config] coerced float int-fields: {', '.join(fixed)}", flush=True)
 
 
+def _model_has_tensor_prefix(model_dir: Path, prefix: str) -> bool:
+    """True if any model tensor key starts with `prefix`. Reads the safetensors
+    index when present, else scans each .safetensors header. Fails OPEN (True) so
+    we never wrongly strip something on an unreadable model."""
+    idx = model_dir / "model.safetensors.index.json"
+    if idx.exists():
+        try:
+            return any(k.startswith(prefix) for k in json.loads(idx.read_text()).get("weight_map", {}))
+        except Exception:
+            return True
+    import struct
+    files = list(model_dir.glob("*.safetensors"))
+    if not files:
+        return True
+    for sf in files:
+        try:
+            with open(sf, "rb") as f:
+                hdr = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+            if any(k.startswith(prefix) for k in hdr):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _disable_missing_mtp(model_dir: Path) -> None:
+    """Qwen3.5 declares an MTP draft head (mtp_num_hidden_layers > 0), and
+    exllamav3 quantizes it -- but most fine-tunes ship no mtp.* weights, so the
+    convert dies on 'Required tensor mtp....weight not found'. If the weights
+    aren't there, zero mtp_num_hidden_layers so exllamav3 skips MTP and quantizes
+    the base model. (Diagnosed on Qwythos-9B.)"""
+    cfg_path = model_dir / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if _model_has_tensor_prefix(model_dir, "mtp"):
+        return
+    fixed = []
+
+    def walk(o, pfx=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == "mtp_num_hidden_layers" and isinstance(v, int) and v > 0:
+                    o[k] = 0
+                    fixed.append(f"{pfx}{k}: {v} -> 0")
+                else:
+                    walk(v, f"{pfx}{k}.")
+
+    walk(cfg)
+    if fixed:
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
+
+
 def _eval_text() -> str:
     """Eval text for the KL metric: exllamav3's bundled calibration corpus.
 
@@ -676,6 +731,7 @@ def main() -> int:
         print("[download] complete", flush=True)
 
         _sanitize_config(model_dir)
+        _disable_missing_mtp(model_dir)
         _qwen2vl_preprocessor_shim(model_dir)
         _ensure_fast_tokenizer(model_dir)
 
