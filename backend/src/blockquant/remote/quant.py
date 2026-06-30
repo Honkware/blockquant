@@ -535,6 +535,10 @@ def main() -> int:
         hf_cache.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_cache))
         os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
+        # Disable Xet. Its chunk-reconstruction step hits "IO Error (os error 5)"
+        # on big repos written to the RunPod network volume; the plain HTTP path
+        # (accelerated by hf_transfer below) is reliable.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
         print(f"[disk] model+cache -> {workspace} (volume) | outputs+work -> "
               f"{quant_root} (container)", flush=True)
 
