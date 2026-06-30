@@ -56,7 +56,7 @@ jobs:
           context: .
           file: docker/Dockerfile.runpod-qwen35
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}
+          tags: ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}
           cache-from: type=gha,scope=qwen35
           cache-to: type=gha,mode=max,scope=qwen35
 
@@ -64,4 +64,4 @@ jobs:
         run: |
           echo "## Built Qwen3.5 image" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Tag: \`ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: \`ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}\`" >> $GITHUB_STEP_SUMMARY
