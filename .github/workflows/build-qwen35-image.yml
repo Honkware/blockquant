@@ -10,16 +10,20 @@ name: build-qwen35-image
 #
 # Image lands at: ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43
 on:
+  # Auto-rebuild when the Qwen3.5 Dockerfile (or this workflow) changes on the
+  # working branch — lets us iterate without the workflow_dispatch-needs-default-
+  # branch dance. workflow_dispatch also works once this lands on master.
+  push:
+    branches: ["feat/gpu-autoselect"]
+    paths:
+      - "docker/Dockerfile.runpod-qwen35"
+      - ".github/workflows/build-qwen35-image.yml"
   workflow_dispatch:
     inputs:
       tag:
         description: "Image tag"
         required: false
         default: "qwen35-exl3-0.0.43"
-      exllamav3_ref:
-        description: "exllamav3 git ref to bake"
-        required: false
-        default: "c5d9c65"
 
 jobs:
   build-and-push:
@@ -51,10 +55,8 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.runpod-qwen35
-          build-args: |
-            EXLLAMAV3_REF=${{ github.event.inputs.exllamav3_ref }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag }}
+          tags: ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}
           cache-from: type=gha,scope=qwen35
           cache-to: type=gha,mode=max,scope=qwen35
 
@@ -62,5 +64,4 @@ jobs:
         run: |
           echo "## Built Qwen3.5 image" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Tag: \`ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "exllamav3 ref: \`${{ github.event.inputs.exllamav3_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: \`ghcr.io/${{ github.repository_owner }}/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43' }}\`" >> $GITHUB_STEP_SUMMARY
