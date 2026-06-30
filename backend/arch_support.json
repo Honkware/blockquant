@@ -1,0 +1,326 @@
+{
+  "generated_at": "2026-06-30T22:22:15+00:00",
+  "exllamav3": {
+    "stable": {
+      "ref": "c18e9b4",
+      "version": "0.0.38"
+    },
+    "latest": {
+      "ref": "c5d9c65",
+      "version": "0.0.43"
+    }
+  },
+  "images": {
+    "stable": "ghcr.io/honkware/blockquant (0.0.38, default)",
+    "exl3_043": "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312",
+    "master": "ghcr.io/honkware/blockquant:v0.1.3"
+  },
+  "architectures": [
+    {
+      "arch": "AfmoeForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "ApertusForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "ArceeForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Cohere2ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "CohereForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "DFlashDraftModel",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "DeciLMForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Dots1ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Ernie4_5_ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Ernie4_5_MoeForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Exaone4ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Gemma2ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Gemma3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Gemma3ForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Gemma4ForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Gemma4UnifiedForConditionalGeneration",
+      "tier": "latest_only",
+      "image": "exl3_043",
+      "note": "new in exllamav3 0.0.43"
+    },
+    {
+      "arch": "Glm4ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Glm4MoeForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Glm4vForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Glm4vMoeForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "HCXVisionV2ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "HyperCLOVAXForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "IQuestCoderForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Lfm2MoeForCausalLM",
+      "tier": "special",
+      "image": "master",
+      "note": "LFM2 MoE -- exllamav3 master image"
+    },
+    {
+      "arch": "LlamaForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "MiMoForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "MiniMaxM2ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Ministral3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Mistral3ForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "MistralForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "MixtralForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "NanoChatForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Olmo3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "OlmoHybridForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Phi3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen2ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen2_5_VLForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen3MoeForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen3NextForCausalLM",
+      "tier": "special",
+      "image": "exl3_043",
+      "note": "linear attn; needs flash-linear-attention + python 3.12"
+    },
+    {
+      "arch": "Qwen3VLForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen3VLMoeForConditionalGeneration",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Qwen3_5ForCausalLM",
+      "tier": "special",
+      "image": "exl3_043",
+      "note": "gated-delta linear attn; needs flash-linear-attention + python 3.12"
+    },
+    {
+      "arch": "Qwen3_5ForConditionalGeneration",
+      "tier": "special",
+      "image": "exl3_043",
+      "note": "gated-delta linear attn; needs flash-linear-attention + python 3.12"
+    },
+    {
+      "arch": "Qwen3_5MoeForCausalLM",
+      "tier": "special",
+      "image": "exl3_043",
+      "note": "MoE + gated-delta; needs flash-linear-attention + python 3.12"
+    },
+    {
+      "arch": "Qwen3_5MoeForConditionalGeneration",
+      "tier": "special",
+      "image": "exl3_043",
+      "note": "MoE + gated-delta; needs flash-linear-attention + python 3.12"
+    },
+    {
+      "arch": "SeedOssForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "SmolLM3ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "SolarOpenForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Step3p5ForCausalLM",
+      "tier": "stable",
+      "image": "stable",
+      "note": ""
+    },
+    {
+      "arch": "Step3p7ForConditionalGeneration",
+      "tier": "latest_only",
+      "image": "exl3_043",
+      "note": "new in exllamav3 0.0.43"
+    }
+  ]
+}

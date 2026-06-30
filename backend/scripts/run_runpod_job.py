@@ -96,6 +96,42 @@ def _arch_needs_exl3_043(model_id: str, token: str) -> bool:
     return any(m in hay for m in _EXL3_043_ARCH_MARKERS)
 
 
+# --- arch-support registry (the committed single source of truth) -------------
+# Routing + the pre-flight gate read backend/arch_support.json (generated from
+# exllamav3 by gen_arch_support.py). The marker funcs above stay only as a
+# fallback for when the registry file is somehow missing.
+_IMAGE_BY_NAME = {"exl3_043": _EXL3_043_IMAGE, "master": _MASTER_IMAGE, "stable": ""}
+
+
+def _load_arch_support() -> dict:
+    """{arch_string_lower: entry} from arch_support.json, or {} if absent."""
+    import json as _json
+    p = Path(__file__).parent.parent / "arch_support.json"
+    try:
+        d = _json.loads(p.read_text())
+        return {a["arch"].lower(): a for a in d.get("architectures", [])}
+    except Exception:
+        return {}
+
+
+def _resolve_arch(model_id: str, token: str):
+    """(arch, registry_entry|None, config_read_ok). entry is the arch_support
+    record (tier/image/note) when the arch is supported by exllamav3."""
+    import json as _json
+    from huggingface_hub import hf_hub_download
+    try:
+        p = hf_hub_download(model_id, "config.json", token=token or None)
+        cfg = _json.loads(Path(p).read_text())
+    except Exception:
+        return "", None, False
+    reg = _load_arch_support()
+    for a in (cfg.get("architectures") or []):
+        if a.lower() in reg:
+            return a, reg[a.lower()], True
+    archs = cfg.get("architectures") or []
+    return (archs[0] if archs else cfg.get("model_type", "?")), None, True
+
+
 def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     """True if a requested variant's exl3 repo is already on HF with a
     config.json. Used as a fallback when the result file can't be read over a
@@ -388,13 +424,27 @@ def main():
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
 
-    # Pick exllamav3 by architecture. Qwen3.5 (qwen3_5 / qwen3_5_moe) segfaults
-    # on the proven image, so it OVERRIDES even an explicitly-pinned --image (the
-    # bot always passes the baked RUNPOD_IMAGE) and forces the 0.0.43 + FLA image.
-    # Everything else keeps its pinned image; if none was pinned, fall through to
-    # the lfm2->master / stable-bootstrap pick so proven models (incl. Qwen3.6)
-    # never move off today's image.
-    if _arch_needs_exl3_043(args.model, args.hf_token):
+    # Architecture routing + pre-flight gate, both driven by the arch-support
+    # registry (the single source of truth). Gate an unknown arch BEFORE spending
+    # a pod, and force the right image for archs that need a non-default one --
+    # overriding the bot-pinned RUNPOD_IMAGE. A `stable` arch keeps its pinned
+    # image; proven models (incl. Qwen3.6) never move. Falls back to the marker
+    # funcs only if arch_support.json is missing.
+    _reg = _load_arch_support()
+    if _reg:
+        _arch, _entry, _ok = _resolve_arch(args.model, args.hf_token)
+        if _ok and _entry is None:
+            print(f"[joberror] unsupported architecture '{_arch}' -- not in the exllamav3 "
+                  f"{len(_reg)}-arch support set. Refusing before launch (no pod, no download).",
+                  flush=True)
+            sys.exit(2)
+        if _entry and _entry["image"] != "stable":
+            args.image = _IMAGE_BY_NAME[_entry["image"]]
+            _note = f" -- {_entry['note']}" if _entry.get("note") else ""
+            print(f"[image] {args.model} ({_arch}, {_entry['tier']}) -> {args.image}{_note}", flush=True)
+        elif not args.image:
+            print("[image] bootstrap path (exllamav3 0.0.38, stable)", flush=True)
+    elif _arch_needs_exl3_043(args.model, args.hf_token):
         args.image = _EXL3_043_IMAGE
         print(f"[image] {args.model} needs exllamav3 0.0.43; forcing {args.image} (py3.12 fresh-ext)", flush=True)
     elif not args.image:
@@ -402,7 +452,7 @@ def main():
             args.image = _MASTER_IMAGE
             print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
         else:
-            print("[image] bootstrap path (exllamav3 0.0.37, stable)", flush=True)
+            print("[image] bootstrap path (exllamav3 0.0.38, stable)", flush=True)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
