@@ -467,13 +467,14 @@ def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_
 @patch("blockquant.providers.runpod.provider._ensure_paramiko")
 @patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_config_contains_pod_and_key(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
-    """Config JSON must include pod_id, runpod_api_key, and keep_pod."""
+    """Config JSON carries pod_id, keep_pod, and the key the pod needs to
+    self-terminate (uploaded 0600 and shredded by quant.py after reading)."""
     provider, _ = _make_pipeline_provider_and_client(
         mock_ensure_rp, mock_ensure_pk, mock_ssh_key
     )
     uploaded: dict[str, bytes] = {}
 
-    def _capture(instance_id, data, remote_path):
+    def _capture(instance_id, data, remote_path, mode=None):
         uploaded[remote_path] = data
 
     with patch.object(provider, "_upload_bytes", side_effect=_capture):
@@ -502,7 +503,7 @@ def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock
     )
     uploaded: dict[str, bytes] = {}
 
-    def _capture(instance_id, data, remote_path):
+    def _capture(instance_id, data, remote_path, mode=None):
         uploaded[remote_path] = data
 
     with patch.object(provider, "_upload_bytes", side_effect=_capture):
@@ -732,3 +733,23 @@ def test_get_cost_per_hour_unknown_gpu(mock_ensure, mock_ssh_key):
         ssh_key_path=str(mock_ssh_key),
     )
     assert provider.get_cost_per_hour() == 2.00
+
+
+# ---------------------------------------------------------------------------
+# is_pipeline_running — pgrep self-match
+# ---------------------------------------------------------------------------
+
+def test_is_pipeline_running_pattern_cannot_self_match(mock_ssh_key):
+    """The pgrep pattern must match a real quant.py cmdline but never the probe
+    command that carries it (the bash -c wrapper's own cmdline contains the
+    pattern text; a self-match reports dead quants as running forever)."""
+    import re
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "done"})
+    assert provider.is_pipeline_running("pod-1") is False
+    cmd = provider.run.call_args[0][1]
+    m = re.search(r"pgrep -f '([^']+)'", cmd)
+    assert m, cmd
+    pat = m.group(1)
+    assert re.search(pat, "python /root/quant.py"), pat
+    assert not re.search(pat, cmd), f"pattern self-matches its own probe: {cmd}"

@@ -1141,9 +1141,15 @@ class RunPodProvider(Provider):
 
     def is_pipeline_running(self, instance_id: str) -> bool:
         """True while the remote quant.py process is alive."""
+        # Bracket the first char so the pattern can't match its own bash -c
+        # wrapper (whose command line contains the script path). The plain
+        # pattern self-matched and reported dead quants as running forever,
+        # so crashed pods idle-billed until the stall timeout instead of the
+        # poll loop's not-running exit.
+        pat = f"[{REMOTE_SCRIPT[0]}]{REMOTE_SCRIPT[1:]}"
         result = self.run(
             instance_id,
-            f"pgrep -f '{REMOTE_SCRIPT}' >/dev/null && echo running || echo done",
+            f"pgrep -f '{pat}' >/dev/null && echo running || echo done",
         )
         return result["stdout"].strip() == "running"
 
