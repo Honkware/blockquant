@@ -467,6 +467,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
             quantized_by=owner,
+            abliteration=_abliteration_facts(o, model_id),
         )
         api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                         repo_id=repo_id, repo_type="model")
@@ -605,6 +606,29 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             print(f"[backfill] re-rendered card for {v}", flush=True)
         except Exception as e:
             print(f"[backfill] {v} card re-render failed: {e}", flush=True)
+
+
+def _abliteration_facts(output: dict, base_repo: str) -> dict | None:
+    """Card facts for one variant, or None when it was not abliterated.
+
+    Everything comes from the fusion report the pod already recorded on the
+    variant, so the card can't drift from what was measured.
+    """
+    if not output.get("abliterated"):
+        return None
+    facts = {
+        "base_repo": base_repo,
+        "tool": "exliberate",
+        "tool_version": output.get("abliterate_tool_version", ""),
+        "method": "rank-k whitened subspace",
+        "mode": output.get("abliterate_fusion", "baked"),
+        "reproduce_file": "fusion_report.json",
+    }
+    for key in ("refusal_pre", "refusal_post", "rebound_pp", "kl_post_vs_pre",
+                "passed", "trials", "seed", "capability_delta"):
+        if output.get(key) is not None:
+            facts[key] = output[key]
+    return facts
 
 
 def _run_abliterated(
@@ -1040,8 +1064,17 @@ def main() -> int:
             rec = {"variant": variant, "path": str(out_dir)}
             if fusion_report is not None:
                 rec["abliterated"] = True
+                rec["abliterate_fusion"] = abliterate_fusion
+                rec["trials"] = abliterate_trials
+                rec["seed"] = abliterate_seed
+                try:
+                    import exliberate as _exlib
+                    rec["abliterate_tool_version"] = getattr(_exlib, "__version__", "")
+                except Exception:
+                    pass
                 for k in ("refusal_pre", "refusal_post", "rebound_pp",
-                          "kl_post_vs_pre", "passed", "iterations"):
+                          "kl_post_vs_pre", "passed", "iterations",
+                          "capability_delta"):
                     if k in fusion_report:
                         rec[k] = fusion_report[k]
             if kl_eval:

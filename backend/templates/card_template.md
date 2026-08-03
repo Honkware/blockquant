@@ -100,6 +100,8 @@ Loaded automatically by every ExLlamaV3 loader; reproduced here for searchabilit
 
 </details>
 
+{{ABLITERATION_SECTION}}
+
 ## License &amp; use
 
 > [!IMPORTANT]

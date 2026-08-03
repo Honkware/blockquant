@@ -211,6 +211,60 @@ def _render(template: str, ctx: dict) -> str:
     return out
 
 
+def _pct(value) -> str:
+    """Refusal rates arrive as either a fraction or an already-scaled percent."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v <= 1.0:
+        v *= 100.0
+    return f"{v:.1f}%"
+
+
+def build_abliteration_section(report: dict | None, bpw: str = "") -> str:
+    """Abliteration block from exliberate's fusion_report.json, or "" when the
+    model was not abliterated. Numbers only -- every value is read from the
+    report, nothing is written by hand."""
+    if not report:
+        return ""
+    tool = report.get("tool", "exliberate")
+    version = report.get("tool_version") or report.get("version") or ""
+    ver = f" v{version}" if version and not str(version).startswith("v") else f" {version}"
+    method = report.get("method", "rank-k whitened subspace")
+    mode = report.get("mode", "baked")
+    rows = [
+        ("Base model", f"[`{report['base_repo']}`](https://huggingface.co/{report['base_repo']})")
+        if report.get("base_repo") else None,
+        ("Refusal rate, before", _pct(report.get("refusal_pre"))),
+        ("Refusal rate, after", _pct(report.get("refusal_post"))),
+        ("Rebound after quantization", f"{float(report['rebound_pp']):+.1f} pp")
+        if report.get("rebound_pp") is not None else None,
+        ("KL vs pre-quant ablated", f"`{float(report['kl_post_vs_pre']):.4f}`")
+        if report.get("kl_post_vs_pre") is not None else None,
+        ("Capability delta", report.get("capability_delta")),
+        ("Search trials", report.get("trials")),
+        ("Seed", report.get("seed")),
+        ("Validation", "passed" if report.get("passed") else "did not pass"),
+    ]
+    table = "\n".join(
+        f"| {k} | {v} |" for k, v in (r for r in rows if r and r[1] is not None)
+    )
+    repro = ""
+    if report.get("reproduce_url"):
+        repro = f"\nFull run parameters: [`reproduce.json`]({report['reproduce_url']}).\n"
+    elif report.get("reproduce_file"):
+        repro = f"\nFull run parameters: `{report['reproduce_file']}` in this repo.\n"
+    return f"""## Abliteration
+
+Abliterated with {tool}{ver} ({method}), {mode} into EXL3 {bpw}&nbsp;bpw.
+
+| Measurement | Value |
+| :--- | :--- |
+{table}
+{repro}"""
+
+
 def render_exl3_card(
     *,
     base_repo: str,
@@ -225,6 +279,7 @@ def render_exl3_card(
     license_id: str = "other",
     quantized_by: str,
     title_override: str | None = None,
+    abliteration: dict | None = None,
 ) -> str:
     """Render the full polished card for one EXL3 variant."""
     base_name = base_repo.split("/")[-1]
@@ -252,7 +307,10 @@ def render_exl3_card(
         "SHORT_NAME": repo_id.split("/")[-1],
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),
         "COLLECTION_URL": collection_url,
+        "ABLITERATION_SECTION": build_abliteration_section(abliteration, variant),
     }
+    if abliteration:
+        ctx["EXTRA_TAGS"] = (ctx["EXTRA_TAGS"] or "") + "\n  - abliterated\n  - uncensored"
     return _render(_find_template(), ctx)
 
 
