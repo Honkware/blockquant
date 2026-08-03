@@ -92,6 +92,7 @@ class QuantConfig(BaseModel):
     abliterate: bool = False
     abliterate_trials: int = 40      # optuna trials for the refusal search
     abliterate_fusion: str = "baked" # baked (merged into weights) | residual (LoRA)
+    abliterate_limit: int | None = None  # cap prompts per set (bounds search time)
     # Quality verification
     verify_quality: bool = True  # Run KL + PPL after quantization
     # Cloud provider settings — RunPod

@@ -1024,6 +1024,7 @@ class RunPodProvider(Provider):
         abliterate: bool = False,
         abliterate_trials: int = 40,
         abliterate_fusion: str = "baked",
+        abliterate_limit: int | None = None,
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1072,6 +1073,8 @@ class RunPodProvider(Provider):
             cfg["abliterate"] = True
             cfg["abliterate_trials"] = int(abliterate_trials)
             cfg["abliterate_fusion"] = str(abliterate_fusion)
+            if abliterate_limit:
+                cfg["abliterate_limit"] = int(abliterate_limit)
         # 0600 + quant.py unlinks it right after parse: it holds the HF token + key.
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json", mode=0o600)
 

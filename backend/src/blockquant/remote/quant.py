@@ -643,6 +643,7 @@ def _run_abliterated(
     fusion: str = "baked",
     cal_frac: float = 0.15,
     seed: int = 0,
+    prompt_limit: int | None = None,
 ) -> dict:
     """Abliterate with exliberate, quantizing through ``convert_fn``.
 
@@ -673,8 +674,10 @@ def _run_abliterated(
     backend = ModelBackend(settings)
     backend.setup_adapters(4)
 
-    harmful = load_prompts(packaged("harmful_extraction"))
-    harmless = load_prompts(packaged("harmless_extraction"))
+    # prompt_limit bounds pod time: the search cost scales with the prompt
+    # sets, and subspace extraction is CPU-bound.
+    harmful = load_prompts(packaged("harmful_extraction"), limit=prompt_limit)
+    harmless = load_prompts(packaged("harmless_extraction"), limit=prompt_limit)
     print(f"[abliterate] extracting refusal subspaces "
           f"({len(harmful)} harmful / {len(harmless)} harmless) ...", flush=True)
     subspaces = precompute_subspaces(backend, harmful, harmless)
@@ -771,6 +774,7 @@ def main() -> int:
         abliterate_trials: int = int(cfg.get("abliterate_trials", 40))
         abliterate_fusion: str = str(cfg.get("abliterate_fusion", "baked"))
         abliterate_seed: int = int(cfg.get("abliterate_seed", 0))
+        abliterate_limit: int | None = cfg.get("abliterate_limit")
 
         t0 = time.time()
 
@@ -1053,7 +1057,7 @@ def main() -> int:
                     fusion_report = _run_abliterated(
                         model_dir, out_dir, work_dir, bpw, head_bits, _convert,
                         trials=abliterate_trials, fusion=abliterate_fusion,
-                        seed=abliterate_seed,
+                        seed=abliterate_seed, prompt_limit=abliterate_limit,
                     )
                 else:
                     _convert(model_dir, out_dir, work_dir, bpw)

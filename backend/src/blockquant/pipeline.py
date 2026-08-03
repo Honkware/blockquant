@@ -124,6 +124,7 @@ def _run_remote_pipeline(
             abliterate=config.abliterate,
             abliterate_trials=config.abliterate_trials,
             abliterate_fusion=config.abliterate_fusion,
+            abliterate_limit=config.abliterate_limit,
         )
 
         # Poll until the remote process exits, bounded so a hung pod cannot
