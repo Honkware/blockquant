@@ -86,6 +86,12 @@ class QuantConfig(BaseModel):
     parallel_mode: bool = False  # -pm, MoE speedup
     high_quality_bpws: list[str] = Field(default_factory=list)  # -hq applied to these variants
     head_bits_8_bpws: list[str] = Field(default_factory=list)   # -hb 8 applied to these variants
+    # Abliteration (exliberate) — refusal removal fused into the same convert.
+    # Off by default: with abliterate False the pod payload and the convert call
+    # are byte-identical to a normal job.
+    abliterate: bool = False
+    abliterate_trials: int = 40      # optuna trials for the refusal search
+    abliterate_fusion: str = "baked" # baked (merged into weights) | residual (LoRA)
     # Quality verification
     verify_quality: bool = True  # Run KL + PPL after quantization
     # Cloud provider settings — RunPod
@@ -111,6 +117,21 @@ class QuantConfig(BaseModel):
     def _validate_positive_gb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("RunPod disk sizes must be positive")
+        return value
+
+    @field_validator("abliterate_fusion")
+    @classmethod
+    def _validate_fusion(cls, value: str) -> str:
+        value = (value or "baked").strip().lower()
+        if value not in ("baked", "residual"):
+            raise ValueError("abliterate_fusion must be 'baked' or 'residual'")
+        return value
+
+    @field_validator("abliterate_trials")
+    @classmethod
+    def _validate_trials(cls, value: int) -> int:
+        if not 1 <= value <= 200:
+            raise ValueError("abliterate_trials must be between 1 and 200")
         return value
 
     @model_validator(mode="after")

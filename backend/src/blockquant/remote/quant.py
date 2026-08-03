@@ -607,6 +607,112 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             print(f"[backfill] {v} card re-render failed: {e}", flush=True)
 
 
+def _run_abliterated(
+    model_dir: Path,
+    out_dir: Path,
+    work_dir: Path,
+    bpw: float,
+    head_bits: int,
+    convert_fn,
+    *,
+    trials: int = 40,
+    fusion: str = "baked",
+    cal_frac: float = 0.15,
+    seed: int = 0,
+) -> dict:
+    """Abliterate with exliberate, quantizing through ``convert_fn``.
+
+    ``convert_fn`` is this script's own ExLlamaV3 call, so the abliterated
+    path runs the exact same conversion (same argv, same progress tap) as a
+    normal job -- exliberate only decides *what* gets converted and checks the
+    result afterwards. Refusal-aware calibration is installed as a hook on
+    ``convert_model.get_default_calibration``, the same namespace ``convert_fn``
+    imported from, so the mixed-in rows land inside that conversion rather than
+    a second one.
+
+    Returns exliberate's fusion report (also written to
+    ``out_dir/fusion_report.json``).
+    """
+    from exliberate.config import Settings
+    from exliberate.model import ModelBackend
+    from exliberate.optimize import precompute_subspaces, reprobe_loop, run_study
+    from exliberate.prompts import load_prompts, packaged
+    from exliberate.quant import (
+        FusionSettings,
+        install_calibration_hook,
+        run_fusion_pipeline,
+    )
+    from exliberate.scorers import capability, keyword, kl
+
+    print(f"[abliterate] search starting ({trials} trials, fusion={fusion}) ...", flush=True)
+    settings = Settings(model_id=str(model_dir), n_trials=int(trials), seed=int(seed))
+    backend = ModelBackend(settings)
+    backend.setup_adapters(4)
+
+    harmful = load_prompts(packaged("harmful_extraction"))
+    harmless = load_prompts(packaged("harmless_extraction"))
+    print(f"[abliterate] extracting refusal subspaces "
+          f"({len(harmful)} harmful / {len(harmless)} harmless) ...", flush=True)
+    subspaces = precompute_subspaces(backend, harmful, harmless)
+
+    backend.zero_adapters()
+    continuations = backend.generate(harmless, max_new_tokens=64)
+    scorers = {
+        "keyword": keyword.KeywordScorer(harmful),
+        "kl": kl.MultiTokenKL(harmless, continuations, base_model=backend),
+        "capability": capability.CapabilityProbe(
+            packaged("capability_probe"), base_model=backend
+        ),
+    }
+
+    result = run_study(backend, subspaces, scorers, settings)
+    reprobe = reprobe_loop(
+        backend, result.plan, subspaces, scorers, settings, harmful, harmless
+    )
+    plan = reprobe.final_plan
+    subspace = reprobe.subspaces[(plan.k, plan.whiten)]
+    print(f"[abliterate] search done: {reprobe.rounds} re-probe round(s), "
+          f"k={plan.k} whiten={plan.whiten}", flush=True)
+
+    fs = FusionSettings(
+        model_dir=str(model_dir),
+        out_dir=str(out_dir),
+        work_dir=str(work_dir),
+        bits=float(bpw),
+        head_bits=int(head_bits),
+        cal_frac=float(cal_frac),
+        cal_seed=int(seed),
+        fusion=fusion,
+    )
+
+    def _quantize_fn(src_dir, job_work_dir, dest_dir, bits, hbits, devices, extra_args):
+        # exliberate's signature -> this script's converter. bits/head_bits are
+        # already fixed by the job; devices/extra_args are the converter defaults
+        # blockquant always uses.
+        return convert_fn(Path(src_dir), Path(dest_dir), Path(job_work_dir), float(bits))
+
+    # run_fusion_pipeline only installs the calibration hook when it owns the
+    # quantizer; we inject ours, so install it here and restore after.
+    restore = install_calibration_hook(
+        [*harmful, *harmless], frac=float(cal_frac), seed=int(seed)
+    )
+    try:
+        report = run_fusion_pipeline(
+            fs, plan, fusion=fusion,
+            backend=backend, subspace=subspace,
+            harmful_prompts=harmful, harmless_prompts=harmless,
+            quantize_fn=_quantize_fn,
+        )
+    finally:
+        restore()
+
+    print(f"[abliterate] refusal {report.get('refusal_pre')} -> "
+          f"{report.get('refusal_post')} (rebound {report.get('rebound_pp')}pp), "
+          f"KL {report.get('kl_post_vs_pre')}, passed={report.get('passed')}",
+          flush=True)
+    return report
+
+
 def main() -> int:
     try:
         cfg = json.loads(Path(CONFIG_PATH).read_text())
@@ -635,6 +741,12 @@ def main() -> int:
         # Optional smoke-test prompt: run on each finished quant so the requester
         # sees a real reply. The fp16 is already gone by here; we load the quant.
         test_prompt: str = (cfg.get("test_prompt") or "").strip()
+        # Abliteration (exliberate). Absent from cfg unless the job asked for
+        # it, so a normal job takes byte-identical code paths.
+        abliterate: bool = bool(cfg.get("abliterate", False))
+        abliterate_trials: int = int(cfg.get("abliterate_trials", 40))
+        abliterate_fusion: str = str(cfg.get("abliterate_fusion", "baked"))
+        abliterate_seed: int = int(cfg.get("abliterate_seed", 0))
 
         t0 = time.time()
 
@@ -786,119 +898,152 @@ def main() -> int:
                 outputs.append(rec)
                 continue
             print(f"[quantize] {variant} bpw ...", flush=True)
-            old_argv = sys.argv
-            argv = [
-                "convert",
-                "-i", str(model_dir),
-                "-o", str(out_dir),
-                "-w", str(work_dir),
-                "-b", str(bpw),
-                "--head_bits", str(head_bits),
-                "--parallel_mode",
-            ]
-            if cal_rows is not None:
-                argv += ["--cal_rows", str(int(cal_rows))]
-            if cal_cols is not None:
-                argv += ["--cal_cols", str(int(cal_cols))]
-            sys.argv = argv
-            try:
-                args = parser.parse_args()
-            finally:
-                sys.argv = old_argv
-            in_args, job_state, ok, err = prepare(args)
-            if not ok:
-                emit_result({"status": "failed", "error": f"prepare failed: {err}"})
-                return 1
-            # Stream layer-based quantize progress. The HONEST progress signal is
-            # the layer index (0..num_hidden_layers): exllamav3's internal
-            # curr/max counter resets per group and does NOT track overall
-            # progress (it read 99% while only on layer 7 of 40). Tap stdout to
-            # follow the highest "Quantized: ...layers.N" the converter prints,
-            # and emit a parseable percent from layer/total.
-            import re as _re
-            import threading
 
-            def _model_total_layers() -> int:
+            def _convert(src_dir: Path, dest_dir: Path, job_work_dir: Path,
+                         bits: float, _variant: str = variant) -> Path:
+                """The pipeline's one and only ExLlamaV3 conversion.
+
+                Abliteration reuses this verbatim (passed to exliberate as its
+                quantize_fn), so both paths get the same argv, the same
+                calibration knobs and the same layer-progress tap.
+                """
+                old_argv = sys.argv
+                argv = [
+                    "convert",
+                    "-i", str(src_dir),
+                    "-o", str(dest_dir),
+                    "-w", str(job_work_dir),
+                    "-b", str(bits),
+                    "--head_bits", str(head_bits),
+                    "--parallel_mode",
+                ]
+                if cal_rows is not None:
+                    argv += ["--cal_rows", str(int(cal_rows))]
+                if cal_cols is not None:
+                    argv += ["--cal_cols", str(int(cal_cols))]
+                sys.argv = argv
                 try:
-                    with open(model_dir / "config.json") as _f:
-                        _cfg = json.load(_f)
-                except Exception:
-                    return 0
+                    args = parser.parse_args()
+                finally:
+                    sys.argv = old_argv
+                in_args, job_state, ok, err = prepare(args)
+                if not ok:
+                    raise RuntimeError(f"prepare failed: {err}")
+                return _convert_run(src_dir, dest_dir, in_args, job_state, _variant)
 
-                def _find(o):
-                    if isinstance(o, dict):
-                        for k, v in o.items():
-                            if k in ("num_hidden_layers", "num_layers") and isinstance(v, int):
-                                return v
-                            r = _find(v)
-                            if r:
-                                return r
-                    return None
+            def _convert_run(src_dir: Path, dest_dir: Path, in_args, job_state,
+                             _variant: str) -> Path:
+                # Stream layer-based quantize progress. The HONEST progress signal is
+                # the layer index (0..num_hidden_layers): exllamav3's internal
+                # curr/max counter resets per group and does NOT track overall
+                # progress (it read 99% while only on layer 7 of 40). Tap stdout to
+                # follow the highest "Quantized: ...layers.N" the converter prints,
+                # and emit a parseable percent from layer/total.
+                import re as _re
+                import threading
 
-                return _find(_cfg) or 0
+                def _model_total_layers() -> int:
+                    try:
+                        with open(src_dir / "config.json") as _f:
+                            _cfg = json.load(_f)
+                    except Exception:
+                        return 0
 
-            _total_layers = _model_total_layers()
-            _lstate = {"layer": 0}
-            _layer_re = _re.compile(r"layers\.(\d+)")
+                    def _find(o):
+                        if isinstance(o, dict):
+                            for k, v in o.items():
+                                if k in ("num_hidden_layers", "num_layers") and isinstance(v, int):
+                                    return v
+                                r = _find(v)
+                                if r:
+                                    return r
+                        return None
 
-            class _LayerTap:
-                """Pass stdout through unchanged, but track the highest layer the
-                converter reports so the monitor can read it."""
-                def __init__(self, real):
-                    self._real = real
+                    return _find(_cfg) or 0
 
-                def write(self, s):
-                    self._real.write(s)
-                    if "Quantized" in s and "layers." in s:
-                        for mm in _layer_re.finditer(s):
-                            n = int(mm.group(1))
-                            if n > _lstate["layer"]:
-                                _lstate["layer"] = n
+                _total_layers = _model_total_layers()
+                _lstate = {"layer": 0}
+                _layer_re = _re.compile(r"layers\.(\d+)")
 
-                def flush(self):
-                    self._real.flush()
+                class _LayerTap:
+                    """Pass stdout through unchanged, but track the highest layer the
+                    converter reports so the monitor can read it."""
+                    def __init__(self, real):
+                        self._real = real
 
-                def __getattr__(self, a):
-                    return getattr(self._real, a)
+                    def write(self, s):
+                        self._real.write(s)
+                        if "Quantized" in s and "layers." in s:
+                            for mm in _layer_re.finditer(s):
+                                n = int(mm.group(1))
+                                if n > _lstate["layer"]:
+                                    _lstate["layer"] = n
 
-            _q_done = threading.Event()
+                    def flush(self):
+                        self._real.flush()
 
-            def _quant_progress():
-                last = -1
-                t_first = None
-                while not _q_done.wait(15):
-                    n = _lstate["layer"]
-                    if not _total_layers or n == 0:
-                        # Measure/prep phase: no layer reported yet. Heartbeat so
-                        # the embed leaves "Downloading" the moment conversion
-                        # starts and the controller's tail always has a marker.
-                        print(f"[progress] quantize {variant} 0% (preparing)", flush=True)
-                        continue
-                    if t_first is None:
-                        t_first = time.time()
-                    if n == last:
-                        continue
-                    pct = min(99, int(n / _total_layers * 100))
-                    eta = ""
-                    el = time.time() - t_first
-                    if el > 0:
-                        rem = (_total_layers - n) * (el / n)
-                        eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
-                    print(f"[progress] quantize {variant} {pct}% (layer {n}/{_total_layers}){eta}", flush=True)
-                    last = n
+                    def __getattr__(self, a):
+                        return getattr(self._real, a)
 
-            _qt = threading.Thread(target=_quant_progress, daemon=True)
-            _qt.start()
-            _old_stdout = sys.stdout
-            sys.stdout = _LayerTap(_old_stdout)
+                _q_done = threading.Event()
+
+                def _quant_progress():
+                    last = -1
+                    t_first = None
+                    while not _q_done.wait(15):
+                        n = _lstate["layer"]
+                        if not _total_layers or n == 0:
+                            # Measure/prep phase: no layer reported yet. Heartbeat so
+                            # the embed leaves "Downloading" the moment conversion
+                            # starts and the controller's tail always has a marker.
+                            print(f"[progress] quantize {_variant} 0% (preparing)", flush=True)
+                            continue
+                        if t_first is None:
+                            t_first = time.time()
+                        if n == last:
+                            continue
+                        pct = min(99, int(n / _total_layers * 100))
+                        eta = ""
+                        el = time.time() - t_first
+                        if el > 0:
+                            rem = (_total_layers - n) * (el / n)
+                            eta = f" eta {int(rem // 60)}m" if rem >= 60 else f" eta {int(rem)}s"
+                        print(f"[progress] quantize {_variant} {pct}% (layer {n}/{_total_layers}){eta}", flush=True)
+                        last = n
+
+                _qt = threading.Thread(target=_quant_progress, daemon=True)
+                _qt.start()
+                _old_stdout = sys.stdout
+                sys.stdout = _LayerTap(_old_stdout)
+                try:
+                    exl_main(in_args, job_state)
+                finally:
+                    sys.stdout = _old_stdout
+                    _q_done.set()
+                    _qt.join(timeout=2)
+                return dest_dir
+
+            fusion_report = None
             try:
-                exl_main(in_args, job_state)
-            finally:
-                sys.stdout = _old_stdout
-                _q_done.set()
-                _qt.join(timeout=2)
+                if abliterate:
+                    fusion_report = _run_abliterated(
+                        model_dir, out_dir, work_dir, bpw, head_bits, _convert,
+                        trials=abliterate_trials, fusion=abliterate_fusion,
+                        seed=abliterate_seed,
+                    )
+                else:
+                    _convert(model_dir, out_dir, work_dir, bpw)
+            except RuntimeError as exc:
+                emit_result({"status": "failed", "error": str(exc)})
+                return 1
             print(f"[quantize] {variant} complete", flush=True)
             rec = {"variant": variant, "path": str(out_dir)}
+            if fusion_report is not None:
+                rec["abliterated"] = True
+                for k in ("refusal_pre", "refusal_post", "rebound_pp",
+                          "kl_post_vs_pre", "passed", "iterations"):
+                    if k in fusion_report:
+                        rec[k] = fusion_report[k]
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
                 kl = _kl_div_eval(out_dir, model_dir, rows=kl_rows)

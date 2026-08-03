@@ -1021,6 +1021,9 @@ class RunPodProvider(Provider):
         cal_cols: int | None = None,
         keep_pod: bool = False,
         test_prompt: str | None = None,
+        abliterate: bool = False,
+        abliterate_trials: int = 40,
+        abliterate_fusion: str = "baked",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1064,6 +1067,11 @@ class RunPodProvider(Provider):
             cfg["cal_cols"] = int(cal_cols)
         if test_prompt:
             cfg["test_prompt"] = str(test_prompt)
+        # Only present when asked -- keeps a normal job's payload identical.
+        if abliterate:
+            cfg["abliterate"] = True
+            cfg["abliterate_trials"] = int(abliterate_trials)
+            cfg["abliterate_fusion"] = str(abliterate_fusion)
         # 0600 + quant.py unlinks it right after parse: it holds the HF token + key.
         self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json", mode=0o600)
 
