@@ -21,6 +21,12 @@ export const commands = [
         .setName('prompt')
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('abliterate')
+        .setDescription('Optional: remove refusal behaviour before quantizing (slower; adds a search pass)')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),

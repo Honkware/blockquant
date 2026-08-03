@@ -272,6 +272,18 @@ def main():
         help="Optional prompt to run on each finished quant; the reply is echoed for the bot.",
     )
     parser.add_argument(
+        "--abliterate", action="store_true",
+        help="Remove refusal behaviour (exliberate) before quantizing, fused into the same convert.",
+    )
+    parser.add_argument(
+        "--abliterate-trials", type=int, default=40,
+        help="Optuna trials for the refusal search (default 40).",
+    )
+    parser.add_argument(
+        "--abliterate-fusion", default="baked", choices=("baked", "residual"),
+        help="baked: merged into the weights (default). residual: ablation ships as a LoRA.",
+    )
+    parser.add_argument(
         "--gpu", default="NVIDIA H100 80GB HBM3",
         help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
     )
@@ -690,6 +702,9 @@ def main():
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
             test_prompt=args.test_prompt,
+            abliterate=args.abliterate,
+            abliterate_trials=args.abliterate_trials,
+            abliterate_fusion=args.abliterate_fusion,
         )
         if launch_result.get("status") != "started":
             print(f"ERROR: run_pipeline failed: {launch_result}")

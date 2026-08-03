@@ -88,7 +88,7 @@ export async function runVariantWithRetry(
  * (so the embed shows the variant actually running, not just the first) and
  * resolves with one result row per variant.
  */
-export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt = null, onProgress }) {
+export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt = null, abliterate = false, onProgress }) {
   return new Promise((resolve, reject) => {
     const args = [
       SCRIPT,
@@ -121,6 +121,8 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     // fast if it is too old, so passing a stale image can't silently regress.
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (testPrompt) args.push('--test-prompt', testPrompt);
+    // Refusal removal, fused into the same conversion. Off unless requested.
+    if (abliterate) args.push('--abliterate');
 
     // Detached, own process group, stdout+stderr to a log file. A bot restart
     // or crash then leaves the controller running: it finishes the quant,

@@ -80,6 +80,8 @@ export async function handleQuant(interaction) {
   // Optional smoke-test prompt: run on each finished quant so the requester
   // sees a real reply. Capped so it stays a quick check, not a chat session.
   const testPrompt = (interaction.options.getString('prompt') || '').trim().slice(0, 1000) || null;
+  // Refusal removal before quantizing. Adds a search pass, so it is opt-in.
+  const abliterate = interaction.options.getBoolean('abliterate') === true;
   const userId = interaction.user.id;
 
   // The request is intentionally just model + bpw. Everything else is a fixed
@@ -262,6 +264,7 @@ export async function handleQuant(interaction) {
     variants,
     bpws,
     testPrompt,
+    abliterate,
     categories: [category],
     profile,
     quantOptions,
@@ -322,6 +325,7 @@ export async function runApprovedJob({ interaction, job }) {
     variants,
     bpws,
     testPrompt = null,
+    abliterate = false,
     categories,
     profile,
     quantOptions,
@@ -511,6 +515,7 @@ export async function runApprovedJob({ interaction, job }) {
               hfOrg: config.HF_ORG,
               calRows: 250,
               testPrompt,
+              abliterate,
               onProgress: (d) => {
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();
