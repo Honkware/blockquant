@@ -644,6 +644,7 @@ def _run_abliterated(
     cal_frac: float = 0.15,
     seed: int = 0,
     prompt_limit: int | None = None,
+    batch_size: int | None = None,
 ) -> dict:
     """Abliterate with exliberate, quantizing through ``convert_fn``.
 
@@ -669,8 +670,21 @@ def _run_abliterated(
     )
     from exliberate.scorers import capability, keyword, kl
 
-    print(f"[abliterate] search starting ({trials} trials, fusion={fusion}) ...", flush=True)
-    settings = Settings(model_id=str(model_dir), n_trials=int(trials), seed=int(seed))
+    # exliberate defaults to 4 prompts per forward, which leaves most of a
+    # datacentre card idle during the search -- and the search generates on the
+    # prompt sets once per trial, so this is the dominant cost. Scale it to the
+    # VRAM we actually have.
+    if batch_size is None:
+        try:
+            import torch as _t
+            vram_gb = _t.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            vram_gb = 24.0
+        batch_size = 32 if vram_gb >= 70 else (16 if vram_gb >= 40 else 8)
+    print(f"[abliterate] search starting ({trials} trials, fusion={fusion}, "
+          f"batch={batch_size}) ...", flush=True)
+    settings = Settings(model_id=str(model_dir), n_trials=int(trials), seed=int(seed),
+                        batch_size=int(batch_size))
     backend = ModelBackend(settings)
     backend.setup_adapters(4)
 
@@ -775,6 +789,7 @@ def main() -> int:
         abliterate_fusion: str = str(cfg.get("abliterate_fusion", "baked"))
         abliterate_seed: int = int(cfg.get("abliterate_seed", 0))
         abliterate_limit: int | None = cfg.get("abliterate_limit")
+        abliterate_batch: int | None = cfg.get("abliterate_batch")
 
         t0 = time.time()
 
@@ -1058,6 +1073,7 @@ def main() -> int:
                         model_dir, out_dir, work_dir, bpw, head_bits, _convert,
                         trials=abliterate_trials, fusion=abliterate_fusion,
                         seed=abliterate_seed, prompt_limit=abliterate_limit,
+                        batch_size=abliterate_batch,
                     )
                 else:
                     _convert(model_dir, out_dir, work_dir, bpw)
