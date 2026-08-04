@@ -1,0 +1,80 @@
+{"context": "The capital of France is", "choices": ["Paris", "Madrid"], "label": 0}
+{"context": "The capital of Japan is", "choices": ["Tokyo", "Seoul"], "label": 0}
+{"context": "The capital of Australia is", "choices": ["Canberra", "Sydney"], "label": 0}
+{"context": "The largest planet in our solar system is", "choices": ["Jupiter", "Saturn"], "label": 0}
+{"context": "The chemical symbol for water is", "choices": ["H2O", "CO2"], "label": 0}
+{"context": "The chemical symbol for gold is", "choices": ["Au", "Ag"], "label": 0}
+{"context": "Water boils at sea level at", "choices": ["100 degrees Celsius", "50 degrees Celsius"], "label": 0}
+{"context": "The Earth revolves around", "choices": ["the Sun", "the Moon"], "label": 0}
+{"context": "Photosynthesis in plants requires", "choices": ["sunlight", "darkness"], "label": 0}
+{"context": "The currency of Japan is", "choices": ["the yen", "the won"], "label": 0}
+{"context": "The Great Wall is located in", "choices": ["China", "India"], "label": 0}
+{"context": "The author of Romeo and Juliet is", "choices": ["William Shakespeare", "Charles Dickens"], "label": 0}
+{"context": "The fastest land animal is", "choices": ["the cheetah", "the lion"], "label": 0}
+{"context": "The ocean between Europe and North America is", "choices": ["the Atlantic", "the Pacific"], "label": 0}
+{"context": "Humans breathe in oxygen and breathe out", "choices": ["carbon dioxide", "hydrogen"], "label": 0}
+{"context": "The hardest natural material is", "choices": ["diamond", "quartz"], "label": 0}
+{"context": "The first month of the year is", "choices": ["January", "March"], "label": 0}
+{"context": "A triangle has this many sides:", "choices": ["three", "four"], "label": 0}
+{"context": "A hexagon has this many sides:", "choices": ["six", "eight"], "label": 0}
+{"context": "The opposite of hot is", "choices": ["cold", "warm"], "label": 0}
+{"context": "The opposite of heavy is", "choices": ["light", "dense"], "label": 0}
+{"context": "The plural of 'child' is", "choices": ["children", "childs"], "label": 0}
+{"context": "The past tense of 'run' is", "choices": ["ran", "runned"], "label": 0}
+{"context": "A baby dog is called", "choices": ["a puppy", "a kitten"], "label": 0}
+{"context": "A baby cat is called", "choices": ["a kitten", "a cub"], "label": 0}
+{"context": "Birds typically move through the air by", "choices": ["flying", "swimming"], "label": 0}
+{"context": "Fish typically breathe using", "choices": ["gills", "lungs"], "label": 0}
+{"context": "Ice feels", "choices": ["cold", "hot"], "label": 0}
+{"context": "Fire feels", "choices": ["hot", "cold"], "label": 0}
+{"context": "Grass is usually", "choices": ["green", "purple"], "label": 0}
+{"context": "The sky on a clear day is usually", "choices": ["blue", "orange"], "label": 0}
+{"context": "Milk comes most commonly from", "choices": ["cows", "chickens"], "label": 0}
+{"context": "Bread is usually baked in", "choices": ["an oven", "a freezer"], "label": 0}
+{"context": "You use a thermometer to measure", "choices": ["temperature", "distance"], "label": 0}
+{"context": "You use a ruler to measure", "choices": ["length", "weight"], "label": 0}
+{"context": "You use a scale to measure", "choices": ["weight", "time"], "label": 0}
+{"context": "A dozen equals", "choices": ["twelve", "ten"], "label": 0}
+{"context": "Two plus three equals", "choices": ["five", "six"], "label": 0}
+{"context": "Ten minus four equals", "choices": ["six", "seven"], "label": 0}
+{"context": "Three times four equals", "choices": ["twelve", "fourteen"], "label": 0}
+{"context": "Twenty divided by five equals", "choices": ["four", "five"], "label": 0}
+{"context": "Half of fifty is", "choices": ["twenty-five", "twenty"], "label": 0}
+{"context": "One hour contains this many minutes:", "choices": ["sixty", "one hundred"], "label": 0}
+{"context": "One day contains this many hours:", "choices": ["twenty-four", "twelve"], "label": 0}
+{"context": "One week contains this many days:", "choices": ["seven", "five"], "label": 0}
+{"context": "The number of continents on Earth is", "choices": ["seven", "five"], "label": 0}
+{"context": "Zero degrees Celsius is the freezing point of", "choices": ["water", "alcohol"], "label": 0}
+{"context": "An adult human typically has this many teeth:", "choices": ["thirty-two", "twenty"], "label": 0}
+{"context": "The heart's main job is to pump", "choices": ["blood", "air"], "label": 0}
+{"context": "The lungs are used for", "choices": ["breathing", "digestion"], "label": 0}
+{"context": "The brain is located in", "choices": ["the head", "the chest"], "label": 0}
+{"context": "A tomato is botanically classified as", "choices": ["a fruit", "a vegetable"], "label": 0}
+{"context": "Penguins live mostly in", "choices": ["the Southern Hemisphere", "the Arctic"], "label": 0}
+{"context": "Spiders have this many legs:", "choices": ["eight", "six"], "label": 0}
+{"context": "Insects have this many legs:", "choices": ["six", "eight"], "label": 0}
+{"context": "A year has approximately this many days:", "choices": ["365", "300"], "label": 0}
+{"context": "February has 29 days in", "choices": ["a leap year", "every year"], "label": 0}
+{"context": "The instrument with black and white keys is", "choices": ["a piano", "a violin"], "label": 0}
+{"context": "You write with", "choices": ["a pen", "a spoon"], "label": 0}
+{"context": "You cut paper with", "choices": ["scissors", "a fork"], "label": 0}
+{"context": "You sleep on", "choices": ["a bed", "a stove"], "label": 0}
+{"context": "You wash dishes in", "choices": ["a sink", "a closet"], "label": 0}
+{"context": "A car typically has this many wheels:", "choices": ["four", "three"], "label": 0}
+{"context": "A bicycle typically has this many wheels:", "choices": ["two", "four"], "label": 0}
+{"context": "Traffic lights use red to mean", "choices": ["stop", "go"], "label": 0}
+{"context": "Traffic lights use green to mean", "choices": ["go", "slow down"], "label": 0}
+{"context": "An umbrella is used when it", "choices": ["rains", "snows only indoors"], "label": 0}
+{"context": "A coat keeps you", "choices": ["warm", "cool in summer"], "label": 0}
+{"context": "Shoes are worn on", "choices": ["feet", "hands"], "label": 0}
+{"context": "Gloves are worn on", "choices": ["hands", "feet"], "label": 0}
+{"context": "A clock shows", "choices": ["the time", "the weather"], "label": 0}
+{"context": "A map shows", "choices": ["places", "recipes"], "label": 0}
+{"context": "Doctors work in", "choices": ["hospitals", "bakeries"], "label": 0}
+{"context": "Teachers work in", "choices": ["schools", "airports"], "label": 0}
+{"context": "Bread is made mostly from", "choices": ["flour", "rice"], "label": 0}
+{"context": "Cheese is made from", "choices": ["milk", "juice"], "label": 0}
+{"context": "Apples grow on", "choices": ["trees", "vines underground"], "label": 0}
+{"context": "Carrots grow", "choices": ["underground", "on tall trees"], "label": 0}
+{"context": "Honey is made by", "choices": ["bees", "ants"], "label": 0}
+{"context": "The season after summer is", "choices": ["autumn", "spring"], "label": 0}

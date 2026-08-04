@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exliberate"
+version = "0.2.0"
+description = "Fully automatic refusal removal (abliteration) for open-weight LLMs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+    "transformers",
+    "peft",
+    "optuna",
+    "scikit-learn",
+    "pydantic",
+    "pydantic-settings",
+    "numpy",
+    "rich",
+    "tomli-w",
+    # torch is intentionally NOT pinned here: users install the wheel matching
+    # their hardware (CPU/CUDA). All torch usage is device-agnostic.
+]
+
+[project.optional-dependencies]
+# Fused ablate+quantize (EXL3). ExLlamaV3 needs torch with CUDA >= 12.4 and
+# builds a CUDA extension; install torch for your hardware first.
+quant = ["exllamav3"]
+
+[project.scripts]
+exliberate = "exliberate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["exliberate*"]
+
+[tool.setuptools.package-data]
+exliberate = ["data/*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

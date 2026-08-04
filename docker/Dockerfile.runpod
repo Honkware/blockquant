@@ -103,6 +103,22 @@ RUN python /tmp/patch_attn_reshape.py && rm /tmp/patch_attn_reshape.py
 COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
 RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 
+# ---- exliberate (abliteration; only used when a job sets --abliterate) ----
+# Off by default -- a normal quant never imports it. Installed unpinned-but-
+# vendored: the source is copied in rather than pulled from a registry, since
+# the fixes this pipeline depends on (chat-template fallback on ExLlamaV3's
+# tokenizer, --limit reaching the default path, GPU whitening) are not in any
+# published release. --no-deps then explicit deps so pip cannot pull a CPU
+# torch over the CUDA build.
+ARG EXLIBERATE_ENABLE=1
+COPY docker/exliberate /opt/exliberate
+RUN if [ "${EXLIBERATE_ENABLE}" = "1" ]; then \
+        python -m pip install --no-cache-dir --no-deps /opt/exliberate && \
+        python -m pip install --no-cache-dir \
+            "optuna" "scikit-learn" "peft" "tomli-w" && \
+        python -c "import exliberate; print('exliberate ok')" ; \
+    fi
+
 # ---- Stub formatron (quant-only image) ------------------------------------
 # exllamav3's __init__ hard-imports FormatronFilter, and formatron is fragile
 # against pinned pydantic. The quant path never builds a filter, so replace

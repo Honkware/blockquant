@@ -7,6 +7,19 @@
 # template-side SSH machinery ran or not.
 set -euo pipefail
 
+# Some hosts pair a CUDA forward-compat libcuda (/usr/local/cuda/compat) with
+# an older host driver; the compat stub then wins the linker search and every
+# CUDA init fails with error 804, so torch reports no GPU on a machine that
+# plainly has one. Prefer the real driver when the compat one is unusable.
+if [ -d /usr/local/cuda/compat ] && ! python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+  export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  if python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+    echo "[entrypoint] CUDA recovered by preferring the host driver over /usr/local/cuda/compat"
+  else
+    echo "[entrypoint] WARNING: CUDA still unavailable; jobs on this pod will fail"
+  fi
+fi
+
 # Set up SSH from PUBLIC_KEY if RunPod's machinery hasn't already.
 if [ -n "${PUBLIC_KEY:-}" ]; then
   mkdir -p /root/.ssh
