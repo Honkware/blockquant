@@ -1141,15 +1141,26 @@ class RunPodProvider(Provider):
 
     def is_pipeline_running(self, instance_id: str) -> bool:
         """True while the remote quant.py process is alive."""
-        # Bracket the first char so the pattern can't match its own bash -c
-        # wrapper (whose command line contains the script path). The plain
-        # pattern self-matched and reported dead quants as running forever,
-        # so crashed pods idle-billed until the stall timeout instead of the
-        # poll loop's not-running exit.
-        pat = f"[{REMOTE_SCRIPT[0]}]{REMOTE_SCRIPT[1:]}"
+        # Match BOTH launch paths. run_pipeline runs the baked copy at
+        # /opt/blockquant/quant.py whenever the image has one (which every
+        # current image does) and only falls back to REMOTE_SCRIPT on a
+        # bootstrap pod, so probing REMOTE_SCRIPT alone never matched a real
+        # run. That was invisible while the pattern self-matched its own probe
+        # and always said "running"; once the self-match was fixed it inverted
+        # into "done" on the first two polls, so the controller declared every
+        # baked run finished ~30s in, found no result file, and killed the pod.
+        #
+        # Bracketing the first char is what stops the self-match: as a regex
+        # "[/]opt/..." matches "/opt/..." but not the literal "[/]opt/..." in
+        # the probe's own bash -c command line.
+        pats = "|".join(f"[{p[0]}]{p[1:]}" for p in (self._BAKED_REMOTE_QUANT, REMOTE_SCRIPT))
+        # No pgrep (a lean image without procps) must not read as "finished":
+        # fail closed to running and let stall_timeout/max_runtime bound the run,
+        # the same way poll_remote treats an SSH error.
         result = self.run(
             instance_id,
-            f"pgrep -f '{pat}' >/dev/null && echo running || echo done",
+            f"command -v pgrep >/dev/null 2>&1 || {{ echo running; exit 0; }}; "
+            f"pgrep -f '{pats}' >/dev/null && echo running || echo done",
         )
         return result["stdout"].strip() == "running"
 

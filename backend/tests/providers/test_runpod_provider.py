@@ -753,3 +753,26 @@ def test_is_pipeline_running_pattern_cannot_self_match(mock_ssh_key):
     pat = m.group(1)
     assert re.search(pat, "python /root/quant.py"), pat
     assert not re.search(pat, cmd), f"pattern self-matches its own probe: {cmd}"
+
+
+def test_is_pipeline_running_matches_the_baked_script_path(mock_ssh_key):
+    """run_pipeline launches the baked /opt/blockquant/quant.py whenever the
+    image has one, which is every current image. Probing only REMOTE_SCRIPT read
+    "done" on the first poll of every baked run, so the controller killed the pod
+    ~30s in and no job could finish."""
+    import re
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "running"})
+    assert provider.is_pipeline_running("pod-1") is True
+    pat = re.search(r"pgrep -f '([^']+)'", provider.run.call_args[0][1]).group(1)
+    assert re.search(pat, f"/usr/bin/python {RunPodProvider._BAKED_REMOTE_QUANT}"), pat
+
+
+def test_is_pipeline_running_fails_closed_without_pgrep(mock_ssh_key):
+    """A pod whose image ships no procps must not read as finished: the probe
+    answers "running" and the stall/max-runtime bounds end the run instead."""
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "running"})
+    provider.is_pipeline_running("pod-1")
+    cmd = provider.run.call_args[0][1]
+    assert "command -v pgrep" in cmd and "echo running" in cmd, cmd

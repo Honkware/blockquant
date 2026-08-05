@@ -166,6 +166,12 @@ def _drain_failure(provider, instance_id, outcome: str) -> str:
                 if ln[:1].isalpha() and ("Error" in ln or "Exception" in ln) and ":" in ln), "")
     if outcome == "failed":
         return f"remote quant crashed: {exc or (lines[-1] if lines else 'see controller log')}"
+    if outcome == "no_result":
+        # The remote process ended on its own but left no bq-result.json, so it
+        # never reached its own except handler: a signal kill, not an exception.
+        # The last log line is where it stopped, which is the whole diagnosis.
+        return ("pod exited without a result file and nothing reached HF; remote log ends at: "
+                + (exc or (lines[-1][-200:] if lines else 'no output at all')))
     return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
 
 
@@ -692,7 +698,7 @@ def main():
             test_prompt=args.test_prompt,
         )
         if launch_result.get("status") != "started":
-            print(f"ERROR: run_pipeline failed: {launch_result}")
+            print(f"[joberror] remote pipeline never started: {launch_result}", flush=True)
             sys.exit(1)
         print(f"      Remote script started")
 
@@ -752,7 +758,7 @@ def main():
                 print("      result unreadable over SSH, but the variant is on HF "
                       "-> treating as complete", flush=True)
                 sys.exit(0)
-            print("ERROR: no result file on pod and nothing on HF — check log tail above")
+            print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result')}", flush=True)
             sys.exit(1)
         status = result.get("status", "unknown")
         print(f"      Status: {status}")
@@ -763,7 +769,8 @@ def main():
             print(f"      Remote time: {result.get('total_time', 0):.0f}s")
             print(f"      Total time (incl. pod lifecycle): {elapsed:.0f}s  ≈  ${cost:.2f}")
         else:
-            print(f"      Error: {result.get('error', 'unknown')}")
+            print(f"[joberror] remote quant reported {status}: "
+                  f"{result.get('error', 'unknown')}", flush=True)
             sys.exit(1)
 
     finally:

@@ -27,6 +27,9 @@ const RE = {
   // The `b64` sentinel avoids matching the "[sample] N generating..." status line:
   // "[sample] 4.0 b64 <base64>"
   sample: /\[sample\]\s*([0-9.]+)\s+b64\s+([A-Za-z0-9+/=]+)/,
+  // The controller's one-line reason for a run that produced nothing. Without
+  // this the user gets "exited 1 with no uploads", which says nothing.
+  jobError: /\[joberror\]\s*(.+)/,
 };
 
 /**
@@ -151,6 +154,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
+    let jobError = '';       // last [joberror] line, reported instead of the exit code
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
     // bar climbs smoothly the whole run (download 4->25, quantize 25->90), and
@@ -181,6 +185,10 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
 
     function handleLine(line) {
       let m;
+      if ((m = RE.jobError.exec(line))) {
+        jobError = m[1].trim().slice(0, 300);
+        return;
+      }
       if ((m = RE.uploadDone.exec(line))) {
         results.set(m[1], m[2]);
         stage = 'Uploading';
@@ -286,9 +294,10 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
         resolve(out); // full or partial success
       } else {
         const err = new Error(
-          signal
-            ? `run_runpod_job.py killed by ${signal} with no uploads`
-            : `run_runpod_job.py exited ${code} with no uploads`
+          jobError ||
+            (signal
+              ? `run_runpod_job.py killed by ${signal} with no uploads`
+              : `run_runpod_job.py exited ${code} with no uploads`)
         );
         err.signal = signal || null;
         err.podCreated = !!podId;
