@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
+import { spawnDetached, wait } from './detached.js';
 
 const log = getLogger('runpod-cli');
 
@@ -125,25 +126,30 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (testPrompt) args.push('--test-prompt', testPrompt);
 
-    // Detached, own process group, stdout+stderr to a log file. A bot restart
-    // or crash then leaves the controller running: it finishes the quant,
-    // uploads, and self-terminates its pod normally — instead of dying and
-    // having its pod reaped (the pod name encodes this controller's pid). The
-    // bot tails the log file for progress while it is alive. PYTHONUNBUFFERED
-    // keeps the log line-buffered so the tail isn't ~8KB behind.
+    // Reparented to init, stdout+stderr to a log file (see services/detached.js).
+    // A bot restart or crash then leaves the controller running: it finishes the
+    // quant, uploads, and self-terminates its pod normally — instead of dying and
+    // having its pod reaped (the pod name encodes this controller's pid). The bot
+    // tails the log file for progress while it is alive. PYTHONUNBUFFERED keeps
+    // the log line-buffered so the tail isn't ~8KB behind.
     fs.mkdirSync(LOG_DIR, { recursive: true });
     const slug = modelId.replace(/[^a-zA-Z0-9._-]/g, '_');
     const logPath = path.join(LOG_DIR, `ctrl-${slug}-${variants.join('-')}-${Date.now()}.log`);
-    const logFd = fs.openSync(logPath, 'a');
-    log.info(`spawn (detached): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
-    const child = spawn(PYTHON, args, {
-      cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-    });
-    child.unref();
-    fs.closeSync(logFd);
+    log.info(`spawn (reparented): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
+    let handle;
+    try {
+      handle = spawnDetached({
+        command: PYTHON,
+        args,
+        cwd: ROOT,
+        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        logPath,
+        kind: 'quant',
+        meta: { modelId, variants },
+      });
+    } catch (err) {
+      return reject(err);
+    }
 
     const total = variants.length;
     const results = new Map(); // bpw -> url
@@ -262,14 +268,11 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
         try { handleLine(line); } catch (e) { log.debug(`parse: ${e.message}`); }
       }
     };
-    const tailTimer = setInterval(drain, 1000);
-
-    child.on('error', (err) => { clearInterval(tailTimer); reject(err); });
-    // exit fires while the bot is alive (it still tracks the detached child). On
+    // The controller is not our child any more, so there is no exit event. Poll
+    // its pid and its recorded exit status instead, draining the log each time
+    // (the last drain flushes the final lines, esp. the last [upload] done). On
     // a deliberate kill, signal is set; a real error always exits with a code.
-    child.on('exit', (code, signal) => {
-      clearInterval(tailTimer);
-      drain(); // flush any final lines (esp. the last [upload] done)
+    wait(handle, { onTick: drain }).then(({ code, signal }) => {
       const out = variants.map((v) => {
         const url = results.get(v) || null;
         return {

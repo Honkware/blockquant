@@ -4,6 +4,7 @@ import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
 import { AppError, sanitizeErrorText } from '../errors/taxonomy.js';
+import { spawnDetached, wait } from './detached.js';
 
 const log = getLogger('catbench-cli');
 
@@ -76,16 +77,21 @@ export function runCatbench({ modelId, onProgress }) {
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (config.CATBENCH_MAX_GB) args.push('--max-gb', String(config.CATBENCH_MAX_GB));
 
-    const logFd = fs.openSync(logPath, 'a');
-    log.info(`spawn (detached): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
-    const child = spawn(PYTHON, args, {
-      cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-    });
-    child.unref();
-    fs.closeSync(logFd);
+    log.info(`spawn (reparented): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
+    let handle;
+    try {
+      handle = spawnDetached({
+        command: PYTHON,
+        args,
+        cwd: ROOT,
+        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        logPath,
+        kind: 'catbench',
+        meta: { modelId, resultPath: outPath },
+      });
+    } catch (err) {
+      return reject(err);
+    }
 
     let stage = 'Provisioning';
     let message = 'looking for a GPU';
@@ -155,15 +161,9 @@ export function runCatbench({ modelId, onProgress }) {
         }
       }
     };
-    const tailTimer = setInterval(drain, 1000);
-
-    child.on('error', (err) => {
-      clearInterval(tailTimer);
-      reject(err);
-    });
-    child.on('exit', (code, signal) => {
-      clearInterval(tailTimer);
-      drain();
+    // No exit event: the controller is reparented to init, so poll its recorded
+    // status and drain the log on the way (see services/detached.js).
+    wait(handle, { onTick: drain }).then(({ code, signal }) => {
       const src = resultPath || outPath;
       let result = null;
       try {
