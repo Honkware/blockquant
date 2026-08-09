@@ -31,9 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from blockquant.providers.runpod_provider import RunPodProvider
 from blockquant.poll import poll_remote
 from blockquant.providers.runpod.constants import REMOTE_LOG, REMOTE_RESULT
-# Same GPU catalogue + orphan sweep /quant uses. Importing is the point: one
-# implementation of "which cards exist and what do they cost".
-from run_runpod_job import _auto_gpu_ids, _terminate_stray_pods
+# Same GPU catalogue, orphan sweep and failure-line parser /quant uses.
+# Importing is the point: one implementation of "which cards exist and what do
+# they cost", and one of "what actually went wrong on the pod".
+from run_runpod_job import _auto_gpu_ids, _terminate_stray_pods, _last_exception
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
@@ -84,6 +85,31 @@ def size_check(model_id: str, token: str, max_gb: float) -> dict:
                          f"so the limit is {max_gb:.0f} GB of weights (~{max_gb / 2:.0f}B "
                          "params at bf16). Too big to bench."}
     return {"ok": True, "gb": round(gb, 1), "error": None}
+
+
+def failure_reason(provider, instance_id, outcome: str) -> str:
+    """The real reason a run ended badly, for the [joberror] line.
+
+    poll_remote only ever sees "Traceback (most recent call last):". The
+    exception itself is several lines below it, and the marker-filtered progress
+    tail drops those, which is how this reported a bare "run failed". Drain the
+    RAW tail and run it through /quant's _last_exception.
+    """
+    try:
+        tail = provider.get_progress(instance_id, lines=500, raw=True) or ""
+    except Exception:
+        tail = ""
+    lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+    exc = _last_exception(lines)
+    # The pod catches its own exceptions and prints [joberror] <what broke>, so
+    # fall back to that before falling back to whatever the last line was.
+    if not exc:
+        exc = next((ln.split("[joberror]", 1)[1].strip()
+                    for ln in reversed(lines) if "[joberror]" in ln), "")
+    if outcome == "failed":
+        return exc or (lines[-1][-300:] if lines else "the pod log was unreadable")
+    return (f"hit the '{outcome}' watchdog limit "
+            f"({exc or (lines[-1][-200:] if lines else 'no output')})")
 
 
 def main():
@@ -246,7 +272,8 @@ def main():
             on_progress=_print_new,
         )
         if outcome != "done":
-            print(f"[joberror] run {outcome}; terminating pod", flush=True)
+            print(f"[joberror] {failure_reason(provider, instance_id, outcome)}; "
+                  "terminating pod", flush=True)
             sys.exit(3)
 
         result = None

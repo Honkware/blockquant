@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
+import { AppError, sanitizeErrorText } from '../errors/taxonomy.js';
 
 const log = getLogger('catbench-cli');
 
@@ -176,14 +177,16 @@ export function runCatbench({ modelId, onProgress }) {
         /* already gone */
       }
       if (result) return resolve(result);
-      reject(
-        new Error(
-          jobError ||
-            (signal
-              ? `catbench controller killed by ${signal}`
-              : `catbench controller exited ${code} with no result`)
-        )
-      );
+      const why =
+        jobError ||
+        (signal
+          ? `catbench controller killed by ${signal}`
+          : `catbench controller exited ${code} with no result`);
+      // publicMessage, not a bare Error: toUserMessage redacts anything it does
+      // not recognise down to "Unexpected internal error", which is how a real
+      // diagnosis ("Unknown quantization type, got exl3") never reached anyone.
+      // The controller writes this line, and sanitizeErrorText scrubs tokens.
+      reject(new AppError('QUANT_EXIT_FAILED', why, { publicMessage: sanitizeErrorText(why) }));
     });
   });
 }
