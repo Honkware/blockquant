@@ -40,11 +40,11 @@ export async function isApiAvailable() {
  * @param {string} [params.provider] — "local" | "runpod"
  * @param {string} [params.hf_org]
  */
-export async function submitJob({ model_id, format = 'exl3', variants, provider = 'local', hf_org = '', parallel_mode = false, high_quality_bpws = [], head_bits_8_bpws = [], verify_quality = true }) {
+export async function submitJob({ model_id, format = 'exl3', variants, provider = 'local', hf_org = '', parallel_mode = false, high_quality_bpws = [], head_bits_8_bpws = [], verify_quality = true, codebook = 'mul1' }) {
   const resp = await fetch(`${API_URL}/api/v1/quant`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model_id, format, variants, provider, hf_org, parallel_mode, high_quality_bpws, head_bits_8_bpws, verify_quality }),
+    body: JSON.stringify({ model_id, format, variants, provider, hf_org, parallel_mode, high_quality_bpws, head_bits_8_bpws, verify_quality, codebook }),
   });
 
   if (!resp.ok) {

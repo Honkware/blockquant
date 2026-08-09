@@ -92,7 +92,15 @@ export async function runVariantWithRetry(
  * (so the embed shows the variant actually running, not just the first) and
  * resolves with one result row per variant.
  */
-export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt = null, onProgress }) {
+export function runViaCli({
+  modelId,
+  variants,
+  hfOrg,
+  calRows = 250,
+  testPrompt = null,
+  codebook = config.CODEBOOK,
+  onProgress,
+}) {
   return new Promise((resolve, reject) => {
     const args = [
       SCRIPT,
@@ -100,6 +108,9 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
       '--variants', variants.join(','),
       '--skip-local-exllama',
       '--cal-rows', String(calRows),
+      // EXL3 trellis codebook. The CLI validates it against the same three
+      // values the converter takes, so a bad one dies here, not on a pod.
+      '--codebook', String(codebook),
       // Cheapest card that fits, walking up on stock-outs. Without this the
       // CLI uses the profile's H100/A100 list and dies fast when those are
       // unavailable. Disk is auto-sized by the CLI (default).

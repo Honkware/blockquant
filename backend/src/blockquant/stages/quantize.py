@@ -154,6 +154,7 @@ def run(config: QuantConfig, workspace: Path, progress_callback=None) -> dict:
                 head_bits=config.head_bits,
                 cal_rows=config.cal_rows,
                 cal_cols=config.cal_cols,
+                codebook=config.codebook,
                 parallel_mode=config.parallel_mode,
                 high_quality=variant in config.high_quality_bpws,
                 head_bits_8=variant in config.head_bits_8_bpws,
@@ -206,6 +207,7 @@ def _run_exl3_quantize(
     head_bits,
     cal_rows,
     cal_cols,
+    codebook: str = "mul1",
     parallel_mode: bool = False,
     high_quality: bool = False,
     head_bits_8: bool = False,
@@ -242,6 +244,7 @@ def _run_exl3_quantize(
             "-w", str(work_dir),
             "-b", str(bpw),
             "--head_bits", str(head_bits),
+            "--codebook", codebook,
         ]
 
     if cal_rows:

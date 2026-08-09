@@ -121,6 +121,7 @@ def _run_remote_pipeline(
             hf_org=config.hf_org,
             head_bits=config.head_bits,
             use_imatrix=config.use_imatrix,
+            codebook=config.codebook,
         )
 
         # Poll until the remote process exits, bounded so a hung pod cannot

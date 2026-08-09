@@ -52,3 +52,21 @@ def test_gguf_variants_use_safe_names():
 def test_gguf_rejects_non_gguf_variant_names(variant):
     with pytest.raises(ValidationError):
         QuantConfig(model_id="test/model", format="gguf", variants=[variant])
+
+
+def test_quant_config_defaults_to_mul1():
+    config = QuantConfig(model_id="test/model")
+    assert config.codebook == "mul1"
+
+
+@pytest.mark.parametrize("codebook", ["mcg", "mul1", "3inst", "MUL1"])
+def test_quant_config_accepts_every_codebook_exllamav3_takes(codebook):
+    config = QuantConfig(model_id="test/model", codebook=codebook)
+    assert config.codebook == codebook.lower()
+
+
+@pytest.mark.parametrize("codebook", ["", "mcg1", "1mad", "none"])
+def test_quant_config_rejects_unknown_codebook(codebook):
+    # Reject here, not on a pod that has already downloaded the weights.
+    with pytest.raises(ValidationError):
+        QuantConfig(model_id="test/model", codebook=codebook)

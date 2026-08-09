@@ -362,6 +362,11 @@ def main():
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
     parser.add_argument("--head-bits", type=int, default=8, help="Head bits for quantization")
     parser.add_argument(
+        "--codebook", choices=["mcg", "mul1", "3inst"],
+        default=os.environ.get("BLOCKQUANT_CODEBOOK", "mul1"),
+        help="EXL3 trellis codebook (default mul1; ExLlamaV3's own default is mcg).",
+    )
+    parser.add_argument(
         "--local-exllama",
         type=Path,
         default=Path(__file__).parent.parent.parent / "exllamav3",
@@ -531,6 +536,7 @@ def main():
         print(f"  PROFILE: {args.profile}  ({RunPodProvider.PROFILES[args.profile]['_summary']})")
         print(f"  GPU:     {args.gpu}   ${rate:.2f}/hr ({args.cloud.lower()})")
         print(f"  CAL:     {cal_rows} rows × {cal_cols} cols")
+        print(f"  BOOK:    {args.codebook} codebook")
         if args.network_volume_id:
             print(f"  VOL:     {args.network_volume_id} (DC: {args.data_center_id or 'unset!'})")
         else:
@@ -546,12 +552,15 @@ def main():
     # Header line consumed by log_dashboard.py's parser. Skip the hf_org
     # field entirely when unset so the dashboard doesn't render the literal
     # placeholder "(personal)" as if it were a real account name.
+    # codebook goes last: the parser's hf_org group has to sit directly after
+    # head_bits, so anything new belongs past the end of what it reads.
     header = (
         f"[job] model={args.model} variants={args.variants} format=exl3 "
         f"head_bits={args.head_bits}"
     )
     if args.hf_org:
         header += f" hf_org={args.hf_org}"
+    header += f" codebook={args.codebook}"
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
@@ -719,6 +728,7 @@ def main():
             hf_token=args.hf_token,
             hf_org=args.hf_org,
             head_bits=args.head_bits,
+            codebook=args.codebook,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,

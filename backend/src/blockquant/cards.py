@@ -146,6 +146,28 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
     }
 
 
+def _codebook_note(codebook: str, is_moe: bool = False) -> str:
+    """The one thing a downloader needs about the codebook: which loaders read it.
+
+    ExLlamaV3 stores the choice as a tensor next to the weights and loads it with
+    ``optional = True``, so a build that predates the codebook simply doesn't see
+    the marker and decodes every trellis with the plain 3INST codebook: wrong
+    weights, no error. Both mcg and mul1 markers arrived in v0.0.3.
+    """
+    cb = (codebook or "mcg").lower()
+    note = (
+        f"The codebook is recorded in the weights, so loaders pick it up with no "
+        f"configuration. `{cb}` needs **ExLlamaV3 v0.0.3** or newer; an older build "
+        f"ignores the marker and decodes the weights with the wrong codebook."
+    )
+    if cb == "mul1" and is_moe:
+        note += (
+            " ExLlamaV3's fully fused MoE kernel is `mcg`-only, so this model runs "
+            "the general expert path."
+        )
+    return note
+
+
 def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     """Coarse pre-publish size estimate when a real size isn't known yet."""
     return n_params_b * bpw / 8.0 + 1.5
@@ -224,6 +246,7 @@ def render_exl3_card(
     collection_url: str,
     license_id: str = "other",
     quantized_by: str,
+    codebook: str = "mul1",
     title_override: str | None = None,
 ) -> str:
     """Render the full polished card for one EXL3 variant."""
@@ -248,6 +271,8 @@ def render_exl3_card(
         "SIZE_GB_BADGE": size_str,
         "HEAD_BITS": str(head_bits),
         "CAL_ROWS": str(cal_rows),
+        "CODEBOOK": (codebook or "mcg").lower(),
+        "CODEBOOK_NOTE": _codebook_note(codebook, facts["is_moe"]),
         "REPO_ID": repo_id,
         "SHORT_NAME": repo_id.split("/")[-1],
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),

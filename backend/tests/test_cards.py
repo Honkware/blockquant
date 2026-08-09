@@ -112,3 +112,33 @@ def test_render_leaves_no_placeholders():
     assert "bits_per_weight: 4.5" in card
     assert "blockblockblock/abc" in card
     assert "21.6&nbsp;GB" in card
+
+
+def test_card_states_the_codebook():
+    card = cards.render_exl3_card(
+        base_repo="org/Model-8B",
+        repo_id="blockblockblock/Model-8B-exl3-4.0bpw",
+        variant="4.0",
+        head_bits=8,
+        cal_rows=250,
+        size_gb=5.5,
+        model_config={"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 32},
+        quant_rows=[{"variant": "4.0", "head_bits": 8, "cal_rows": 250,
+                     "size_gb": 5.5, "url": None}],
+        collection_url="https://huggingface.co/collections/blockblockblock/abc",
+        quantized_by="blockblockblock",
+        codebook="mul1",
+    )
+    assert not re.search(r"\{\{[A-Z_]+\}\}", card), "unfilled placeholder left in card"
+    assert "| Codebook | `mul1` |" in card
+    assert "badge/codebook-mul1-" in card
+    # A downloader has to be able to tell which loaders can read this.
+    assert "v0.0.3" in card
+    # Dense model: no fused-MoE caveat.
+    assert "fully fused MoE kernel" not in card
+
+
+def test_card_flags_the_mul1_moe_fallback():
+    note = cards._codebook_note("mul1", is_moe=True)
+    assert "fully fused MoE kernel is `mcg`-only" in note
+    assert "fully fused MoE" not in cards._codebook_note("mcg", is_moe=True)

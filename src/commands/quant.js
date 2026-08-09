@@ -80,6 +80,9 @@ export async function handleQuant(interaction) {
   // Optional smoke-test prompt: run on each finished quant so the requester
   // sees a real reply. Capped so it stays a quick check, not a chat session.
   const testPrompt = (interaction.options.getString('prompt') || '').trim().slice(0, 1000) || null;
+  // Trellis codebook. Recorded in the quant itself, so it decides which
+  // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
+  const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
   const userId = interaction.user.id;
 
   // The request is intentionally just model + bpw. Everything else is a fixed
@@ -262,6 +265,7 @@ export async function handleQuant(interaction) {
     variants,
     bpws,
     testPrompt,
+    codebook,
     categories: [category],
     profile,
     quantOptions,
@@ -322,6 +326,7 @@ export async function runApprovedJob({ interaction, job }) {
     variants,
     bpws,
     testPrompt = null,
+    codebook = config.CODEBOOK,
     categories,
     profile,
     quantOptions,
@@ -511,6 +516,7 @@ export async function runApprovedJob({ interaction, job }) {
               hfOrg: config.HF_ORG,
               calRows: 250,
               testPrompt,
+              codebook,
               onProgress: (d) => {
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();
@@ -559,6 +565,7 @@ export async function runApprovedJob({ interaction, job }) {
         variants,
         provider,
         hf_org: config.HF_ORG,
+        codebook,
       });
 
       await db.patchJob(jobId, {

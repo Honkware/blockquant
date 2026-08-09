@@ -33,6 +33,11 @@ class VerificationStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+# Trellis codebooks ExLlamaV3's convert_model.py accepts. Keep in step with its
+# own check, or the job dies on the pod after the model is already downloaded.
+CODEBOOKS = ("mcg", "mul1", "3inst")
+DEFAULT_CODEBOOK = "mul1"
+
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HF_ORG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EXL3_VARIANT_RE = re.compile(r"^(?:[1-9]\d*)(?:\.\d+)?$")
@@ -52,6 +57,13 @@ def validate_hf_org(value: str) -> str:
     value = value.strip()
     if value and ("/" in value or not _HF_ORG_RE.match(value)):
         raise ValueError("hf_org must be a single HuggingFace namespace")
+    return value
+
+
+def validate_codebook(value: str) -> str:
+    value = value.strip().lower()
+    if value not in CODEBOOKS:
+        raise ValueError(f"codebook must be one of {', '.join(CODEBOOKS)}")
     return value
 
 
@@ -82,6 +94,10 @@ class QuantConfig(BaseModel):
     head_bits: int = 8  # EXL3 param, matches existing config
     cal_rows: int | None = None  # EXL3 param
     cal_cols: int | None = None  # EXL3 param
+    # EXL3 trellis codebook. ExLlamaV3 itself defaults to mcg; we default to
+    # mul1, which is recorded in the quant as a tensor so loaders pick it up
+    # without config. Both have been supported since ExLlamaV3 v0.0.3.
+    codebook: str = DEFAULT_CODEBOOK
     # Per-BPW quantization flags (inspired by ezexl3)
     parallel_mode: bool = False  # -pm, MoE speedup
     high_quality_bpws: list[str] = Field(default_factory=list)  # -hq applied to these variants
@@ -105,6 +121,11 @@ class QuantConfig(BaseModel):
     @classmethod
     def _validate_hf_org(cls, value: str) -> str:
         return validate_hf_org(value)
+
+    @field_validator("codebook")
+    @classmethod
+    def _validate_codebook(cls, value: str) -> str:
+        return validate_codebook(value)
 
     @field_validator("runpod_container_disk_gb", "runpod_volume_gb")
     @classmethod

@@ -1021,11 +1021,13 @@ class RunPodProvider(Provider):
         cal_cols: int | None = None,
         keep_pod: bool = False,
         test_prompt: str | None = None,
+        codebook: str = "mul1",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
         ``cal_rows``/``cal_cols`` override ExLlamaV3's calibration defaults
         (250 × 2048). Lower values trade quality for speed; see PROFILES.
+        ``codebook`` is the EXL3 trellis codebook (mcg, mul1 or 3inst).
         """
         # Reset any cached result from a prior call.
         self._last_result = None
@@ -1051,6 +1053,7 @@ class RunPodProvider(Provider):
             "hf_token": hf_token,
             "hf_org": hf_org,
             "head_bits": head_bits,
+            "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),

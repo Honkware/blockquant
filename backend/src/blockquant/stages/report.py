@@ -105,6 +105,7 @@ def _render_exl3_card(config: QuantConfig, output: QuantOutput, ctx: dict) -> st
         collection_url=ctx["collection_url"],
         license_id=ctx["license_id"],
         quantized_by=ctx["quantized_by"],
+        codebook=config.codebook,
     )
 
 

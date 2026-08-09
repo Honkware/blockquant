@@ -21,6 +21,17 @@ export const commands = [
         .setName('prompt')
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('codebook')
+        .setDescription('EXL3 trellis codebook (default mul1)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'mul1 (default)', value: 'mul1' },
+          { name: 'mcg', value: 'mcg' },
+          { name: '3inst', value: '3inst' }
+        )
     ),
 
   new SlashCommandBuilder()

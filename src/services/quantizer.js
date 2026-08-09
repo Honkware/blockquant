@@ -33,6 +33,7 @@ export async function quantize(bpw, modelName, onProgress, signal, options = {})
   const convertScript = await resolveConvertScriptPath();
 
   const headBits = options.headBits ?? config.HEAD_BITS;
+  const codebook = options.codebook ?? config.CODEBOOK;
   const args = [
     '-u',
     convertScript,
@@ -46,6 +47,8 @@ export async function quantize(bpw, modelName, onProgress, signal, options = {})
     bpw.toString(),
     '--head_bits',
     headBits.toString(),
+    '--codebook',
+    codebook,
   ];
   if (Array.isArray(options.extraArgs) && options.extraArgs.length > 0) {
     args.push(...options.extraArgs);

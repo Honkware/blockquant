@@ -138,6 +138,9 @@ def main():
     ap.add_argument("--cal-rows", type=int, default=250,
                     help="Calibration rows shown in the recipe table.")
     ap.add_argument("--head-bits", type=int, default=8)
+    ap.add_argument("--codebook", choices=["mcg", "mul1", "3inst"], default="mul1",
+                    help="Codebook shown in the recipe table. Quants made before "
+                         "mul1 became the default are mcg.")
     ap.add_argument("--title", default=None,
                     help="Hand-curated card heading; auto-derived from the name when omitted.")
     args = ap.parse_args()
@@ -187,7 +190,7 @@ def main():
             head_bits=args.head_bits, cal_rows=args.cal_rows, size_gb=size_gb,
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
-            quantized_by=hf_org, title_override=args.title,
+            quantized_by=hf_org, codebook=args.codebook, title_override=args.title,
         )
         _push_card(repo_id, args.base, v, rendered)
         cards.add_to_collection(slug, repo_id, token)

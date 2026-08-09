@@ -456,8 +456,24 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
         time.sleep(wait)
 
 
+def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
+    """Codebook a published quant was made with, from its own config.json.
+
+    ExLlamaV3 records it in quantization_config. Older quants predate the key
+    and were all mcg, which is also the converter's default.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+
+        p = hf_hub_download(repo_id, "config.json", token=hf_token or None)
+        qcfg = json.loads(Path(p).read_text(encoding="utf-8")).get("quantization_config") or {}
+        return str(qcfg.get("codebook") or default)
+    except Exception:
+        return default
+
+
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                    head_bits, cal_rows, model_dir) -> None:
+                    head_bits, cal_rows, codebook, model_dir) -> None:
     """Render each variant's card with the full cross-variant table and push
     README.md to its repo. Runs after the serial upload+delete, so the out_dir
     is gone -- sizes/KL come from the recs and the card goes up via the API."""
@@ -488,7 +504,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
             head_bits=head_bits, cal_rows=rows_cal, size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
-            quantized_by=owner,
+            quantized_by=owner, codebook=codebook,
         )
         api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                         repo_id=repo_id, repo_type="model")
@@ -496,8 +512,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
 
 
 def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
-                         head_bits, cal_rows, kl_rows, model_dir, scratch_dir,
-                         max_eval=8) -> None:
+                         head_bits, cal_rows, codebook, kl_rows, model_dir,
+                         scratch_dir, max_eval=8) -> None:
     """Retroactively fill KL for existing sibling quants of the same base.
 
     The fp16 source is already on the pod, so any {owner}/{model_name}-exl3-Xbpw
@@ -530,7 +546,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     for o in outputs:
         repo = f"{owner}/{model_name}-exl3-{o['variant']}bpw"
         table[o["variant"]] = {"repo": repo, "kl": o.get("kl_div"),
-                               "size_gb": o.get("_size_gb")}
+                               "size_gb": o.get("_size_gb"), "codebook": codebook}
 
     try:
         found = list(api.list_models(author=owner, search=f"{model_name}-exl3"))
@@ -551,6 +567,9 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     evaled = 0
     for v, repo in sorted(siblings, key=lambda x: float(x[0])):
         size_gb = _repo_size_gb(repo)
+        # A sibling may well have been quantized with a different codebook than
+        # this run, so read each one's own rather than assuming ours.
+        cb_v = _repo_codebook(repo, hf_token)
         # Already measured? read it back and skip the eval.
         existing = None
         try:
@@ -561,13 +580,14 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         except Exception:
             existing = None
         if existing is not None:
-            table[v] = {"repo": repo, "kl": float(existing), "size_gb": size_gb}
+            table[v] = {"repo": repo, "kl": float(existing), "size_gb": size_gb,
+                        "codebook": cb_v}
             print(f"[backfill] {v} already has KL={float(existing):.6f}", flush=True)
             continue
         if evaled >= max_eval:
             print(f"[backfill] eval cap {max_eval} hit, leaving {v} for later",
                   flush=True)
-            table[v] = {"repo": repo, "kl": None, "size_gb": size_gb}
+            table[v] = {"repo": repo, "kl": None, "size_gb": size_gb, "codebook": cb_v}
             continue
 
         bdir = scratch_dir / f"backfill-{v}bpw"
@@ -597,7 +617,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                 print(f"[backfill] {v} KL={kl:.6f} -> bq_quality.json", flush=True)
             except Exception as e:
                 print(f"[backfill] {v} quality upload failed: {e}", flush=True)
-        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb}
+        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v}
 
     # Re-render every card so the Quants table shows KL for all bpws.
     try:
@@ -620,7 +640,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                 head_bits=head_bits, cal_rows=rows_cal, size_gb=d["size_gb"],
                 model_config=model_config, quant_rows=quant_rows,
                 collection_url=collection_url, license_id=license_id,
-                quantized_by=owner,
+                quantized_by=owner, codebook=d["codebook"],
             )
             api.upload_file(path_or_fileobj=card.encode(),
                             path_in_repo="README.md", repo_id=d["repo"])
@@ -647,6 +667,10 @@ def main() -> int:
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
         cal_cols: int | None = cfg.get("cal_cols")
+        # Trellis codebook. ExLlamaV3's own default is mcg; ours is mul1. The
+        # converter rejects anything outside mcg/mul1/3inst, and the choice is
+        # baked into the quant as a tensor, so the loader needs no config.
+        codebook: str = (cfg.get("codebook") or "mul1").strip().lower()
         # Post-quant KL-divergence of the quant against the fp16, measured on
         # the pod where both still live. On by default (best-effort: skips if the
         # fp16 won't fit the GPU). kl_rows trades accuracy for pod time.
@@ -816,6 +840,7 @@ def main() -> int:
                 "-w", str(work_dir),
                 "-b", str(bpw),
                 "--head_bits", str(head_bits),
+                "--codebook", codebook,
                 "--parallel_mode",
             ]
             if cal_rows is not None:
@@ -954,7 +979,7 @@ def main() -> int:
             # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
                 _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                                head_bits, cal_rows, model_dir)
+                                head_bits, cal_rows, codebook, model_dir)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an
@@ -977,8 +1002,8 @@ def main() -> int:
                     _backfill_sibling_kl(
                         outputs=outputs, model_id=model_id, model_name=model_name,
                         owner=owner, hf_token=hf_token, head_bits=head_bits,
-                        cal_rows=cal_rows, kl_rows=kl_rows, model_dir=model_dir,
-                        scratch_dir=workspace,
+                        cal_rows=cal_rows, codebook=codebook, kl_rows=kl_rows,
+                        model_dir=model_dir, scratch_dir=workspace,
                     )
                 except Exception:
                     print("[backfill] WARN skipped:\n" + traceback.format_exc(),
