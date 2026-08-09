@@ -115,6 +115,29 @@ def _load_arch_support() -> dict:
         return {}
 
 
+def _default_codebook(model_id: str, token: str) -> str:
+    """mul1 for dense, mcg for MoE.
+
+    mul1 sums 4 bytes per weight where mcg sums 2, which is a closer fit to the
+    Gaussian the trellis assumes. But exl3_moe.cu only has a fused kernel for
+    mcg (`block_sparse_mlp.py` gates support_fused on it), so a mul1 MoE model
+    silently drops to the general expert path: right answer, slower inference,
+    paid by everyone who downloads it. Dense models have no such kernel and
+    take mul1 free. Unreadable config gets mcg, the one nothing penalises.
+    """
+    try:
+        import json as _json
+        from huggingface_hub import hf_hub_download
+        cfg = _json.loads(Path(hf_hub_download(model_id, "config.json", token=token or None)).read_text())
+    except Exception:
+        return "mcg"
+    # Multimodal repos put the LM's geometry under text_config.
+    for scope in (cfg, cfg.get("text_config") or {}):
+        if any(scope.get(k) for k in ("num_local_experts", "num_experts", "n_routed_experts")):
+            return "mcg"
+    return "mul1"
+
+
 def _resolve_arch(model_id: str, token: str):
     """(arch, registry_entry|None, config_read_ok). entry is the arch_support
     record (tier/image/note) when the arch is supported by exllamav3."""
@@ -362,9 +385,10 @@ def main():
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
     parser.add_argument("--head-bits", type=int, default=8, help="Head bits for quantization")
     parser.add_argument(
-        "--codebook", choices=["mcg", "mul1", "3inst"],
-        default=os.environ.get("BLOCKQUANT_CODEBOOK", "mul1"),
-        help="EXL3 trellis codebook (default mul1; ExLlamaV3's own default is mcg).",
+        "--codebook", choices=["auto", "mcg", "mul1", "3inst"],
+        default=os.environ.get("BLOCKQUANT_CODEBOOK", "auto"),
+        help="EXL3 trellis codebook. auto (default) picks mul1 for dense and mcg "
+             "for MoE, which keeps the fused MoE kernel. ExLlamaV3's own default is mcg.",
     )
     parser.add_argument(
         "--local-exllama",
@@ -419,6 +443,11 @@ def main():
         help="Print resolved config + cost estimate and exit. Does not launch a pod.",
     )
     args = parser.parse_args()
+
+    # Resolve the codebook before anything reads it: the summary, the [job]
+    # header and the provider all want a concrete value, not "auto".
+    if args.codebook == "auto":
+        args.codebook = _default_codebook(args.model, args.hf_token)
 
     # ---- Resolve --profile + per-knob overrides -------------------------
     # Only apply preset's cloud/GPU when the user didn't pass theirs.
