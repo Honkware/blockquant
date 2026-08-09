@@ -349,6 +349,24 @@ def quant_method() -> str:
     return str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
 
 
+def _pkg_version(name: str, mod=None) -> str:
+    """Installed version of a loader package.
+
+    Package metadata first: a git/source install of exllamav3 sets no top-level
+    __version__, which is why the image health check reads it this way too.
+    """
+    try:
+        from importlib.metadata import version
+        v = version(name)
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    v = (getattr(mod, "__version__", "")
+         or getattr(getattr(mod, "version", None), "__version__", ""))
+    return str(v or "")
+
+
 def _hf_tokenizer():
     """AutoTokenizer from the download. Both loaders want it for the chat
     template; only the transformers one uses it to tokenize."""
@@ -377,9 +395,13 @@ def _trim(resp: str) -> str:
 class HFRunner:
     """fp16/bf16 source weights through transformers."""
 
+    loader = "transformers"
+
     def __init__(self):
         import torch
+        import transformers
         from transformers import AutoModelForCausalLM
+        self.engine = _pkg_version("transformers", transformers)
         # trust_remote_code stays OFF. /catbench has no approval gate, so an
         # arbitrary HF repo must not get to run its own python next to our HF
         # token. Models that need custom code fail here, loudly, by design.
@@ -419,8 +441,12 @@ class Exl3Runner:
     _sample_generate, which drives freshly converted quants on this image.
     """
 
+    loader = "exl3"
+
     def __init__(self, max_tokens: int = CACHE_TOKENS):
+        import exllamav3
         from exllamav3 import Config, Model, Cache, Tokenizer, Generator
+        self.engine = _pkg_version("exllamav3", exllamav3)
         config = Config.from_directory(str(MODEL_DIR))
         self.model = Model.from_config(config)
         self.cache = Cache(self.model, max_num_tokens=max_tokens)
@@ -511,6 +537,12 @@ def main() -> None:
         fmt = quant_method()
         result["format"] = fmt or "bf16"
         runner = load_model(fmt)
+        # What read the weights, and at what version. The bot stores this with
+        # the pictures: the same repo through a newer exllamav3 is arguably a
+        # different result, and you cannot tell from a jpg.
+        result["loader"] = runner.loader
+        result["engine"] = runner.engine
+        result["prompts"] = {"svg": PROMPT_SVG, "python": PROMPT_PY}
 
         print("[progress] prompt 1/2 (svg)", flush=True)
         svg_reply = runner.generate(PROMPT_SVG, MAX_NEW_SVG)

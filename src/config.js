@@ -131,6 +131,11 @@ const config = Object.freeze({
   // user from spending the RunPod balance a pod at a time.
   CATBENCH_MAX_GB: intEnv('CATBENCH_MAX_GB', 64),
   CATBENCH_COOLDOWN_MS: intEnv('CATBENCH_COOLDOWN_MS', 30 * 60 * 1000),
+  // HF dataset holding our own results, e.g. Honkware/catbench-results.
+  // Empty means results stay on this box only: nothing is pushed to
+  // HuggingFace until this names a repo, which is also the review gate before
+  // the first write. Authenticated with HF_TOKEN, no second credential.
+  CATBENCH_DATASET: process.env.CATBENCH_DATASET || '',
 
   // Paths (.env file overrides inherited env for these two)
   WORKSPACE_DIR: resolveRepoPath(workspaceDirRaw, './tmp/workdir'),

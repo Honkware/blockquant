@@ -5,8 +5,11 @@ process.env.BOT_TOKEN ??= 'test';
 process.env.CLIENT_ID ??= 'test';
 process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
+process.env.CATBENCH_DATASET ??= 'Honkware/catbench-results';
 
-const { normKey, modelKey, lookup, listAll } = await import('../src/services/catbench.js');
+const { normKey, modelKey, lookup, listAll, gradeRun } = await import(
+  '../src/services/catbench.js'
+);
 const { sanitizeSvg } = await import('../src/utils/svg.js');
 
 // One model, shaped exactly like upstream's demos/CatBench/manifest.json.
@@ -24,8 +27,39 @@ const MANIFEST = {
       python_render: 'assets/North-Mini-Code-1.0_30B-python.jpg',
       svg: 'assets/North-Mini-Code-1.0_30B-svg.jpg',
     },
+    'muse-spark-1.1': {
+      display_name: 'muse-spark-1.1',
+      svg: 'assets/muse-spark-1.1-svg.jpg',
+      python_render: 'assets/muse-spark-1.1-python.jpg',
+    },
   },
 };
+
+// Our own store: upstream's shape plus what upstream does not record. Same
+// muse-spark entry, so precedence between the two stores is testable.
+const OURS = {
+  models: {
+    'qwen3-8b': {
+      display_name: 'Qwen3-8B',
+      model_id: 'Qwen/Qwen3-8B',
+      svg: 'assets/qwen3-8b-svg.jpg',
+      python_render: 'assets/qwen3-8b-python.jpg',
+      svg_source: 'assets/qwen3-8b.svg',
+      python_source: 'assets/qwen3-8b.py',
+      loader: 'exl3',
+      engine: '0.0.43',
+      run_date: '2026-08-09T21:00:00Z',
+    },
+    'muse-spark-1.1': {
+      display_name: 'muse-spark-1.1',
+      model_id: 'someone/Muse-Spark-1.1',
+      svg: 'assets/muse-spark-1.1-svg.jpg',
+      python_render: 'assets/muse-spark-1.1-python.jpg',
+      run_date: '2026-08-09T21:00:00Z',
+    },
+  },
+};
+const OURS_BASE = 'https://huggingface.co/datasets/Honkware/catbench-results/resolve/main';
 
 describe('catbench keys', () => {
   it('normalizes a stem the way the upstream page does', () => {
@@ -44,6 +78,7 @@ describe('catbench gallery', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url) => {
+        if (String(url).startsWith(OURS_BASE)) return { ok: true, json: async () => OURS };
         if (String(url).endsWith('manifest.json')) {
           return { ok: true, json: async () => MANIFEST };
         }
@@ -75,6 +110,72 @@ describe('catbench gallery', () => {
   it('lists everything benched', async () => {
     const all = await listAll();
     expect(all.map((e) => e.key)).toContain('glm-5.2');
+    expect(all.map((e) => e.key)).toContain('qwen3-8b');
+  });
+});
+
+describe('our own store', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url) => {
+        if (String(url).startsWith(OURS_BASE)) return { ok: true, json: async () => OURS };
+        if (String(url).endsWith('manifest.json')) return { ok: true, json: async () => MANIFEST };
+        throw new Error(`unexpected fetch: ${url}`);
+      })
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('serves a run we did, with the loader and engine that did it', async () => {
+    const hit = await lookup('Qwen/Qwen3-8B');
+    expect(hit.source).toBe('ours');
+    expect(hit.svg).toBe(`${OURS_BASE}/assets/qwen3-8b-svg.jpg`);
+    expect(hit.loader).toBe('exl3');
+    expect(hit.engine).toBe('0.0.43');
+    expect(hit.at).toBe('2026-08-09T21:00:00Z');
+  });
+
+  it('wins over upstream, so a forced re-run is not invisible', async () => {
+    expect((await lookup('someone/Muse-Spark-1.1')).source).toBe('ours');
+  });
+
+  it('does not answer for another org that happens to share a stem', async () => {
+    // someoneelse/Qwen3-8B is a different repo. Upstream's key rule cannot see
+    // that; we recorded the model id, so we can.
+    expect(await lookup('someoneelse/Qwen3-8B')).toBeNull();
+    expect((await lookup('qwen3-8b')).source).toBe('ours');
+  });
+});
+
+describe('gradeRun', () => {
+  const png = Buffer.alloc(4096, 7);
+  const good = { svg: "<svg><circle r='3'/></svg>", python_source: 'import matplotlib' };
+
+  it('accepts a run where both halves drew something', () => {
+    expect(gradeRun(good, { svgPng: png, pythonPng: png }).ok).toBe(true);
+  });
+
+  it('refuses a script that crashed after drawing', () => {
+    const g = gradeRun({ ...good, python_error: 'ZeroDivisionError' }, { svgPng: png, pythonPng: png });
+    expect(g.ok).toBe(false);
+    expect(g.why).toContain('crashed');
+  });
+
+  it('refuses prose where the code should be', () => {
+    expect(gradeRun({ svg: good.svg, python_error: 'no python in the reply' }, { svgPng: png }).ok).toBe(
+      false
+    );
+  });
+
+  it('refuses an SVG with no marks in it', () => {
+    expect(gradeRun({ ...good, svg: '<svg><defs/></svg>' }, { svgPng: png, pythonPng: png }).ok).toBe(
+      false
+    );
+  });
+
+  it('refuses an SVG that rasterized blank', () => {
+    expect(gradeRun(good, { svgPng: Buffer.alloc(200), pythonPng: png }).ok).toBe(false);
   });
 });
 

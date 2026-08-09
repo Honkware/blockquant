@@ -43,6 +43,12 @@ export const commands = [
         .setDescription('A benched model, or a HuggingFace ID to run. Leave empty to list what is benched.')
         .setRequired(false)
         .setAutocomplete(true)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('refresh')
+        .setDescription('(Admin) Ignore the stored result and bench it again on a fresh pod')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),

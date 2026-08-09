@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
@@ -10,8 +11,10 @@ const log = getLogger('catbench-cli');
 
 const ROOT = config.ROOT_DIR;
 const SCRIPT = path.join(ROOT, 'backend', 'scripts', 'run_catbench_job.py');
+const STORE_SCRIPT = path.join(ROOT, 'backend', 'scripts', 'catbench_store.py');
 const PYTHON = config.PYTHON_BIN || path.join(ROOT, 'backend', 'venv', 'bin', 'python');
 const LOG_DIR = path.join(ROOT, 'backend', 'logs');
+const MIRROR_DIR = path.join(ROOT, 'data', 'catbench');
 
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
@@ -187,6 +190,76 @@ export function runCatbench({ modelId, onProgress }) {
       // diagnosis ("Unknown quantization type, got exl3") never reached anyone.
       // The controller writes this line, and sanitizeErrorText scrubs tokens.
       reject(new AppError('QUANT_EXIT_FAILED', why, { publicMessage: sanitizeErrorText(why) }));
+    });
+  });
+}
+
+/**
+ * Persist one graded run through backend/scripts/catbench_store.py: the local
+ * mirror always, the HF dataset when CATBENCH_DATASET names one.
+ *
+ * The upload runs here, on the VPS, not on the pod. The pod already hands the
+ * SVG, the script and the rendered PNG back in its result JSON, and it drops
+ * HF_TOKEN from its environment before any model output executes. Uploading
+ * from the pod would put a write token back next to model-written code for no
+ * gain, so it stays here.
+ *
+ * Resolves the store's JSON receipt. Rejects if it refuses the payload.
+ */
+export function storeRun(payload) {
+  return new Promise((resolve, reject) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bq-catbench-'));
+    const write = (name, buf) => {
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, buf);
+      return p;
+    };
+    const body = {
+      model_id: payload.model_id,
+      display_name: payload.display_name || String(payload.model_id).split('/').pop(),
+      loader: payload.loader || '',
+      engine: payload.engine || '',
+      format: payload.format || '',
+      run_date: payload.run_date || new Date().toISOString(),
+      prompts: payload.prompts || {},
+      svg_source: payload.svgSource || '',
+      python_source: payload.pythonSource || '',
+      svg_png: payload.svgPng ? write('svg.png', payload.svgPng) : '',
+      python_png: payload.pythonPng ? write('python.png', payload.pythonPng) : '',
+    };
+    const payloadPath = write('payload.json', Buffer.from(JSON.stringify(body)));
+
+    const args = [STORE_SCRIPT, '--payload', payloadPath, '--mirror', MIRROR_DIR];
+    if (config.CATBENCH_DATASET) args.push('--repo', config.CATBENCH_DATASET);
+
+    const child = spawn(PYTHON, args, {
+      cwd: ROOT,
+      env: { ...process.env, HF_TOKEN: config.HF_TOKEN, PYTHONUNBUFFERED: '1' },
+    });
+    let out = '';
+    let errOut = '';
+    // Big enough for a slow LFS push of two jpgs, short enough that a hung
+    // upload cannot pin the command's finally block open.
+    const timer = setTimeout(() => child.kill('SIGKILL'), 180_000);
+    child.stdout.on('data', (c) => (out += c.toString()));
+    child.stderr.on('data', (c) => (errOut += c.toString()));
+    const done = (err, val) => {
+      clearTimeout(timer);
+      fs.rmSync(dir, { recursive: true, force: true });
+      err ? reject(err) : resolve(val);
+    };
+    child.on('error', (err) => done(err));
+    child.on('close', (code) => {
+      const line = out.trim().split('\n').filter(Boolean).pop() || '';
+      let receipt = null;
+      try {
+        receipt = JSON.parse(line);
+      } catch {
+        /* not JSON */
+      }
+      if (receipt?.ok) return done(null, receipt);
+      const why = receipt?.error || (errOut || out).trim().slice(-300) || `store exited ${code}`;
+      done(new Error(sanitizeErrorText(why)));
     });
   });
 }
