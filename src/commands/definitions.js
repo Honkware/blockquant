@@ -23,6 +23,17 @@ export const commands = [
         .setRequired(false)
     ),
 
+  new SlashCommandBuilder()
+    .setName('catbench')
+    .setDescription('Ask a model for a cute kitten twice, and look at what comes out')
+    .addStringOption((opt) =>
+      opt
+        .setName('model')
+        .setDescription('A benched model, or a HuggingFace ID to run. Leave empty to list what is benched.')
+        .setRequired(false)
+        .setAutocomplete(true)
+    ),
+
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),
   new SlashCommandBuilder().setName('health').setDescription('Check bot/service health summary'),
 

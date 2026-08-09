@@ -123,6 +123,12 @@ const config = Object.freeze({
   CHAT_CHANNELS: process.env.CHAT_CHANNELS || '',
   CHAT_MAX_TOKENS: intEnv('CHAT_MAX_TOKENS', 1024),
 
+  // CatBench (/catbench). Runs with no admin approval, so these two are the
+  // gate: the size cap keeps every run on one H100, the cooldown keeps one
+  // user from spending the RunPod balance a pod at a time.
+  CATBENCH_MAX_GB: intEnv('CATBENCH_MAX_GB', 64),
+  CATBENCH_COOLDOWN_MS: intEnv('CATBENCH_COOLDOWN_MS', 30 * 60 * 1000),
+
   // Paths (.env file overrides inherited env for these two)
   WORKSPACE_DIR: resolveRepoPath(workspaceDirRaw, './tmp/workdir'),
   EXLLAMAV3_DIR: resolveRepoPath(exllamav3DirRaw, './exllamav3'),

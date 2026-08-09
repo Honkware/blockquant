@@ -1,6 +1,7 @@
 import { getLogger } from '../logger.js';
 import { MessageFlags } from 'discord.js';
 import { handleQuant } from './quant.js';
+import { handleCatbench, autocompleteCatbench } from './catbench.js';
 import { handleApproval } from './approval.js';
 import { handleHealth, handleHistory, handleQueueStatus } from './info.js';
 import { handleCache, handleDiag, handlePause, handleResume } from './admin.js';
@@ -10,6 +11,7 @@ const log = getLogger('commands');
 
 const handlers = {
   quant: handleQuant,
+  catbench: handleCatbench,
   queue: handleQueueStatus,
   health: handleHealth,
   history: handleHistory,
@@ -37,6 +39,19 @@ export async function routeCommand(interaction) {
       } catch {
         // interaction expired
       }
+    }
+    return;
+  }
+
+  // Autocomplete on /catbench's model option. Must answer within 3s and can
+  // never reply with anything but choices, so it gets its own short path.
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName !== 'catbench') return;
+    try {
+      await autocompleteCatbench(interaction);
+    } catch (err) {
+      log.debug(`autocomplete failed: ${err.message}`);
+      await interaction.respond([]).catch(() => {});
     }
     return;
   }
