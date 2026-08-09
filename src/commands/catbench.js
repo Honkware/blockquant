@@ -1,9 +1,11 @@
+import { existsSync } from 'node:fs';
 import { AttachmentBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
 import * as hf from '../services/huggingface.js';
 import * as gallery from '../services/catbench.js';
 import { preflight, runCatbench } from '../services/catbenchCli.js';
+import { list as listControllers } from '../services/detached.js';
 import { sanitizeSvg, renderSvgToPng } from '../utils/svg.js';
 import { truncate } from '../utils/format.js';
 import { toUserMessage } from '../errors/taxonomy.js';
@@ -16,6 +18,17 @@ const COLOR = 0xff6b35; // upstream CatBench accent
 // time across the whole bot, and one run per user per window.
 let running = null; // modelId of the in-flight run
 const lastRun = new Map(); // userId -> ms
+
+/**
+ * The model a run is already burning a pod on, or null. Controllers survive a
+ * bot restart, so the in-memory flag alone would let the first /catbench after
+ * a deploy boot a second pod next to the first.
+ */
+function inFlight() {
+  if (running) return running;
+  const c = listControllers().find((r) => r.kind === 'catbench' && r.running);
+  return c ? c.meta?.modelId || c.id : null;
+}
 
 function cooldownLeft(userId) {
   if (config.ADMIN_IDS.includes(userId)) return 0;
@@ -52,7 +65,6 @@ function resultEmbeds({ name, svgImage, pythonImage, footer }) {
   return embeds;
 }
 
-/** Show an already-benched model. Upstream entries are URLs, ours are files. */
 // A fresh run takes 12-25 minutes and an interaction token dies at 15, so the
 // result usually lands after editReply has stopped working -- it throws and the
 // user sits on the last progress state forever. Fall back to the channel, which
@@ -74,31 +86,41 @@ async function deliver(interaction, payload) {
   }
 }
 
+/**
+ * A cached hit's footer. Ours carries the date and the engine that made it: an
+ * old run is still worth showing, but it should read as an old run rather than
+ * as the current answer, and `refresh` is how you replace it.
+ */
+function cachedFooter(entry) {
+  if (entry.source === 'upstream') return 'already in the CatBench gallery';
+  const day = entry.at ? String(entry.at).slice(0, 10) : 'earlier';
+  const engine = [entry.loader, entry.engine].filter(Boolean).join(' ');
+  return `benched here ${day}${engine ? ` · ${engine}` : ''}`;
+}
+
+/**
+ * Show an already-benched model. Upstream is a URL; ours attaches the mirrored
+ * file when this box still has it and falls back to the dataset URL when it
+ * doesn't, so a rebuilt VPS still answers from the runs it used to have.
+ */
 async function showCached(interaction, entry) {
   const files = [];
-  let svgImage = null;
-  let pythonImage = null;
-
-  if (entry.source === 'upstream') {
-    svgImage = entry.svg;
-    pythonImage = entry.python;
-  } else {
-    if (entry.svgFile) {
-      files.push(new AttachmentBuilder(entry.svgFile, { name: 'svg.png' }));
-      svgImage = 'attachment://svg.png';
+  const image = (file, url, name) => {
+    if (file && existsSync(file)) {
+      files.push(new AttachmentBuilder(file, { name }));
+      return `attachment://${name}`;
     }
-    if (entry.pythonFile) {
-      files.push(new AttachmentBuilder(entry.pythonFile, { name: 'python.png' }));
-      pythonImage = 'attachment://python.png';
-    }
-  }
+    return url || null;
+  };
+  const svgImage = image(entry.svgFile, entry.svg, 'svg.jpg');
+  const pythonImage = image(entry.pythonFile, entry.python, 'python.jpg');
 
   await interaction.editReply({
     embeds: resultEmbeds({
       name: entry.name,
       svgImage,
       pythonImage,
-      footer: entry.source === 'upstream' ? 'already in the CatBench gallery' : 'benched here earlier',
+      footer: cachedFooter(entry),
     }),
     files,
   });
@@ -148,6 +170,7 @@ export async function autocompleteCatbench(interaction) {
 
 export async function handleCatbench(interaction) {
   const input = (interaction.options.getString('model') || '').trim();
+  const refresh = interaction.options.getBoolean('refresh') ?? false;
 
   // No model: the roster. Keeps `/catbench <model>` exactly as specified while
   // still giving a zero-argument way to browse.
@@ -158,14 +181,26 @@ export async function handleCatbench(interaction) {
 
   await interaction.deferReply();
   const userId = interaction.user.id;
+  const isAdmin = config.ADMIN_IDS.includes(userId);
+
+  // `refresh` skips the cache and re-benches. Admin only: the cache is the only
+  // thing standing between /catbench and paying for the same kitten twice, so a
+  // switch that turns it off is a switch that spends money.
+  if (refresh && !isAdmin) {
+    return interaction.editReply({
+      content: 'Only an admin can force a re-run. A cached bench is a pod nobody has to pay for.',
+    });
+  }
 
   // Cached first, before any validation — an upstream hit needs no HF lookup,
   // no pod, no GPU.
   let entry = null;
-  try {
-    entry = await gallery.lookup(input);
-  } catch (err) {
-    log.warn(`gallery lookup failed: ${err.message}`);
+  if (!refresh) {
+    try {
+      entry = await gallery.lookup(input);
+    } catch (err) {
+      log.warn(`gallery lookup failed: ${err.message}`);
+    }
   }
   if (entry) return showCached(interaction, entry);
 
@@ -187,9 +222,10 @@ export async function handleCatbench(interaction) {
       content: `You benched a model recently. Try again in ${Math.ceil(wait / 60000)} min.`,
     });
   }
-  if (running) {
+  const busy = inFlight();
+  if (busy) {
     return interaction.editReply({
-      content: `A CatBench run is already going (\`${running}\`). One pod at a time — try again when it lands.`,
+      content: `A CatBench run is already going (\`${busy}\`). One pod at a time — try again when it lands.`,
     });
   }
   // Claim the slot before the size check, not after: the check takes seconds
@@ -265,6 +301,9 @@ export async function handleCatbench(interaction) {
       });
     }
 
+    // Only a clean both-halves run is worth keeping. A half-run cached is a
+    // half-run nobody ever retries, and those are the ones a fix would fix.
+    const grade = gallery.gradeRun(result, { svgPng, pythonPng });
     const mins = Math.round((result.wall_seconds || (Date.now() - started) / 1000) / 60);
     const cost = result.cost_usd != null ? ` · ~$${result.cost_usd.toFixed(2)}` : '';
     await deliver(interaction, {
@@ -272,15 +311,30 @@ export async function handleCatbench(interaction) {
         name: modelId,
         svgImage,
         pythonImage,
-        footer: `fresh run · ${mins}m${cost}`,
+        footer: grade.ok
+          ? `fresh run · ${mins}m${cost}`
+          : `fresh run · ${mins}m${cost} · not saved (${truncate(grade.why, 90)})`,
       }),
       files,
     });
 
-    // Remember it, so the next request for this model is free.
-    await gallery
-      .saveRun(modelId, { svgPng, pythonPng, note: result.python_error || result.svg_error })
-      .catch((e) => log.warn(`could not cache result: ${e.message}`));
+    if (!grade.ok) {
+      log.info(`not caching ${modelId}: ${grade.why}`);
+    } else {
+      // Remember it, so the next request for this model is free.
+      await gallery
+        .saveRun(modelId, {
+          svgPng,
+          pythonPng,
+          svgSource: result.svg,
+          pythonSource: result.python_source,
+          loader: result.loader,
+          engine: result.engine,
+          format: result.format,
+          prompts: result.prompts,
+        })
+        .catch((e) => log.warn(`could not cache result: ${e.message}`));
+    }
   } catch (err) {
     log.error(`catbench failed for ${modelId}`, { error: err.message });
     await deliver(interaction, { embeds: [], content: `❌ ${toUserMessage(err)}` });
