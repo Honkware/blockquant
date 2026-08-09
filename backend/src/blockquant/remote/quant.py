@@ -408,30 +408,52 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
             pass
 
 
+_UPLOAD_TRIES = 4
+# Nothing here comes good on a retry: bad request, bad token, no write access,
+# missing repo, payload rejected. Everything else (429, 5xx, a dropped socket)
+# is worth another go.
+_UPLOAD_TERMINAL = {400, 401, 403, 404, 413}
+
+
 def _upload_folder_hb(api, path, repo_id, variant) -> None:
     """upload_folder on a worker thread with a 20s heartbeat -- pushing tens of
     GB is silent for minutes, the last quiet phase that could trip the
-    controller's stall watchdog. Raises on failure (after join)."""
+    controller's stall watchdog. Raises on failure (after join).
+
+    Retried, because the pod is torn down afterwards: one transient error used
+    to throw away a conversion that had already succeeded. upload_folder asks
+    the remote what it already has and pushes only the rest, so a retry resumes
+    a part-uploaded repo rather than starting it again.
+    """
     import threading
-    done, err = threading.Event(), {}
+    for attempt in range(1, _UPLOAD_TRIES + 1):
+        done, err = threading.Event(), {}
 
-    def _do():
-        try:
-            api.upload_folder(folder_path=path, repo_id=repo_id, repo_type="model")
-        except Exception as exc:
-            err["exc"] = exc
-        finally:
-            done.set()
+        def _do():
+            try:
+                api.upload_folder(folder_path=path, repo_id=repo_id, repo_type="model")
+            except Exception as exc:
+                err["exc"] = exc
+            finally:
+                done.set()
 
-    t = threading.Thread(target=_do, daemon=True)
-    t.start()
-    secs = 0
-    while not done.wait(20):
-        secs += 20
-        print(f"[upload] {variant} pushing... {secs}s", flush=True)
-    t.join()
-    if "exc" in err:
-        raise err["exc"]
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        secs = 0
+        while not done.wait(20):
+            secs += 20
+            print(f"[upload] {variant} pushing... {secs}s", flush=True)
+        t.join()
+        exc = err.get("exc")
+        if exc is None:
+            return
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in _UPLOAD_TERMINAL or attempt == _UPLOAD_TRIES:
+            raise exc
+        wait = 30 * 2 ** (attempt - 1)
+        print(f"[upload] {variant} attempt {attempt}/{_UPLOAD_TRIES} failed "
+              f"({code or type(exc).__name__}); resuming in {wait}s", flush=True)
+        time.sleep(wait)
 
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
