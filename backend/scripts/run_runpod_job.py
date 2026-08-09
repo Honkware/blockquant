@@ -11,6 +11,7 @@ Example:
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -154,6 +155,33 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     return False
 
 
+_FRAME = ("Traceback", "  File ", "During handling", "The above exception")
+
+
+def _last_exception(lines: list[str]) -> str:
+    """Final exception line plus its continuation.
+
+    HfHubHTTPError puts a request id on the first line and the server's actual
+    message on the ones after it, so the single line that matches "Error" is the
+    half that says nothing. Keep the continuation, drop the request id.
+    """
+    idx = next((i for i in range(len(lines) - 1, -1, -1)
+                if lines[i][:1].isalpha() and ":" in lines[i]
+                and ("Error" in lines[i] or "Exception" in lines[i])), None)
+    if idx is None:
+        return ""
+    parts = [lines[idx].strip()]
+    for ln in lines[idx + 1:]:
+        s = ln.strip()
+        if not s or ln.startswith(_FRAME) or s.startswith("["):
+            break
+        parts.append(s)
+        if sum(map(len, parts)) > 600:
+            break
+    msg = re.sub(r"\(Request ID: [^)]*\)\s*", "", " ".join(parts)).strip()
+    return msg[:600] if msg else " ".join(parts)[:600]
+
+
 def _drain_failure(provider, instance_id, outcome: str) -> str:
     """Distill a one-line reason from the remote log for a non-done outcome, so a
     failure surfaces as the real cause instead of a bare exit code."""
@@ -162,8 +190,7 @@ def _drain_failure(provider, instance_id, outcome: str) -> str:
     except Exception:
         tail = ""
     lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
-    exc = next((ln.strip() for ln in reversed(lines)
-                if ln[:1].isalpha() and ("Error" in ln or "Exception" in ln) and ":" in ln), "")
+    exc = _last_exception(lines)
     if outcome == "failed":
         return f"remote quant crashed: {exc or (lines[-1] if lines else 'see controller log')}"
     if outcome == "no_result":
