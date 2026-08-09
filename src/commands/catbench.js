@@ -53,6 +53,27 @@ function resultEmbeds({ name, svgImage, pythonImage, footer }) {
 }
 
 /** Show an already-benched model. Upstream entries are URLs, ours are files. */
+// A fresh run takes 12-25 minutes and an interaction token dies at 15, so the
+// result usually lands after editReply has stopped working -- it throws and the
+// user sits on the last progress state forever. Fall back to the channel, which
+// is where someone who wandered off will look anyway.
+async function deliver(interaction, payload) {
+  try {
+    return await interaction.editReply(payload);
+  } catch {
+    const ch = interaction.channel
+      || (await interaction.client.channels.fetch(interaction.channelId).catch(() => null));
+    if (!ch) {
+      log.warn('result ready but the token expired and the channel is gone');
+      return null;
+    }
+    const at = `<@${interaction.user.id}>`;
+    return ch
+      .send({ ...payload, content: payload.content ? `${at} ${payload.content}` : at })
+      .catch((e) => log.warn(`could not deliver to channel: ${e.message}`));
+  }
+}
+
 async function showCached(interaction, entry) {
   const files = [];
   let svgImage = null;
@@ -236,7 +257,7 @@ export async function handleCatbench(interaction) {
     }
 
     if (!svgImage && !pythonImage) {
-      return interaction.editReply({
+      return deliver(interaction, {
         embeds: [],
         content:
           `\`${modelId}\` drew nothing usable. ` +
@@ -246,7 +267,7 @@ export async function handleCatbench(interaction) {
 
     const mins = Math.round((result.wall_seconds || (Date.now() - started) / 1000) / 60);
     const cost = result.cost_usd != null ? ` · ~$${result.cost_usd.toFixed(2)}` : '';
-    await interaction.editReply({
+    await deliver(interaction, {
       embeds: resultEmbeds({
         name: modelId,
         svgImage,
@@ -262,7 +283,7 @@ export async function handleCatbench(interaction) {
       .catch((e) => log.warn(`could not cache result: ${e.message}`));
   } catch (err) {
     log.error(`catbench failed for ${modelId}`, { error: err.message });
-    await interaction.editReply({ embeds: [], content: `❌ ${toUserMessage(err)}` }).catch(() => {});
+    await deliver(interaction, { embeds: [], content: `❌ ${toUserMessage(err)}` });
   } finally {
     running = null;
   }
