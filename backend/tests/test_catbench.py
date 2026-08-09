@@ -39,10 +39,15 @@ class _P:
 @pytest.fixture(scope="module")
 def job():
     """run_catbench_job.py's pure helpers, with the /quant imports stubbed."""
+    import json
     import re
-    ns = {"RunPodProvider": _P, "re": re}
+    from pathlib import Path
+    ns = {"RunPodProvider": _P, "json": json, "Path": Path, "re": re,
+          "_IMAGE_BY_NAME": {"exl3_043": "ghcr.io/x:043", "master": "ghcr.io/x:master",
+                             "stable": ""},
+          "_resolve_arch": lambda m, t: ("ArchForCausalLM", None, True)}
     _load(QUANT_JOB, ("_FRAME", "_last_exception"), ns)
-    _load(JOB, ("size_check", "DEFAULT_MAX_GB", "failure_reason"), ns)
+    _load(JOB, ("size_check", "DEFAULT_MAX_GB", "format_check", "failure_reason"), ns)
     return ns
 
 
@@ -86,6 +91,63 @@ def test_extract_python_accepts_an_unfenced_script():
 
 def test_extract_python_rejects_a_refusal():
     assert cb.extract_python("Sorry, I would rather not.") is None
+
+
+# ── Which loader the pod reaches for ────────────────────────────────────────
+
+def _config(tmp_path, monkeypatch, body):
+    (tmp_path / "config.json").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(cb, "MODEL_DIR", tmp_path)
+
+
+def test_an_exl3_repo_is_detected_from_its_config(tmp_path, monkeypatch):
+    # Verbatim from AnuAmba/Ornith-9B-6bpw-exl3, the run that crashed.
+    _config(tmp_path, monkeypatch,
+            '{"architectures": ["Qwen3_5ForConditionalGeneration"], '
+            '"quantization_config": {"quant_method": "exl3", "bits": 6.0}}')
+    assert cb.quant_method() == "exl3"
+
+
+def test_plain_weights_report_no_quant_method(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, '{"architectures": ["Qwen3ForCausalLM"]}')
+    assert cb.quant_method() == ""
+
+
+def test_a_missing_config_is_not_a_crash(tmp_path, monkeypatch):
+    monkeypatch.setattr(cb, "MODEL_DIR", tmp_path)
+    assert cb.quant_method() == ""
+
+
+def test_a_format_with_no_loader_says_so_before_transformers_does(tmp_path, monkeypatch):
+    monkeypatch.setattr(cb, "MODEL_DIR", tmp_path)
+    with pytest.raises(RuntimeError, match="awq"):
+        cb.load_model("awq")
+
+
+def test_reply_is_cut_at_the_turn_boundary():
+    assert cb._trim("<svg/></svg><|im_end|>\n<|im_start|>user") == "<svg/></svg>"
+    assert cb._trim("  plain  ") == "plain"
+
+
+def test_a_base_model_gets_the_raw_prompt():
+    class _NoTemplate:
+        chat_template = None
+
+    assert cb._chat_wrap(_NoTemplate(), "hi") == ("hi", False)
+    assert cb._chat_wrap(None, "hi") == ("hi", False)
+
+
+def test_an_instruct_model_gets_its_template():
+    class _Tok:
+        chat_template = "x"
+
+        @staticmethod
+        def apply_chat_template(msgs, **kw):
+            return f"<|im_start|>user\n{msgs[0]['content']}<|im_end|>"
+
+    text, special = cb._chat_wrap(_Tok(), "hi")
+    assert special is True
+    assert "hi" in text
 
 
 # ── The sandbox. This is the part that runs model-written code. ─────────────
@@ -177,6 +239,44 @@ def test_size_check_rejects_an_unmeasurable_model(size_check):
     assert "could not read the size" in got["error"]
 
 
+# ── The format cap, also before any pod exists ──────────────────────────────
+
+def _fmt(job, fmt, entry=None, arch="Qwen3ForCausalLM"):
+    job["repo_format"] = lambda m, t: fmt
+    job["_resolve_arch"] = lambda m, t: (arch, entry, True)
+    return job["format_check"]("org/m", "")
+
+
+def test_plain_weights_pass_and_pick_no_image(job):
+    assert _fmt(job, "") == {"ok": True, "format": "", "image": "", "error": None}
+
+
+def test_exl3_passes_on_a_stable_arch(job):
+    got = _fmt(job, "exl3", {"tier": "stable", "image": "stable"})
+    assert got["ok"] is True
+    assert got["image"] == ""
+
+
+def test_exl3_on_a_special_arch_forces_that_image(job):
+    got = _fmt(job, "exl3", {"tier": "special", "image": "exl3_043"},
+               arch="Qwen3_5ForConditionalGeneration")
+    assert got["ok"] is True
+    assert got["image"] == "ghcr.io/x:043"
+
+
+def test_exl3_of_an_arch_exllamav3_never_heard_of_is_rejected(job):
+    got = _fmt(job, "exl3", None, arch="MadeUpForCausalLM")
+    assert got["ok"] is False
+    assert "MadeUpForCausalLM" in got["error"]
+
+
+@pytest.mark.parametrize("fmt", ["gguf", "awq", "gptq", "compressed-tensors"])
+def test_a_format_with_no_loader_is_rejected_by_name(job, fmt):
+    got = _fmt(job, fmt)
+    assert got["ok"] is False
+    assert fmt.upper() in got["error"]
+
+
 # ── What a failed run actually says ─────────────────────────────────────────
 
 class _Log:
@@ -187,20 +287,19 @@ class _Log:
         return self.text
 
 
-# The Ornith-9B run: the pod crashed loading the weights, and all the
-# controller said was "run failed".
-CRASH_TAIL = (
-    "[progress] loading weights\n"
+# The Ornith-9B run: transformers refusing an EXL3 quant, reported as "failed".
+EXL3_TAIL = (
+    "[progress] loading weights (exl3)\n"
     "Traceback (most recent call last):\n"
     '  File "/root/catbench.py", line 403, in main\n'
-    "    model, tok = load_model()\n"
+    "    runner = load_model(fmt)\n"
     "ValueError: Unknown quantization type, got exl3 - supported types are: ['awq']\n"
     "[joberror] ValueError: Unknown quantization type, got exl3\n"
 )
 
 
 def test_a_crash_reports_the_exception_not_the_word_failed(job):
-    got = job["failure_reason"](_Log(CRASH_TAIL), "pod-1", "failed")
+    got = job["failure_reason"](_Log(EXL3_TAIL), "pod-1", "failed")
     assert "Unknown quantization type" in got
     assert got != "failed"
 

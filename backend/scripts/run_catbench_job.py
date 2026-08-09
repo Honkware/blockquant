@@ -8,8 +8,9 @@ upload, and the pod dies the moment the result JSON is in hand.
     python run_catbench_job.py --model Qwen/Qwen3-8B --out /tmp/cb.json
     python run_catbench_job.py --model Qwen/Qwen3-8B --preflight
 
---preflight does the size gate alone and prints one JSON line. It creates no
-pod, so the bot can reject an oversized model instantly.
+--preflight does the format and size gates alone and prints one JSON line. It
+creates no pod, so the bot can reject an oversized model, or one in a format no
+loader here reads, instantly.
 """
 
 import argparse
@@ -31,10 +32,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from blockquant.providers.runpod_provider import RunPodProvider
 from blockquant.poll import poll_remote
 from blockquant.providers.runpod.constants import REMOTE_LOG, REMOTE_RESULT
-# Same GPU catalogue, orphan sweep and failure-line parser /quant uses.
-# Importing is the point: one implementation of "which cards exist and what do
-# they cost", and one of "what actually went wrong on the pod".
-from run_runpod_job import _auto_gpu_ids, _terminate_stray_pods, _last_exception
+# Same GPU catalogue, orphan sweep, arch registry and failure-line parser /quant
+# uses. Importing is the point: one implementation of "which cards exist and
+# what do they cost", "which image knows this architecture", and "what actually
+# went wrong on the pod".
+from run_runpod_job import (
+    _auto_gpu_ids, _terminate_stray_pods, _last_exception, _resolve_arch, _IMAGE_BY_NAME,
+)
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
@@ -67,12 +71,73 @@ class _CatBenchProvider(RunPodProvider):
         return result["stdout"].strip() == "running"
 
 
+def repo_format(model_id: str, token: str) -> str:
+    """What kind of weights the repo holds: "exl3", "gguf", another
+    quant_method, or "" for plain fp16/bf16 safetensors.
+
+    Read from config.json and the file list, never the repo name.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+    names: list[str] = []
+    try:
+        info = HfApi(token=token or None).model_info(model_id)
+        names = [s.rfilename for s in (info.siblings or [])]
+    except Exception:
+        pass
+    try:
+        cfg = json.loads(Path(hf_hub_download(
+            model_id, "config.json", token=token or None)).read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    method = str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
+    if method:
+        return method
+    # exllamav3 also drops a standalone quantization_config.json; an older quant
+    # can have that and nothing in config.json.
+    if "quantization_config.json" in names:
+        return "exl3"
+    # Only when there is nothing else to load: plenty of repos ship a GGUF
+    # convenience copy alongside the real safetensors.
+    if (any(n.lower().endswith(".gguf") for n in names)
+            and not any(n.endswith(".safetensors") for n in names)):
+        return "gguf"
+    return ""
+
+
+def format_check(model_id: str, token: str) -> dict:
+    """Gate the weight format BEFORE anything is provisioned.
+
+    The pod has two loaders, transformers and exllamav3, so a GGUF/AWQ/GPTQ repo
+    can only die at "loading weights" six minutes and one pod in. Reject it here
+    instead. For EXL3 the architecture also has to be one exllamav3 knows, and
+    the arch registry picks the image whose exllamav3 knows it.
+    """
+    fmt = repo_format(model_id, token)
+    if fmt and fmt != "exl3":
+        return {"ok": False, "format": fmt, "image": "",
+                "error": f"`{model_id}` holds {fmt.upper()} weights. CatBench loads fp16/bf16 "
+                         f"safetensors or an EXL3 quant; nothing on the pod reads {fmt.upper()}."}
+    image = ""
+    if fmt == "exl3":
+        arch, entry, ok = _resolve_arch(model_id, token)
+        if ok and entry is None:
+            return {"ok": False, "format": fmt, "image": "",
+                    "error": f"`{model_id}` is an EXL3 quant of `{arch}`, an architecture "
+                             "exllamav3 does not support. Only exllamav3 can read EXL3, so "
+                             "there is nothing here that can load it."}
+        if entry and entry["image"] != "stable":
+            image = _IMAGE_BY_NAME[entry["image"]]
+    return {"ok": True, "format": fmt, "image": image, "error": None}
+
+
 def size_check(model_id: str, token: str, max_gb: float) -> dict:
     """Gate on model size BEFORE anything is provisioned.
 
     Reuses RunPodProvider._base_download_gb, the same HF lookup that drives
-    /quant's GPU selection. An unreadable size is a rejection, not a guess:
-    a model we cannot measure is a model we cannot promise fits one H100.
+    /quant's GPU selection. It sums the actual sibling byte counts, so a
+    quantized repo measures as its own size, not a bf16 guess. An unreadable
+    size is a rejection: a model we cannot measure is a model we cannot promise
+    fits one H100.
     """
     gb = RunPodProvider._base_download_gb(model_id, token)
     if gb is None:
@@ -136,13 +201,22 @@ def main():
     p.add_argument("--keep-pod", action="store_true")
     args = p.parse_args()
 
-    gate = size_check(args.model, args.hf_token, args.max_gb)
+    # Format first: "we cannot read GGUF" is more use than "that is 300 GB".
+    fmt = format_check(args.model, args.hf_token)
+    gate = (size_check(args.model, args.hf_token, args.max_gb) if fmt["ok"]
+            else {"ok": False, "gb": None, "error": fmt["error"]})
+    gate["format"] = fmt["format"] or "bf16"
     if args.preflight:
         print(json.dumps(gate), flush=True)
         sys.exit(0 if gate["ok"] else 1)
     if not gate["ok"]:
         print(f"[joberror] {gate['error']}", flush=True)
         sys.exit(1)
+    # An EXL3 quant is only readable by an exllamav3 that knows its arch, so the
+    # registry can override the bot-pinned image. Same rule /quant follows.
+    if fmt["image"]:
+        args.image = fmt["image"]
+        print(f"[image] EXL3 quant -> {args.image}", flush=True)
 
     if not args.hf_token or not args.runpod_api_key:
         print("[joberror] HF_TOKEN and RUNPOD_API_KEY are required", flush=True)
@@ -157,7 +231,7 @@ def main():
     # written back, so this is far below /quant's 120 GB floor.
     container_gb = max(60, int(base_gb * 2 + 30))
 
-    print(f"[gpu] model ~{base_gb:.0f} GB -> need >= {min_vram} GB VRAM, "
+    print(f"[gpu] model ~{base_gb:.0f} GB ({gate['format']}) -> need >= {min_vram} GB VRAM, "
           f"disk {container_gb} GB, cap ${args.max_price:.2f}/hr", flush=True)
 
     gpu_candidates = _auto_gpu_ids(args.runpod_api_key, min_vram, None)

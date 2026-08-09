@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """CatBench entrypoint — runs inside the RunPod pod.
 
-Reads ``/root/bq-catbench-config.json``, downloads the fp16/bf16 source
-weights from HuggingFace, asks the model the two CatBench prompts, renders
-the matplotlib answer to a PNG, and writes ``/root/bq-result.json`` for the
-controller to pick up.
+Reads ``/root/bq-catbench-config.json``, downloads the weights from
+HuggingFace, asks the model the two CatBench prompts, renders the matplotlib
+answer to a PNG, and writes ``/root/bq-result.json`` for the controller to
+pick up.
+
+Two loaders: transformers for fp16/bf16 source weights, exllamav3 for an EXL3
+quant. Which one is decided by the downloaded config.json, not the repo name.
 
 The second prompt makes the model WRITE PYTHON THAT WE THEN RUN, so the
 runner below treats that code as hostile: separate network namespace, an
@@ -35,6 +38,15 @@ MODEL_DIR = Path("/quant/cb-model")
 # Exact, not paraphrased. These are the benchmark.
 PROMPT_SVG = "Create a detailed SVG image of a cute kitten."
 PROMPT_PY = "Write a Python script that draws a cute kitten using matplotlib."
+
+# SVG needs room to finish the drawing; a truncated one renders as junk.
+MAX_NEW_SVG = 4096
+MAX_NEW_PY = 2048
+# exllamav3 allocates its cache up front, so it has to cover the longest turn
+# (prompt + template + MAX_NEW_SVG) with room to spare.
+CACHE_TOKENS = 8192
+
+END_MARKERS = ("<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>", "<|endoftext|>")
 
 SVG_RE = re.compile(r"<svg[\s\S]*?</svg>", re.I)
 # Fences must start a line, or the CLOSING fence of one block reads as the
@@ -324,44 +336,140 @@ def download(model_id: str, token: str) -> None:
     print("[download] 100% complete", flush=True)
 
 
-def load_model():
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    print("[progress] loading weights", flush=True)
-    # trust_remote_code stays OFF. /catbench has no approval gate, so an
-    # arbitrary HF repo must not get to run its own python next to our HF
-    # token. Models that need custom code fail here, loudly, by design.
-    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
-    kw = dict(device_map="cuda:0", low_cpu_mem_usage=True)
+def quant_method() -> str:
+    """quant_method from the downloaded config.json, "" for plain weights.
+
+    Read from the file, never the repo name: `-exl3` in a repo id proves
+    nothing, and plenty of exl3 repos are not named for it.
+    """
     try:
-        model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), dtype=torch.bfloat16, **kw)
-    except TypeError:
-        # transformers < 4.56 spells it torch_dtype.
-        model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), torch_dtype=torch.bfloat16, **kw)
-    model.eval()
-    return model, tok
+        cfg = json.loads((MODEL_DIR / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
 
 
-def generate(model, tok, prompt: str, max_new_tokens: int) -> str:
-    import torch
-    text, special = prompt, False
-    if getattr(tok, "chat_template", None):
-        text = tok.apply_chat_template(
+def _hf_tokenizer():
+    """AutoTokenizer from the download. Both loaders want it for the chat
+    template; only the transformers one uses it to tokenize."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(str(MODEL_DIR))
+
+
+def _chat_wrap(tok, prompt: str) -> tuple[str, bool]:
+    """(text, encode_special). Instruct models get their template so they reply
+    in character; a base model gets the raw prompt."""
+    if tok is not None and getattr(tok, "chat_template", None):
+        return tok.apply_chat_template(
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True, tokenize=False,
-        )
-        special = True
-    ids = tok(text, return_tensors="pt", add_special_tokens=not special).to(model.device)
-    with torch.inference_mode():
-        out = model.generate(
-            **ids, max_new_tokens=max_new_tokens, do_sample=False,
-            pad_token_id=tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id,
-        )
-    resp = tok.decode(out[0][ids["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-    for marker in ("<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>", "<|endoftext|>"):
+        ), True
+    return prompt, False
+
+
+def _trim(resp: str) -> str:
+    for marker in END_MARKERS:
         if marker in resp:
-            resp = resp.split(marker, 1)[0].strip()
-    return resp
+            resp = resp.split(marker, 1)[0]
+    return resp.strip()
+
+
+class HFRunner:
+    """fp16/bf16 source weights through transformers."""
+
+    def __init__(self):
+        import torch
+        from transformers import AutoModelForCausalLM
+        # trust_remote_code stays OFF. /catbench has no approval gate, so an
+        # arbitrary HF repo must not get to run its own python next to our HF
+        # token. Models that need custom code fail here, loudly, by design.
+        self.tok = _hf_tokenizer()
+        kw = dict(device_map="cuda:0", low_cpu_mem_usage=True)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                str(MODEL_DIR), dtype=torch.bfloat16, **kw)
+        except TypeError:
+            # transformers < 4.56 spells it torch_dtype.
+            self.model = AutoModelForCausalLM.from_pretrained(
+                str(MODEL_DIR), torch_dtype=torch.bfloat16, **kw)
+        self.model.eval()
+
+    def generate(self, prompt: str, max_new_tokens: int) -> str:
+        import torch
+        tok = self.tok
+        text, special = _chat_wrap(tok, prompt)
+        ids = tok(text, return_tensors="pt", add_special_tokens=not special).to(self.model.device)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **ids, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id,
+            )
+        return _trim(tok.decode(out[0][ids["input_ids"].shape[-1]:], skip_special_tokens=True))
+
+    def unload(self):
+        del self.model
+
+
+class Exl3Runner:
+    """An already-quantized EXL3 repo through exllamav3.
+
+    transformers cannot open one at all: its AutoQuantizer has no exl3 entry,
+    so from_pretrained raises "Unknown quantization type, got exl3" before it
+    touches a shard. Same load/generate shape as remote/quant.py's
+    _sample_generate, which drives freshly converted quants on this image.
+    """
+
+    def __init__(self, max_tokens: int = CACHE_TOKENS):
+        from exllamav3 import Config, Model, Cache, Tokenizer, Generator
+        config = Config.from_directory(str(MODEL_DIR))
+        self.model = Model.from_config(config)
+        self.cache = Cache(self.model, max_num_tokens=max_tokens)
+        self.model.load()
+        self.gen = Generator(self.model, self.cache, Tokenizer.from_config(config))
+        # Chat template and stop ids come from the HF tokenizer; exllamav3's own
+        # has neither. Best-effort: a repo without one still runs raw, it just
+        # rambles past the turn boundary until the token budget runs out.
+        self.tok, self.stop = None, []
+        try:
+            self.tok = _hf_tokenizer()
+            if self.tok.eos_token_id is not None:
+                self.stop.append(self.tok.eos_token_id)
+            for marker in END_MARKERS:
+                tid = self.tok.convert_tokens_to_ids(marker)
+                if isinstance(tid, int) and tid >= 0 and tid != self.tok.unk_token_id:
+                    self.stop.append(tid)
+        except Exception as e:
+            print(f"[progress] WARN no HF tokenizer ({e}); raw prompt", flush=True)
+
+    def generate(self, prompt: str, max_new_tokens: int) -> str:
+        from exllamav3 import GreedySampler
+        text, special = _chat_wrap(self.tok, prompt)
+        out = self.gen.generate(
+            prompt=text, max_new_tokens=max_new_tokens, sampler=GreedySampler(),
+            completion_only=True, encode_special_tokens=special, add_bos=not special,
+            stop_conditions=(list(dict.fromkeys(self.stop)) or None),
+        )
+        return _trim(out if isinstance(out, str) else (out[0] if out else ""))
+
+    def unload(self):
+        self.model.unload()
+
+
+def load_model(fmt: str):
+    """Pick a loader for what was actually downloaded.
+
+    The controller rejects every other quant format at preflight, so anything
+    reaching this branch is a bug there, not a user's problem. Say so plainly
+    rather than letting transformers raise from three frames down.
+    """
+    print(f"[progress] loading weights ({fmt or 'bf16'})", flush=True)
+    if fmt == "exl3":
+        return Exl3Runner()
+    if fmt:
+        raise RuntimeError(
+            f"quantization '{fmt}' has no loader on this pod; CatBench reads "
+            "fp16/bf16 safetensors or an EXL3 quant")
+    return HFRunner()
 
 
 def main() -> None:
@@ -387,7 +495,7 @@ def main() -> None:
     )
 
     result: dict = {"status": "error", "model_id": model_id}
-    model = None
+    runner = None
     try:
         _ensure_matplotlib()
         download(model_id, token)
@@ -400,13 +508,14 @@ def main() -> None:
         cfg.pop("hf_token", None)
         cfg.pop("runpod_api_key", None)
 
-        model, tok = load_model()
+        fmt = quant_method()
+        result["format"] = fmt or "bf16"
+        runner = load_model(fmt)
 
-        # SVG needs room to finish the drawing; a truncated one renders as junk.
         print("[progress] prompt 1/2 (svg)", flush=True)
-        svg_reply = generate(model, tok, PROMPT_SVG, 4096)
+        svg_reply = runner.generate(PROMPT_SVG, MAX_NEW_SVG)
         print("[progress] prompt 2/2 (python)", flush=True)
-        py_reply = generate(model, tok, PROMPT_PY, 2048)
+        py_reply = runner.generate(PROMPT_PY, MAX_NEW_PY)
 
         svg = extract_svg(svg_reply)
         result["svg"] = svg
@@ -432,8 +541,8 @@ def main() -> None:
         traceback.print_exc()
     finally:
         try:
-            if model is not None:
-                del model
+            if runner is not None:
+                runner.unload()
             import torch
             torch.cuda.empty_cache()
         except Exception:
