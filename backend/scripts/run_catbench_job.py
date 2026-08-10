@@ -34,10 +34,10 @@ from blockquant.poll import poll_remote
 from blockquant.providers.runpod.constants import REMOTE_LOG, REMOTE_RESULT
 # Same GPU catalogue, orphan sweep, arch registry and failure-line parser /quant
 # uses. Importing is the point: one implementation of "which cards exist and
-# what do they cost", "which image knows this architecture", and "what actually
+# what do they cost", "which architectures exllamav3 reads", and "what actually
 # went wrong on the pod".
 from run_runpod_job import (
-    _auto_gpu_ids, _terminate_stray_pods, _last_exception, _resolve_arch, _IMAGE_BY_NAME,
+    _auto_gpu_ids, _terminate_stray_pods, _last_exception, _resolve_arch,
 )
 from dotenv import load_dotenv
 
@@ -109,25 +109,21 @@ def format_check(model_id: str, token: str) -> dict:
 
     The pod has two loaders, transformers and exllamav3, so a GGUF/AWQ/GPTQ repo
     can only die at "loading weights" six minutes and one pod in. Reject it here
-    instead. For EXL3 the architecture also has to be one exllamav3 knows, and
-    the arch registry picks the image whose exllamav3 knows it.
+    instead. For EXL3 the architecture also has to be one exllamav3 knows.
     """
     fmt = repo_format(model_id, token)
     if fmt and fmt != "exl3":
-        return {"ok": False, "format": fmt, "image": "",
+        return {"ok": False, "format": fmt,
                 "error": f"`{model_id}` holds {fmt.upper()} weights. CatBench loads fp16/bf16 "
                          f"safetensors or an EXL3 quant; nothing on the pod reads {fmt.upper()}."}
-    image = ""
     if fmt == "exl3":
-        arch, entry, ok = _resolve_arch(model_id, token)
-        if ok and entry is None:
-            return {"ok": False, "format": fmt, "image": "",
+        arch, supported, ok = _resolve_arch(model_id, token)
+        if ok and not supported:
+            return {"ok": False, "format": fmt,
                     "error": f"`{model_id}` is an EXL3 quant of `{arch}`, an architecture "
                              "exllamav3 does not support. Only exllamav3 can read EXL3, so "
                              "there is nothing here that can load it."}
-        if entry and entry["image"] != "stable":
-            image = _IMAGE_BY_NAME[entry["image"]]
-    return {"ok": True, "format": fmt, "image": image, "error": None}
+    return {"ok": True, "format": fmt, "error": None}
 
 
 def size_check(model_id: str, token: str, max_gb: float) -> dict:
@@ -212,12 +208,6 @@ def main():
     if not gate["ok"]:
         print(f"[joberror] {gate['error']}", flush=True)
         sys.exit(1)
-    # An EXL3 quant is only readable by an exllamav3 that knows its arch, so the
-    # registry can override the bot-pinned image. Same rule /quant follows.
-    if fmt["image"]:
-        args.image = fmt["image"]
-        print(f"[image] EXL3 quant -> {args.image}", flush=True)
-
     if not args.hf_token or not args.runpod_api_key:
         print("[joberror] HF_TOKEN and RUNPOD_API_KEY are required", flush=True)
         sys.exit(1)

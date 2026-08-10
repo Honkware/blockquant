@@ -1,124 +1,125 @@
 # BlockQuant pre-baked RunPod image.
 #
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
-# "quant-ready" the instant it boots — no apt-get, no pip, no JIT compile
-# during the run.
+# "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# Built and pushed by .github/workflows/build-runpod-image.yml on tags.
+# One image for every architecture. exllamav3 1.4.1 covers all 58 registered
+# archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
+# nemotronh) needs flash-linear-attention, which is installed here, and nothing
+# else needs a separate bake. The old three-image split (stable 0.0.38 +
+# qwen35 0.0.43 + a master image for LFM2) is gone.
+#
+# **Python 3.12** is load-bearing. fla's triton kernels trip triton bug #5224
+# (multi-decorator @triton.jit -> inspect.getsource returns only the decorators
+# -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
+# ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
+#
+# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.1 ships
+# Triton attention kernels that lead the dispatch order and handle sliding
+# window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
+#
+# Built and pushed by .github/workflows/build-runpod-image.yml.
 
-# ---- Base ----------------------------------------------------------------
-# nvidia/cuda:devel because we need nvcc on the pod for ExLlamaV3's JIT
-# C++ extension (compiled the first time exllamav3 is imported, then cached
-# at /root/.cache/torch_extensions).
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# ---- Base (ubuntu24.04 -> Python 3.12) ------------------------------------
+# devel because exllamav3's C++/CUDA extension JIT-compiles on the pod (nvcc +
+# ninja), cached at /root/.cache/torch_extensions.
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 
-# ---- System ---------------------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3-pip \
+        python3.12 python3.12-dev python3-pip \
         git wget ca-certificates \
         ninja-build build-essential \
         openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && python -m pip install --upgrade pip
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+# ---- torch 2.8 / cu129 (pip auto-selects the cp312 wheel) ------------------
+RUN python -m pip install \
+        "torch==2.8.0" \
+        --index-url https://download.pytorch.org/whl/cu129
 
 # ---- Python deps ----------------------------------------------------------
-# Pinned to combinations we have seen work cleanly with ExLlamaV3 0.0.37
-# on this base. Bumping any of these requires re-validating end-to-end on
-# at least one MoE model.
-RUN python -m pip install \
-        "torch==2.6.0" \
-        --index-url https://download.pytorch.org/whl/cu124
-
 # hf_transfer gives parallel, Rust-backed weight downloads (the 70GB+ pull is
 # the longest part of a run); remote/quant.py turns it on when it is present.
 RUN python -m pip install \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
-        "transformers>=4.40" \
-        "tokenizers>=0.20" \
+        "transformers>=4.45.0,<5" \
+        "tokenizers>=0.21.1" \
         "safetensors>=0.4" \
         "datasets>=2.0" \
-        "numpy>=1.24" \
+        "numpy>=2.1.0" \
         "Pillow>=10.0" \
         "marisa-trie>=1.2" \
         "pydantic==2.11.0" \
-        "kbnf>=0.4.2" \
-        "formatron>=0.5.0" \
         "rich>=13.0" \
         "tqdm" \
         "psutil" \
         "sentencepiece" \
         "pyyaml" \
-        "typing_extensions"
+        "typing_extensions" \
+        "einops"
 
 # ---- ExLlamaV3 ------------------------------------------------------------
-# Installed from a pinned git commit on master (not a PyPI release) so the
-# image carries architectures that are merged upstream but not yet released,
-# e.g. Lfm2MoeForCausalLM (LiquidAI LFM2 MoE). --no-deps stops pip pulling
-# flash-attn (no prebuilt wheel for this torch/CUDA; source build fails in CI);
-# the patch step below makes exllamav3 import + run without it.
+# Pinned to a git ref, not a PyPI release, so the image carries architectures
+# merged upstream but not yet released. --no-deps stops pip resolving torch and
+# fla again; both are installed explicitly here.
+# EXLLAMA_NOCOMPILE: install without building the CUDA ext (the GPU-less CI
+# builder can't auto-detect an arch -> _get_cuda_arch_flags IndexError). The
+# ext JIT-builds on the pod's first boot (GPU + ninja present).
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
-# pre-baked health check still enforces a minimum reported version
-# (_MIN_EXLLAMAV3 in providers/runpod/provider.py); this commit reports 0.0.38.
-ARG EXLLAMAV3_REF=c18e9b40bed1d2bd9c30fbbc0ba0eeb19b4fbda1
-RUN python -m pip install --no-cache-dir --no-deps \
+# health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
+# providers/runpod/provider.py); this ref reports 1.4.1.
+ARG EXLLAMAV3_REF=4f8ad0121f483ba66a5336244a4c3b6d7210385e
+RUN EXLLAMA_NOCOMPILE=1 python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
-# ---- flash-attn (required for sliding-window-attention models) ------------
-# exllamav3's non-flash backends all refuse SWA (torch SDPA, xformers and
-# bighead_scalar return None on is_swa), so flash-attn is mandatory for
-# models like Gemma4, Mellum and Gemma3 that use sliding-window attention.
-# Prebuilt wheel matching torch's C++ ABI — no source build needed.
-# patch_flash_attn.py below stays a no-op when flash_attn imports cleanly.
-RUN python -m pip install --no-cache-dir einops
-ARG FLASH_ATTN_VER=2.7.4.post1
-RUN ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')") \
-    && python -m pip install --no-cache-dir --no-deps \
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VER}/flash_attn-${FLASH_ATTN_VER}+cu12torch2.6cxx11abi${ABI}-cp311-cp311-linux_x86_64.whl"
-
-# ---- Make exllamav3 import + run without flash-attn -----------------------
-# Patches any remaining unguarded flash_attn imports (no-op if flash-attn is
-# installed above). Kept so the image degrades gracefully if the wheel URL
-# ever stops resolving.
-COPY docker/patch_flash_attn.py /tmp/patch_flash_attn.py
-RUN python /tmp/patch_flash_attn.py && rm /tmp/patch_flash_attn.py
-COPY docker/patch_attn_reshape.py /tmp/patch_attn_reshape.py
-# exllamav3 uses .view() after flash-attn in decode_flash_attn_nc, which
-# fails for Gemma4's global-attention layers because flash-attn returns a
-# non-contiguous tensor when global_head_dim != head_dim. .reshape() handles
-# both contiguous and non-contiguous tensors.
-RUN python /tmp/patch_attn_reshape.py && rm /tmp/patch_attn_reshape.py
+# ---- flash-linear-attention (linear-attention archs) ----------------------
+# exllamav3 lists it in install_requires; the gated-delta-net path uses its
+# chunked kernel for prefill and falls back to a much slower built-in recurrent
+# kernel without it, and nemotronh/mamba2 import it outright.
+RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
 
 # ---- Bundled calibration corpus ------------------------------------------
-# exllamav3 wheels omit conversion/standard_cal_data/*.utf8, which convert.py
-# needs. Fetch it into the installed package (same script the bootstrap runs).
+# exllamav3's packaging still omits conversion/standard_cal_data/*.utf8 (not in
+# package_data, not in MANIFEST.in), which convert_model needs. Fetch it into
+# the installed package.
 COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
 RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 
-# ---- Stub formatron (quant-only image) ------------------------------------
-# exllamav3's __init__ hard-imports FormatronFilter, and formatron is fragile
-# against pinned pydantic. The quant path never builds a filter, so replace
-# exllamav3's filter/formatron.py with a stub that imports cleanly and only
-# raises if actually instantiated. Mirrors the bootstrap's formatron handling.
-COPY docker/stub_formatron.py /tmp/stub_formatron.py
-RUN python /tmp/stub_formatron.py && rm /tmp/stub_formatron.py
-
-# ---- Pre-trigger the JIT C++ extension compile ---------------------------
-# ExLlamaV3 compiles its CUDA kernels on first import. Doing it here at
-# build time bakes the compiled .so into the image so the pod doesn't pay
-# the ~30s tax on every cold boot. Wrapped in a try so the build still
-# succeeds on a host without GPU access (the actual JIT compile may
-# fail at this stage and re-run on the pod — that's fine, deps are cached).
+# ---- Verify the stack at build time ---------------------------------------
+RUN python - <<'PY'
+import sys, torch, importlib.metadata as m
+assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
+assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
+assert m.version("exllamav3").startswith("1.4"), f"exllamav3 not 1.4.x: {m.version('exllamav3')}"
+print("python", sys.version.split()[0], "| torch", torch.__version__,
+      "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
+      "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))
+PY
+# `import fla` parses triton kernels (CPU) then inits the CUDA driver. On the
+# GPU-less builder it must REACH the driver init -- proving the #5224 parse bug
+# is gone under py3.12. The driver error is expected here (satisfied on the pod);
+# the parse AttributeError (the py3.11 failure) would fail the build instead.
+RUN python - <<'PY'
+try:
+    import fla
+    print("FLA IMPORT OK (gpu driver present)")
+except RuntimeError as e:
+    assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
+    print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
+PY
+# exllamav3's CUDA ext JITs on import (ninja present) -> best-effort GPU-less.
 RUN python -c "import exllamav3; print('exllamav3 import ok')" \
-    || echo "(JIT skipped at build — will compile on first pod boot)"
+    || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
@@ -134,8 +135,9 @@ LABEL org.opencontainers.image.title="BlockQuant RunPod" \
       org.opencontainers.image.source="https://github.com/Honkware/blockquant" \
       org.opencontainers.image.licenses="MIT" \
       blockquant.exllamav3_ref="${EXLLAMAV3_REF}" \
-      blockquant.torch_version="2.6.0+cu124" \
-      blockquant.cuda_runtime="12.4.1"
+      blockquant.python_version="3.12" \
+      blockquant.torch_version="2.8.0+cu129" \
+      blockquant.cuda_runtime="12.9.1"
 
 # ---- Default workdir + ports ---------------------------------------------
 WORKDIR /workspace

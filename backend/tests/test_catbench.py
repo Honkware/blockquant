@@ -43,9 +43,7 @@ def job():
     import re
     from pathlib import Path
     ns = {"RunPodProvider": _P, "json": json, "Path": Path, "re": re,
-          "_IMAGE_BY_NAME": {"exl3_043": "ghcr.io/x:043", "master": "ghcr.io/x:master",
-                             "stable": ""},
-          "_resolve_arch": lambda m, t: ("ArchForCausalLM", None, True)}
+          "_resolve_arch": lambda m, t: ("ArchForCausalLM", True, True)}
     _load(QUANT_JOB, ("_FRAME", "_last_exception"), ns)
     _load(JOB, ("size_check", "DEFAULT_MAX_GB", "format_check", "failure_reason"), ns)
     return ns
@@ -241,31 +239,27 @@ def test_size_check_rejects_an_unmeasurable_model(size_check):
 
 # ── The format cap, also before any pod exists ──────────────────────────────
 
-def _fmt(job, fmt, entry=None, arch="Qwen3ForCausalLM"):
+def _fmt(job, fmt, supported=True, arch="Qwen3ForCausalLM"):
     job["repo_format"] = lambda m, t: fmt
-    job["_resolve_arch"] = lambda m, t: (arch, entry, True)
+    job["_resolve_arch"] = lambda m, t: (arch, supported, True)
     return job["format_check"]("org/m", "")
 
 
-def test_plain_weights_pass_and_pick_no_image(job):
-    assert _fmt(job, "") == {"ok": True, "format": "", "image": "", "error": None}
+def test_plain_weights_pass(job):
+    assert _fmt(job, "") == {"ok": True, "format": "", "error": None}
 
 
-def test_exl3_passes_on_a_stable_arch(job):
-    got = _fmt(job, "exl3", {"tier": "stable", "image": "stable"})
-    assert got["ok"] is True
-    assert got["image"] == ""
+def test_exl3_passes_on_a_supported_arch(job):
+    assert _fmt(job, "exl3")["ok"] is True
 
 
-def test_exl3_on_a_special_arch_forces_that_image(job):
-    got = _fmt(job, "exl3", {"tier": "special", "image": "exl3_043"},
-               arch="Qwen3_5ForConditionalGeneration")
-    assert got["ok"] is True
-    assert got["image"] == "ghcr.io/x:043"
+def test_exl3_passes_on_a_linear_attn_arch(job):
+    # One image carries every arch now, so qwen3_5 is not special any more.
+    assert _fmt(job, "exl3", arch="Qwen3_5ForConditionalGeneration")["ok"] is True
 
 
 def test_exl3_of_an_arch_exllamav3_never_heard_of_is_rejected(job):
-    got = _fmt(job, "exl3", None, arch="MadeUpForCausalLM")
+    got = _fmt(job, "exl3", supported=False, arch="MadeUpForCausalLM")
     assert got["ok"] is False
     assert "MadeUpForCausalLM" in got["error"]
 

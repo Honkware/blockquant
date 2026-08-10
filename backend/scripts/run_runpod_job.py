@@ -51,79 +51,39 @@ _WEAK_FOR_QUANT = {"NVIDIA L4"}
 # as substrings of the RunPod GPU id.
 _NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
 
-# exllamav3 version is chosen by architecture. The stable release (0.0.37, what
-# the bootstrap path installs) handles the proven models incl. Qwen3.6. The
-# master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
-# (Qwen3.6 segfaults loading the first layer), so we only reach for the master
-# image when the model's architecture actually needs it.
-_MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
-_MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
-
-# Qwen3.5 (qwen3_5 / qwen3_5_moe) and Qwen3-Next use gated-delta linear attention,
-# which exllamav3 only handles in 0.0.43 via flash-linear-attention -- and fla's
-# triton kernels only import on python 3.12 (triton #5224). So route ONLY those
-# archs to the 0.0.43 / py3.12 image. 0.0.43 regresses proven models (Qwen3.6),
-# so everyone else stays on 0.0.38. (ministral3's layer-0 crash was NOT this -- it
-# was a float config field; remote/quant.py _sanitize_config fixes it on any image.)
-# Markers are substrings of the lowercased arch+model_type; "qwen3_5" matches the
-# dense AND MoE variant but NOT Qwen3.6 (qwen3 / qwen3_moe).
-_EXL3_043_IMAGE = os.environ.get("RUNPOD_EXL3_043_IMAGE", "ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312")
-_EXL3_043_ARCH_MARKERS = ("qwen3_5", "qwen3_next")
-
-
-def _arch_markers(model_id: str, token: str) -> str:
-    """Lowercased 'architectures + model_type' from config.json, '' on failure."""
-    try:
-        import json as _json
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(model_id, "config.json", token=token or None)
-        with open(p) as f:
-            cfg = _json.load(f)
-        archs = " ".join(cfg.get("architectures") or [])
-        return f"{archs} {cfg.get('model_type', '')}".lower()
-    except Exception:
-        return ""
-
-
-def _arch_needs_master(model_id: str, token: str) -> bool:
-    """True if the model's architecture is only supported on exllamav3 master."""
-    hay = _arch_markers(model_id, token)
-    return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
-
-
-def _arch_needs_exl3_043(model_id: str, token: str) -> bool:
-    """True for archs needing the 0.0.43/py3.12 image (qwen3_5*, qwen3_next -- linear attn + fla)."""
-    hay = _arch_markers(model_id, token)
-    return any(m in hay for m in _EXL3_043_ARCH_MARKERS)
-
-
 # --- arch-support registry (the committed single source of truth) -------------
-# Routing + the pre-flight gate read backend/arch_support.json (generated from
-# exllamav3 by gen_arch_support.py). The marker funcs above stay only as a
-# fallback for when the registry file is somehow missing.
-_IMAGE_BY_NAME = {"exl3_043": _EXL3_043_IMAGE, "master": _MASTER_IMAGE, "stable": ""}
+# The pre-flight gate reads backend/arch_support.json (generated from exllamav3
+# by gen_arch_support.py). One image carries every architecture exllamav3
+# supports, so nothing here picks an image any more -- the registry only answers
+# "can exllamav3 read this arch at all", which is worth knowing before a pod is
+# rented and 70GB is pulled.
 
 
-def _load_arch_support() -> dict:
-    """{arch_string_lower: entry} from arch_support.json, or {} if absent."""
+def _load_arch_support() -> set:
+    """Lowercased arch strings from arch_support.json, or an empty set if absent."""
     import json as _json
     p = Path(__file__).parent.parent / "arch_support.json"
     try:
         d = _json.loads(p.read_text())
-        return {a["arch"].lower(): a for a in d.get("architectures", [])}
+        return {a.lower() for a in d.get("architectures", [])}
     except Exception:
-        return {}
+        return set()
 
 
 def _default_codebook(model_id: str, token: str) -> str:
     """mul1 for dense, mcg for MoE.
 
     mul1 sums 4 bytes per weight where mcg sums 2, which is a closer fit to the
-    Gaussian the trellis assumes. But exl3_moe.cu only has a fused kernel for
-    mcg (`block_sparse_mlp.py` gates support_fused on it), so a mul1 MoE model
-    silently drops to the general expert path: right answer, slower inference,
-    paid by everyone who downloads it. Dense models have no such kernel and
-    take mul1 free. Unreadable config gets mcg, the one nothing penalises.
+    Gaussian the trellis assumes. But exl3_moe.cu only had a fused kernel for
+    mcg, so a mul1 MoE silently dropped to the general expert path: right
+    answer, slower inference, paid by everyone who downloads it. Dense models
+    have no such kernel and take mul1 free.
+
+    exllamav3 1.4 widened the MoE fused path to mul1 as well (block_sparse_mlp
+    accepts either codebook, as long as gate/up/down agree), so this rule is no
+    longer forced -- but mcg is fused on every version we might run, including
+    an image rolled back to 0.0.38, so it stays the MoE default until a mul1 MoE
+    has been measured. Unreadable config gets mcg, the one nothing penalises.
     """
     try:
         import json as _json
@@ -139,21 +99,21 @@ def _default_codebook(model_id: str, token: str) -> str:
 
 
 def _resolve_arch(model_id: str, token: str):
-    """(arch, registry_entry|None, config_read_ok). entry is the arch_support
-    record (tier/image/note) when the arch is supported by exllamav3."""
+    """(arch, supported, config_read_ok). arch is the first declared architecture
+    exllamav3 knows, else whatever the config declares first."""
     import json as _json
     from huggingface_hub import hf_hub_download
     try:
         p = hf_hub_download(model_id, "config.json", token=token or None)
         cfg = _json.loads(Path(p).read_text())
     except Exception:
-        return "", None, False
+        return "", False, False
     reg = _load_arch_support()
     for a in (cfg.get("architectures") or []):
         if a.lower() in reg:
-            return a, reg[a.lower()], True
+            return a, True, True
     archs = cfg.get("architectures") or []
-    return (archs[0] if archs else cfg.get("model_type", "?")), None, True
+    return (archs[0] if archs else cfg.get("model_type", "?")), False, True
 
 
 def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
@@ -506,35 +466,20 @@ def main():
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
 
-    # Architecture routing + pre-flight gate, both driven by the arch-support
-    # registry (the single source of truth). Gate an unknown arch BEFORE spending
-    # a pod, and force the right image for archs that need a non-default one --
-    # overriding the bot-pinned RUNPOD_IMAGE. A `stable` arch keeps its pinned
-    # image; proven models (incl. Qwen3.6) never move. Falls back to the marker
-    # funcs only if arch_support.json is missing.
+    # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
+    # is rented and the weights are pulled. The image is whatever the bot pinned
+    # (RUNPOD_IMAGE); it carries every supported arch, so there is nothing to
+    # route. An unreadable config falls through -- the pod reports the real error.
     _reg = _load_arch_support()
     if _reg:
-        _arch, _entry, _ok = _resolve_arch(args.model, args.hf_token)
-        if _ok and _entry is None:
+        _arch, _supported, _ok = _resolve_arch(args.model, args.hf_token)
+        if _ok and not _supported:
             print(f"[joberror] unsupported architecture '{_arch}' -- not in the exllamav3 "
                   f"{len(_reg)}-arch support set. Refusing before launch (no pod, no download).",
                   flush=True)
             sys.exit(2)
-        if _entry and _entry["image"] != "stable":
-            args.image = _IMAGE_BY_NAME[_entry["image"]]
-            _note = f" -- {_entry['note']}" if _entry.get("note") else ""
-            print(f"[image] {args.model} ({_arch}, {_entry['tier']}) -> {args.image}{_note}", flush=True)
-        elif not args.image:
-            print("[image] bootstrap path (exllamav3 0.0.38, stable)", flush=True)
-    elif _arch_needs_exl3_043(args.model, args.hf_token):
-        args.image = _EXL3_043_IMAGE
-        print(f"[image] {args.model} needs exllamav3 0.0.43; forcing {args.image} (py3.12 fresh-ext)", flush=True)
-    elif not args.image:
-        if _arch_needs_master(args.model, args.hf_token):
-            args.image = _MASTER_IMAGE
-            print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
-        else:
-            print("[image] bootstrap path (exllamav3 0.0.38, stable)", flush=True)
+    if not args.image:
+        print("[image] bootstrap path (exllamav3 from PyPI, installed in-pod)", flush=True)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:

@@ -841,6 +841,10 @@ def main() -> int:
                 "-b", str(bpw),
                 "--head_bits", str(head_bits),
                 "--codebook", codebook,
+                # No-op on exllamav3 >= 1.4 (parallel mode became the default and
+                # the flag was kept as an accepted no-op), still meaningful on
+                # 0.0.38. Passing it keeps this script correct on either, which
+                # matters because the image can be rolled back under it.
                 "--parallel_mode",
             ]
             if cal_rows is not None:
