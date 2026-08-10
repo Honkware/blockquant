@@ -247,6 +247,49 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
     return [gid for _, gid in cards]
 
 
+_GHCR_ACCEPT = ",".join((
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+))
+
+
+def _image_missing(image: str) -> bool:
+    """True only when GHCR is certain the tag was never pushed.
+
+    A tag that is not there costs one pod per card in the sweep: RunPod takes
+    the create, fails the pull, and EXITs the pod inside five seconds, which
+    reads up here as "pod never came up" on every card in turn. The build
+    workflow tags sha-<HEAD of the dispatched ref>, not the commit that touched
+    the Dockerfile, so pinning a tag that does not exist is easy to do and
+    expensive to diagnose. One HEAD against the registry rules it out.
+
+    Anything unverifiable -- another registry, a private repo, a network blip --
+    answers False, so this can only ever stop a launch that was already doomed.
+    """
+    import json
+    import urllib.error
+    import urllib.request as u
+    if not image.startswith("ghcr.io/"):
+        return False
+    repo, _, tag = image[len("ghcr.io/"):].partition(":")
+    if not tag or "@" in image:
+        return False
+    try:
+        tok = json.load(u.urlopen(
+            f"https://ghcr.io/token?scope=repository:{repo}:pull&service=ghcr.io",
+            timeout=15))["token"]
+        u.urlopen(u.Request(
+            f"https://ghcr.io/v2/{repo}/manifests/{tag}", method="HEAD",
+            headers={"Authorization": f"Bearer {tok}", "Accept": _GHCR_ACCEPT}), timeout=15)
+    except urllib.error.HTTPError as e:
+        return e.code == 404
+    except Exception:
+        return False
+    return False
+
+
 def _terminate_stray_pods(api_key: str, prefix: str, keep_id: str = "") -> list[str]:
     """Kill pods named ``{prefix}-*`` except keep_id.
 
@@ -480,6 +523,10 @@ def main():
             sys.exit(2)
     if not args.image:
         print("[image] bootstrap path (exllamav3 from PyPI, installed in-pod)", flush=True)
+    elif _image_missing(args.image):
+        print(f"[joberror] image tag is not in the registry: {args.image}. "
+              f"Nothing can boot from it; fix the pin before renting a card.", flush=True)
+        sys.exit(2)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
@@ -633,8 +680,8 @@ def main():
                 active = {"status": "error", "error": str(e)}
             if active.get("status") != "active":
                 print(f"      pod {instance_id} did not become active "
-                      f"({active.get('status')}); terminating and trying the next card",
-                      flush=True)
+                      f"({active.get('error') or active.get('status')}); "
+                      f"terminating and trying the next card", flush=True)
                 try:
                     attempt.terminate(instance_id)
                 except Exception:  # noqa: BLE001

@@ -44,7 +44,7 @@ def job():
     from pathlib import Path
     ns = {"RunPodProvider": _P, "json": json, "Path": Path, "re": re,
           "_resolve_arch": lambda m, t: ("ArchForCausalLM", True, True)}
-    _load(QUANT_JOB, ("_FRAME", "_last_exception"), ns)
+    _load(QUANT_JOB, ("_FRAME", "_last_exception", "_GHCR_ACCEPT", "_image_missing"), ns)
     _load(JOB, ("size_check", "DEFAULT_MAX_GB", "format_check", "failure_reason"), ns)
     return ns
 
@@ -316,3 +316,47 @@ def test_an_unreadable_log_still_says_something(job):
             raise OSError("ssh gone")
 
     assert job["failure_reason"](_Dead(), "pod-1", "failed")
+
+
+# ── A pin that was never pushed, caught before the first card ───────────────
+
+def _ghcr(monkeypatch, manifest):
+    """Fake GHCR: the token call always works, the manifest call is `manifest`."""
+    import io
+    import urllib.request
+    seen = []
+
+    def fake(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        seen.append(url)
+        if "/token?" in url:
+            return io.BytesIO(b'{"token": "t"}')
+        if isinstance(manifest, Exception):
+            raise manifest
+        return io.BytesIO(b"")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    return seen
+
+
+def test_a_tag_that_was_never_pushed_is_missing(job, monkeypatch):
+    import urllib.error
+    _ghcr(monkeypatch, urllib.error.HTTPError("u", 404, "Not Found", {}, None))
+    assert job["_image_missing"]("ghcr.io/honkware/blockquant:sha-deadbeef") is True
+
+
+def test_a_tag_that_resolves_is_not_missing(job, monkeypatch):
+    _ghcr(monkeypatch, None)
+    assert job["_image_missing"]("ghcr.io/honkware/blockquant:latest") is False
+
+
+def test_an_unreachable_registry_never_blocks_a_launch(job, monkeypatch):
+    _ghcr(monkeypatch, OSError("dns"))
+    assert job["_image_missing"]("ghcr.io/honkware/blockquant:latest") is False
+
+
+def test_a_registry_we_cannot_check_is_left_alone(job, monkeypatch):
+    seen = _ghcr(monkeypatch, None)
+    assert job["_image_missing"]("runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204") is False
+    assert job["_image_missing"]("ghcr.io/honkware/blockquant") is False
+    assert seen == []

@@ -38,6 +38,7 @@ from blockquant.providers.runpod.constants import REMOTE_LOG, REMOTE_RESULT
 # went wrong on the pod".
 from run_runpod_job import (
     _auto_gpu_ids, _terminate_stray_pods, _last_exception, _resolve_arch,
+    _image_missing,
 )
 from dotenv import load_dotenv
 
@@ -224,6 +225,11 @@ def main():
     print(f"[gpu] model ~{base_gb:.0f} GB ({gate['format']}) -> need >= {min_vram} GB VRAM, "
           f"disk {container_gb} GB, cap ${args.max_price:.2f}/hr", flush=True)
 
+    if args.image and _image_missing(args.image):
+        print(f"[joberror] image tag is not in the registry: {args.image}. "
+              f"Nothing can boot from it; fix the pin before renting a card.", flush=True)
+        sys.exit(1)
+
     gpu_candidates = _auto_gpu_ids(args.runpod_api_key, min_vram, None)
     if not gpu_candidates:
         print(f"[joberror] no GPUs with >= {min_vram} GB VRAM available", flush=True)
@@ -267,7 +273,8 @@ def main():
             except Exception as e:
                 active = {"status": "error", "error": str(e)}
             if active.get("status") != "active":
-                print(f"      pod never came up ({active.get('status')}); next card", flush=True)
+                print(f"      pod never came up "
+                      f"({active.get('error') or active.get('status')}); next card", flush=True)
                 try:
                     attempt.terminate(instance_id)
                 except Exception:
