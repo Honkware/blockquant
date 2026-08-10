@@ -360,3 +360,31 @@ def test_a_registry_we_cannot_check_is_left_alone(job, monkeypatch):
     assert job["_image_missing"]("runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204") is False
     assert job["_image_missing"]("ghcr.io/honkware/blockquant") is False
     assert seen == []
+
+
+def test_prose_that_mentions_matplotlib_is_not_code():
+    """The failure this replaced: a chatty model's commentary reached exec().
+
+    Real reply from Qwopus3.6 ended with a markdown bullet about
+    solid_capstyle, and the keyword check ("matplotlib" in s) said yes to the
+    whole thing. exec() reported an unterminated string literal from the prose.
+    """
+    prose = ("I'd use matplotlib here. The tail might look a bit weird with "
+             "just plt.plot, so let's use a FancyBboxPatch instead.")
+    assert cb.extract_python(prose) is None
+
+
+def test_code_is_taken_out_of_a_reply_that_surrounds_it_with_prose():
+    reply = (
+        "Here is a kitten!\n\n"
+        "```python\nimport matplotlib.pyplot as plt\nplt.plot([0, 1])\n```\n\n"
+        "- The tail might look weird with a thick line, let's make it organic."
+    )
+    assert cb.extract_python(reply) == "import matplotlib.pyplot as plt\nplt.plot([0, 1])"
+
+
+def test_a_fence_the_model_never_closed_is_still_recovered():
+    """A verbose model runs out of budget mid-block, so there is no closer."""
+    truncated = "Sure!\n\n```python\nimport matplotlib.pyplot as plt\nfig, ax = plt.subplots()\n"
+    got = cb.extract_python(truncated)
+    assert got and got.startswith("import matplotlib.pyplot as plt")

@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ast
 import re
 import shutil
 import subprocess
@@ -52,6 +53,8 @@ SVG_RE = re.compile(r"<svg[\s\S]*?</svg>", re.I)
 # Fences must start a line, or the CLOSING fence of one block reads as the
 # OPENING of the next and we hand back the prose in between.
 FENCE_RE = re.compile(r"^```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n([\s\S]*?)^```", re.M)
+# A reply cut off mid-block never closes its fence, so FENCE_RE sees nothing.
+OPEN_FENCE_RE = re.compile(r"^```[ \t]*(?:python|py|python3)[ \t]*\r?\n", re.M | re.I)
 
 # Sandbox bounds for the model-written script.
 SBX_TIMEOUT_S = 90       # hard wall clock, process group killed
@@ -196,8 +199,21 @@ sys.exit(0)
 '''
 
 
-def _looks_like_python(s: str) -> bool:
-    return "import " in s or "matplotlib" in s or "plt." in s
+def _parses(s: str) -> bool:
+    """Real python, not prose that happens to say matplotlib.
+
+    This is the gate the old keyword check should have been: a chatty model
+    writes "let's use a FancyBboxPatch" right next to its code, and any
+    substring test says yes to the lot. exec() then reports an unterminated
+    string literal from a markdown bullet.
+    """
+    if not s.strip():
+        return False
+    try:
+        ast.parse(s)
+        return True
+    except SyntaxError:
+        return False
 
 
 def extract_python(text: str) -> str | None:
@@ -212,12 +228,20 @@ def extract_python(text: str) -> str | None:
     blocks = [(lang.lower(), body.strip()) for lang, body in FENCE_RE.findall(text)]
     tagged = [b for lang, b in blocks if lang in ("python", "py", "python3")]
     if tagged:
-        return max(tagged, key=len) or None
-    untagged = [b for lang, b in blocks if not lang and _looks_like_python(b)]
+        best = max(tagged, key=len)
+        if best:
+            return best
+    # Truncated mid-block: take what follows the opener, up to a stray close.
+    m = OPEN_FENCE_RE.search(text)
+    if m:
+        tail = text[m.end():].split("\n```", 1)[0].strip()
+        if _parses(tail):
+            return tail
+    untagged = [b for lang, b in blocks if not lang and _parses(b)]
     if untagged:
-        return max(untagged, key=len) or None
+        return max(untagged, key=len)
     stripped = text.strip()
-    return stripped if _looks_like_python(stripped) else None
+    return stripped if _parses(stripped) else None
 
 
 def extract_svg(text: str) -> str | None:
