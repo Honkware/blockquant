@@ -28,9 +28,12 @@ export function parseRunTag(name) {
   const m = RUN_TAG.exec(name || '');
   if (!m) return null;
   const pid = Number(m[1]);
-  const short = Number(m[2]);
   const ts = Number(m[3]);
-  if (ts % 100000 !== short) return null; // not one of ours despite the shape
+  // The third field is NOT a checksum of the fourth. `run_tag` is built as
+  // bq-<pid>-<time()%100000> when the controller starts, and the provider
+  // appends the pod's own creation time when it rents one, seconds to minutes
+  // later. Requiring them to agree rejected every real pod.
+  if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(ts) || ts < 1e9) return null;
   return { pid, ts };
 }
 

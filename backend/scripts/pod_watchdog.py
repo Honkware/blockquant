@@ -49,7 +49,10 @@ EXEMPT_PREFIXES = ("btc-node",)
 # A live one of these driving a pod means the pod is working, whatever its age.
 CONTROLLER_SCRIPTS = ("run_runpod_job.py", "run_catbench_job.py", "run_parallel_quants.py")
 
-# bq-<controller pid>-<ts % 100000>-<ts>, assembled by run_*_job.py's run_tag
+# bq-<controller pid>-<controller-start ts % 100000>-<pod-create ts>. The third
+# field and the fourth are stamped at different moments (run_*_job.py builds
+# run_tag at startup, the provider appends the pod's own time when it rents
+# one), so they do NOT agree and must not be cross-checked.
 # plus the provider's own "-{ts}" suffix.
 RUN_TAG = re.compile(r"^bq-(\d+)-(\d+)-(\d+)$")
 
@@ -119,8 +122,8 @@ def parse_run_tag(name):
     m = RUN_TAG.match(name or "")
     if not m:
         return None
-    pid, short, ts = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if ts % 100000 != short:  # not one of ours, whatever else it looks like
+    pid, ts = int(m.group(1)), int(m.group(3))
+    if pid <= 0 or ts < 1_000_000_000:  # shaped like ours but not plausible
         return None
     return pid, ts
 

@@ -66,9 +66,17 @@ def test_names_that_are_not_ours_yield_no_controller(name):
     assert wd.parse_run_tag(name) is None
 
 
-def test_a_bq_name_whose_checksum_disagrees_is_not_treated_as_ours():
-    # Middle field must be the timestamp mod 100000 or the name is a coincidence.
-    assert wd.parse_run_tag(f"bq-4119069-99999-{POD_TS}") is None
+def test_a_real_pod_name_parses_even_though_the_fields_disagree():
+    # Observed in production: bq-4130775-20914-1786320953. 1786320953 % 100000
+    # is 20953, not 20914, because run_tag is stamped when the controller starts
+    # and the pod's own timestamp is appended ~39s later when it is rented.
+    # Cross-checking them dropped every real pod into the ad-hoc bucket, where a
+    # multi-hour quant would eventually blow the age ceiling and be killed.
+    assert wd.parse_run_tag("bq-4130775-20914-1786320953") == (4130775, 1786320953)
+
+
+def test_a_bq_name_with_an_implausible_timestamp_is_not_ours():
+    assert wd.parse_run_tag("bq-4119069-99999-42") is None
 
 
 def test_the_rental_clock_is_read_out_of_last_status_change():

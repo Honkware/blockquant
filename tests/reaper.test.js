@@ -32,8 +32,16 @@ describe('parseRunTag', () => {
     expect(parseRunTag(NAME)).toEqual({ pid: PID, ts: TS });
   });
 
-  it('rejects a name whose checksum field does not match its timestamp', () => {
-    expect(parseRunTag(`bq-${PID}-00000-${TS}`)).toBeNull();
+  it('accepts a real pod whose short field does not equal ts % 100000', () => {
+    // run_tag is stamped when the controller starts; the pod's timestamp is
+    // appended when it is actually rented, which is later. A real name seen in
+    // production: bq-4130775-20914-1786320953, where 1786320953 % 100000 is
+    // 20953, not 20914. Requiring them to match reaped nothing, ever.
+    expect(parseRunTag('bq-4130775-20914-1786320953')).toEqual({ pid: 4130775, ts: 1786320953 });
+  });
+
+  it('rejects a name with a nonsense timestamp', () => {
+    expect(parseRunTag(`bq-${PID}-20914-42`)).toBeNull();
   });
 
   it('ignores pods that are not ours', () => {
