@@ -369,9 +369,21 @@ def _pkg_version(name: str, mod=None) -> str:
 
 def _hf_tokenizer():
     """AutoTokenizer from the download. Both loaders want it for the chat
-    template; only the transformers one uses it to tokenize."""
-    from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(str(MODEL_DIR))
+    template; only the transformers one uses it to tokenize.
+
+    AutoTokenizer dispatches on tokenizer_config.json's `tokenizer_class`, so a
+    repo saved by a newer transformers than this image has fails with "Tokenizer
+    class X does not exist" even though tokenizer.json right beside it is fine.
+    That costs the chat template, and a 27B instruct model handed a raw prompt
+    rambles instead of drawing, which is a whole pod spent on nothing. The fast
+    tokenizer reads the file directly and ignores the class name."""
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    try:
+        return AutoTokenizer.from_pretrained(str(MODEL_DIR))
+    except Exception as e:
+        print(f"[progress] WARN AutoTokenizer refused it ({e}); reading "
+              "tokenizer.json directly", flush=True)
+        return PreTrainedTokenizerFast.from_pretrained(str(MODEL_DIR))
 
 
 def _chat_wrap(tok, prompt: str) -> tuple[str, bool]:
@@ -553,11 +565,17 @@ def main() -> None:
         result["svg"] = svg
         if not svg:
             result["svg_error"] = "no <svg> element in the reply"
+            # What it said instead. Without this the reply is thrown away and
+            # "no <svg> element" is all anyone ever learns, on a run that
+            # already cost a pod -- you cannot tell a refusal from a ramble
+            # from a bad chat template without renting the card again.
+            result["svg_reply"] = svg_reply[:2000]
 
         code = extract_python(py_reply)
         result["python_source"] = code
         if not code:
             result["python_error"] = "no python in the reply"
+            result["python_reply"] = py_reply[:2000]
         else:
             print("[progress] rendering the python answer (sandboxed)", flush=True)
             png, err = run_untrusted_python(code)
