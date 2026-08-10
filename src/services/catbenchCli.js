@@ -16,6 +16,14 @@ const PYTHON = config.PYTHON_BIN || path.join(ROOT, 'backend', 'venv', 'bin', 'p
 const LOG_DIR = path.join(ROOT, 'backend', 'logs');
 const MIRROR_DIR = path.join(ROOT, 'data', 'catbench');
 
+// A result file is the only copy of what a pod produced, and a pod costs money.
+// It used to be unlinked the instant it was parsed, which left a run whose
+// delivery failed, or one that landed while the bot was down, with nothing to
+// recover from -- and index.js already tells the operator to go look at
+// meta.resultPath in exactly that case. So they stay, and a new run prunes the
+// old ones rather than the reader deleting its own evidence.
+const KEEP_RESULTS = 20;
+
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
   gpu: /Trying\s+(.+?)\s+\(~\$([0-9.]+)/,
@@ -59,6 +67,27 @@ export function preflight(modelId) {
   });
 }
 
+/** Drop all but the newest KEEP_RESULTS result files. Name carries the stamp. */
+function pruneResults() {
+  let files;
+  try {
+    files = fs
+      .readdirSync(LOG_DIR)
+      .map((n) => ({ n, m: /^catbench-.+-(\d+)\.json$/.exec(n) }))
+      .filter((f) => f.m)
+      .sort((a, b) => Number(b.m[1]) - Number(a.m[1]));
+  } catch {
+    return;
+  }
+  for (const f of files.slice(KEEP_RESULTS)) {
+    try {
+      fs.unlinkSync(path.join(LOG_DIR, f.n));
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 /**
  * Run CatBench for one model on a throwaway pod. Mirrors runpodCli.runViaCli:
  * detached controller writing to a log file, tailed here for progress, so a bot
@@ -71,6 +100,7 @@ export function preflight(modelId) {
 export function runCatbench({ modelId, onProgress }) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(LOG_DIR, { recursive: true });
+    pruneResults();
     const slug = modelId.replace(/[^a-zA-Z0-9._-]/g, '_');
     const stamp = Date.now();
     const logPath = path.join(LOG_DIR, `catbench-${slug}-${stamp}.log`);
@@ -174,11 +204,13 @@ export function runCatbench({ modelId, onProgress }) {
       } catch {
         /* no result file */
       }
-      try {
-        fs.unlinkSync(src);
-      } catch {
-        /* already gone */
-      }
+      // One line per finished run, always. Without it a controller that ended
+      // is indistinguishable in the log from one still going, which is how a
+      // completed bench read as a run that vanished.
+      log.info(
+        `finished (${signal ? `killed by ${signal}` : `exit ${code}`}): ` +
+          (result ? `result ${src}` : 'no result file')
+      );
       if (result) return resolve(result);
       const why =
         jobError ||

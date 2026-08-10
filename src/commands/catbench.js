@@ -69,20 +69,32 @@ function resultEmbeds({ name, svgImage, pythonImage, footer }) {
 // result usually lands after editReply has stopped working -- it throws and the
 // user sits on the last progress state forever. Fall back to the channel, which
 // is where someone who wandered off will look anyway.
-async function deliver(interaction, payload) {
+//
+// It logs `what` and where it landed, every time. The good endings used to log
+// nothing at all, so a run that finished, posted "drew nothing usable" and
+// stopped left a bot log holding one `spawn` line and nothing after it, which
+// is indistinguishable from a run that disappeared and was read as one.
+async function deliver(interaction, what, payload) {
   try {
-    return await interaction.editReply(payload);
-  } catch {
+    await interaction.editReply(payload);
+    log.info(`${what} -> reply`);
+    return true;
+  } catch (err) {
     const ch = interaction.channel
       || (await interaction.client.channels.fetch(interaction.channelId).catch(() => null));
     if (!ch) {
-      log.warn('result ready but the token expired and the channel is gone');
-      return null;
+      log.error(`${what} -> nowhere: token gone (${err.message}) and no channel`);
+      return false;
     }
     const at = `<@${interaction.user.id}>`;
-    return ch
-      .send({ ...payload, content: payload.content ? `${at} ${payload.content}` : at })
-      .catch((e) => log.warn(`could not deliver to channel: ${e.message}`));
+    try {
+      await ch.send({ ...payload, content: payload.content ? `${at} ${payload.content}` : at });
+      log.info(`${what} -> channel`);
+      return true;
+    } catch (e) {
+      log.error(`${what} -> nowhere: ${e.message}`);
+      return false;
+    }
   }
 }
 
@@ -279,7 +291,9 @@ export async function handleCatbench(interaction) {
         files.push(new AttachmentBuilder(svgPng, { name: 'svg.png' }));
         svgImage = 'attachment://svg.png';
       } catch (e) {
-        log.debug(`svg render failed: ${e.message}`);
+        // warn, not debug: production runs at info, and an SVG that came back
+        // and would not rasterize reports as "no render" with no trace of why.
+        log.warn(`svg render failed: ${e.message}`);
       }
     }
 
@@ -292,21 +306,33 @@ export async function handleCatbench(interaction) {
       pythonImage = 'attachment://python.png';
     }
 
+    const mins = Math.round((result.wall_seconds || (Date.now() - started) / 1000) / 60);
+    const cost = result.cost_usd != null ? ` · ~$${result.cost_usd.toFixed(2)}` : '';
+
+    // A pod that answered with no kitten in it. Still an embed with the run's
+    // cost and minutes on it: a bare line of text replacing the progress embed
+    // reads as the bot losing its place, which is how a run that did say what
+    // went wrong still counted as "got nothing".
     if (!svgImage && !pythonImage) {
-      return deliver(interaction, {
-        embeds: [],
-        content:
-          `\`${modelId}\` drew nothing usable. ` +
-          `SVG: ${result.svg_error || 'no render'} · Python: ${result.python_error || 'no render'}`,
+      const why =
+        `SVG: ${result.svg_error || 'no render'} · ` +
+        `Python: ${result.python_error || 'no render'}`;
+      return deliver(interaction, `${modelId} drew nothing usable (${why})`, {
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(`🐱 CatBench · ${truncate(modelId, 80)}`)
+            .setColor(COLOR)
+            .setURL(gallery.GALLERY_URL)
+            .setDescription(`Nothing renderable came back.\n${why}`)
+            .setFooter({ text: truncate(`fresh run · ${mins}m${cost} · not saved`, 200) }),
+        ],
       });
     }
 
     // Only a clean both-halves run is worth keeping. A half-run cached is a
     // half-run nobody ever retries, and those are the ones a fix would fix.
     const grade = gallery.gradeRun(result, { svgPng, pythonPng });
-    const mins = Math.round((result.wall_seconds || (Date.now() - started) / 1000) / 60);
-    const cost = result.cost_usd != null ? ` · ~$${result.cost_usd.toFixed(2)}` : '';
-    await deliver(interaction, {
+    await deliver(interaction, `${modelId} benched in ${mins}m${cost}`, {
       embeds: resultEmbeds({
         name: modelId,
         svgImage,
@@ -337,7 +363,10 @@ export async function handleCatbench(interaction) {
     }
   } catch (err) {
     log.error(`catbench failed for ${modelId}`, { error: err.message });
-    await deliver(interaction, { embeds: [], content: `❌ ${toUserMessage(err)}` });
+    await deliver(interaction, `${modelId} failed`, {
+      embeds: [],
+      content: `❌ ${toUserMessage(err)}`,
+    });
   } finally {
     running = null;
   }
