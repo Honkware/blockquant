@@ -388,16 +388,40 @@ def _hf_tokenizer():
 
 def _chat_wrap(tok, prompt: str) -> tuple[str, bool]:
     """(text, encode_special). Instruct models get their template so they reply
-    in character; a base model gets the raw prompt."""
-    if tok is not None and getattr(tok, "chat_template", None):
-        return tok.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, tokenize=False,
-        ), True
+    in character; a base model gets the raw prompt.
+
+    Thinking off: a reasoning model otherwise spends the budget narrating. A
+    Qwen3.5 quant came back with "the tail might look a bit weird with plot,
+    let's use a FancyBboxPatch" and the extractor handed that to exec(). A
+    template that ignores the variable is unaffected, so this is safe across
+    families; the kwarg spelling moved between transformers versions, hence the
+    ladder.
+    """
+    if tok is None or not getattr(tok, "chat_template", None):
+        return prompt, False
+    msgs = [{"role": "user", "content": prompt}]
+    for extra in ({"chat_template_kwargs": {"enable_thinking": False}},
+                  {"enable_thinking": False},
+                  {}):
+        try:
+            return tok.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=False, **extra
+            ), True
+        except TypeError:
+            continue
     return prompt, False
 
 
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+
+
 def _trim(resp: str) -> str:
+    # Belt and braces for the template flag: some checkpoints open a think block
+    # regardless. A closed one is dropped; an unclosed one means the reply never
+    # got past reasoning, and keeping the prose only feeds junk to the extractor.
+    resp = _THINK.sub("", resp)
+    if "<think>" in resp:
+        resp = resp.split("<think>", 1)[0]
     for marker in END_MARKERS:
         if marker in resp:
             resp = resp.split(marker, 1)[0]
