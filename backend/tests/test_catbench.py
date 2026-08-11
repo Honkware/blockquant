@@ -117,6 +117,30 @@ def test_a_missing_config_is_not_a_crash(tmp_path, monkeypatch):
     assert cb.quant_method() == ""
 
 
+def test_a_vl_repo_with_no_processor_config_gets_a_stand_in(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch,
+            '{"architectures": ["Qwen3_5ForConditionalGeneration"], '
+            '"vision_config": {"patch_size": 16, "spatial_merge_size": 2}}')
+    cb._vision_preprocessor_shim()
+    prep = json.loads((tmp_path / "preprocessor_config.json").read_text())
+    assert prep["image_processor_type"] == "Qwen2VLImageProcessorFast"
+    assert prep["patch_size"] == 16 and prep["merge_size"] == 2
+    assert set(prep["size"]) == {"shortest_edge", "longest_edge"}
+
+
+def test_the_models_own_processor_config_is_left_alone(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, '{"vision_config": {"patch_size": 16}}')
+    (tmp_path / "preprocessor_config.json").write_text('{"mine": true}')
+    cb._vision_preprocessor_shim()
+    assert json.loads((tmp_path / "preprocessor_config.json").read_text()) == {"mine": True}
+
+
+def test_a_text_only_repo_gets_no_processor_config(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, '{"architectures": ["Qwen3ForCausalLM"]}')
+    cb._vision_preprocessor_shim()
+    assert not (tmp_path / "preprocessor_config.json").exists()
+
+
 def test_a_format_with_no_loader_says_so_before_transformers_does(tmp_path, monkeypatch):
     monkeypatch.setattr(cb, "MODEL_DIR", tmp_path)
     with pytest.raises(RuntimeError, match="awq"):

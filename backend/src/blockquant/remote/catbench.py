@@ -360,6 +360,41 @@ def download(model_id: str, token: str) -> None:
     print("[download] 100% complete", flush=True)
 
 
+def _vision_preprocessor_shim() -> None:
+    """Give a VL repo the processor config exllamav3 insists on reading.
+
+    exllamav3 opens preprocessor_config.json unconditionally for any config
+    carrying a vision_config, so a quant published without one cannot be loaded
+    at all: FileNotFoundError before it reads a shard. quant.py writes a real
+    one now, but the repos published in between have none, and CatBench should
+    still be able to bench them.
+
+    These numbers only have to parse. CatBench sends two sentences and no
+    images, and this copy dies with the pod, so it cannot mislead a downloader
+    the way a published stub did.
+    """
+    prep = MODEL_DIR / "preprocessor_config.json"
+    if prep.exists():
+        return
+    try:
+        vis = json.loads((MODEL_DIR / "config.json").read_text(encoding="utf-8")).get("vision_config")
+    except Exception:
+        vis = None
+    if not vis:
+        return
+    prep.write_text(json.dumps({
+        "size": {"shortest_edge": 56, "longest_edge": 56},
+        "patch_size": vis.get("patch_size", 14),
+        "temporal_patch_size": vis.get("temporal_patch_size", 2),
+        "merge_size": vis.get("spatial_merge_size", 2),
+        "image_mean": [0.48145466, 0.4578275, 0.40821073],
+        "image_std": [0.26862954, 0.26130258, 0.27577711],
+        "image_processor_type": "Qwen2VLImageProcessorFast",
+    }))
+    print("[progress] no preprocessor_config.json; wrote a stand-in to load the LM",
+          flush=True)
+
+
 def quant_method() -> str:
     """quant_method from the downloaded config.json, "" for plain weights.
 
@@ -646,6 +681,7 @@ def main() -> None:
         cfg.pop("hf_token", None)
         cfg.pop("runpod_api_key", None)
 
+        _vision_preprocessor_shim()
         fmt = quant_method()
         result["format"] = fmt or "bf16"
         runner = load_model(fmt)
