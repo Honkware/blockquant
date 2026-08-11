@@ -5,6 +5,7 @@ size_check lives in scripts/run_catbench_job.py, which pulls the provider stack
 at import time, so it is AST-loaded the way test_drain_failure does it.
 """
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -127,12 +128,19 @@ def test_reply_is_cut_at_the_turn_boundary():
     assert cb._trim("  plain  ") == "plain"
 
 
+def test_reasoning_the_template_opened_is_dropped():
+    # The template puts <think> in the PROMPT, so the reply only ever carries
+    # the closing tag and everything before it is thinking, not the answer.
+    assert cb._trim("size the ears\n</think>\n\n<svg/></svg>") == "<svg/></svg>"
+    assert cb._trim("<think>a</think>b") == "b"
+
+
 def test_a_base_model_gets_the_raw_prompt():
     class _NoTemplate:
         chat_template = None
 
-    assert cb._chat_wrap(_NoTemplate(), "hi") == ("hi", False)
-    assert cb._chat_wrap(None, "hi") == ("hi", False)
+    assert cb._chat_wrap(_NoTemplate(), "hi") == ("hi", False, False)
+    assert cb._chat_wrap(None, "hi") == ("hi", False, False)
 
 
 def test_an_instruct_model_gets_its_template():
@@ -143,9 +151,46 @@ def test_an_instruct_model_gets_its_template():
         def apply_chat_template(msgs, **kw):
             return f"<|im_start|>user\n{msgs[0]['content']}<|im_end|>"
 
-    text, special = cb._chat_wrap(_Tok(), "hi")
+    text, special, thinking = cb._chat_wrap(_Tok(), "hi")
     assert special is True
+    assert thinking is False
     assert "hi" in text
+
+
+def test_thinking_off_is_checked_in_the_render_not_the_call():
+    # Qwen3.5's template, in the shape that matters: an unrecognised kwarg is
+    # not an error, it just lands in the template unused and the prompt still
+    # ends inside <think>. Only the top-level spelling turns reasoning off.
+    class _Tok:
+        chat_template = "x"
+
+        @staticmethod
+        def apply_chat_template(msgs, enable_thinking=None, **kw):
+            tail = "<think>\n\n</think>\n\n" if enable_thinking is False else "<think>\n"
+            return f"<|im_start|>assistant\n{tail}"
+
+    text, _, thinking = cb._chat_wrap(_Tok(), "hi")
+    assert thinking is False
+    assert text.endswith("</think>\n\n")
+
+
+def test_a_template_that_insists_on_thinking_is_reported():
+    class _Tok:
+        chat_template = "x"
+
+        @staticmethod
+        def apply_chat_template(msgs, **kw):
+            return "<|im_start|>assistant\n<think>\n"
+
+    _, _, thinking = cb._chat_wrap(_Tok(), "hi")
+    assert thinking is True
+
+
+def test_an_empty_run_says_whether_it_reasoned_or_answered():
+    assert "reasoning" in cb._why_nothing("still sketching the tail", True, True, 2048)
+    assert cb._why_nothing("</think>\n\nHere you go", True, False, 2048) == ""
+    assert "2048" in cb._why_nothing("half an answer", False, True, 2048)
+    assert cb._why_nothing("a cat is nice", False, False, 2048) == ""
 
 
 # ── The sandbox. This is the part that runs model-written code. ─────────────

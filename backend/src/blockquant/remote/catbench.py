@@ -410,30 +410,49 @@ def _hf_tokenizer():
         return PreTrainedTokenizerFast.from_pretrained(str(MODEL_DIR))
 
 
-def _chat_wrap(tok, prompt: str) -> tuple[str, bool]:
-    """(text, encode_special). Instruct models get their template so they reply
-    in character; a base model gets the raw prompt.
+def _thinking_open(text: str) -> bool:
+    """The rendered prompt ends inside a <think> block, so generation starts as
+    reasoning and the reply carries no opening tag of its own."""
+    return text.rfind("<think>") > text.rfind("</think>")
+
+
+def _chat_wrap(tok, prompt: str) -> tuple[str, bool, bool]:
+    """(text, encode_special, thinking). Instruct models get their template so
+    they reply in character; a base model gets the raw prompt.
 
     Thinking off: a reasoning model otherwise spends the budget narrating. A
     Qwen3.5 quant came back with "the tail might look a bit weird with plot,
-    let's use a FancyBboxPatch" and the extractor handed that to exec(). A
-    template that ignores the variable is unaffected, so this is safe across
-    families; the kwarg spelling moved between transformers versions, hence the
-    ladder.
+    let's use a FancyBboxPatch" and the extractor handed that to exec().
+
+    The kwarg spelling moved between transformers versions and the wrong one is
+    NOT an error: apply_chat_template forwards anything it does not recognise
+    to the template as a variable, so chat_template_kwargs={...} renders exactly
+    like passing nothing and the model reasons anyway. Hence look at what came
+    out instead of trusting the call: keep the first spelling whose prompt does
+    not end inside an open <think>. A template with no thinking in it matches on
+    the first try, so this costs nothing elsewhere.
     """
     if tok is None or not getattr(tok, "chat_template", None):
-        return prompt, False
+        return prompt, False, False
     msgs = [{"role": "user", "content": prompt}]
-    for extra in ({"chat_template_kwargs": {"enable_thinking": False}},
-                  {"enable_thinking": False},
+    plain = None
+    for extra in ({"enable_thinking": False},
+                  {"chat_template_kwargs": {"enable_thinking": False}},
                   {}):
         try:
-            return tok.apply_chat_template(
-                msgs, add_generation_prompt=True, tokenize=False, **extra
-            ), True
-        except TypeError:
+            text = tok.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=False, **extra)
+        except Exception:
             continue
-    return prompt, False
+        if not _thinking_open(text):
+            return text, True, False
+        plain = text if plain is None else plain
+    # Reasoning is welded into this template. Run it anyway and let the budget
+    # note explain a reply that never got out of the think block.
+    if plain is None:
+        return prompt, False, False
+    print("[progress] WARN this chat template insists on thinking", flush=True)
+    return plain, True, True
 
 
 _THINK = re.compile(r"<think>.*?</think>", re.S)
@@ -441,15 +460,33 @@ _THINK = re.compile(r"<think>.*?</think>", re.S)
 
 def _trim(resp: str) -> str:
     # Belt and braces for the template flag: some checkpoints open a think block
-    # regardless. A closed one is dropped; an unclosed one means the reply never
-    # got past reasoning, and keeping the prose only feeds junk to the extractor.
+    # regardless. A closed one is dropped. A dangling </think> means the TEMPLATE
+    # opened the block in the prompt, so everything ahead of it is reasoning and
+    # the answer is what follows. A dangling <think> means the reply never got
+    # past reasoning, and keeping the prose only feeds junk to the extractor.
     resp = _THINK.sub("", resp)
+    if "</think>" in resp:
+        resp = resp.split("</think>", 1)[1]
     if "<think>" in resp:
         resp = resp.split("<think>", 1)[0]
     for marker in END_MARKERS:
         if marker in resp:
             resp = resp.split(marker, 1)[0]
     return resp.strip()
+
+
+def _why_nothing(raw: str, thinking: bool, capped: bool, budget: int) -> str:
+    """Why a reply held nothing usable, when the generation itself explains it.
+
+    "no python in the reply" is equally true of a model that reasoned for 2048
+    tokens without answering and of one that answered in prose, and those are
+    different problems. Say which one it was.
+    """
+    if thinking and "</think>" not in raw:
+        return f"spent its whole {budget}-token budget reasoning, never answered"
+    if capped:
+        return f"the reply ran past the {budget}-token limit mid-answer"
+    return ""
 
 
 class HFRunner:
@@ -476,17 +513,19 @@ class HFRunner:
                 str(MODEL_DIR), torch_dtype=torch.bfloat16, **kw)
         self.model.eval()
 
-    def generate(self, prompt: str, max_new_tokens: int) -> str:
+    def generate(self, prompt: str, max_new_tokens: int) -> tuple[str, str]:
         import torch
         tok = self.tok
-        text, special = _chat_wrap(tok, prompt)
+        text, special, thinking = _chat_wrap(tok, prompt)
         ids = tok(text, return_tensors="pt", add_special_tokens=not special).to(self.model.device)
         with torch.inference_mode():
             out = self.model.generate(
                 **ids, max_new_tokens=max_new_tokens, do_sample=False,
                 pad_token_id=tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id,
             )
-        return _trim(tok.decode(out[0][ids["input_ids"].shape[-1]:], skip_special_tokens=True))
+        new = out[0][ids["input_ids"].shape[-1]:]
+        raw = tok.decode(new, skip_special_tokens=True)
+        return _trim(raw), _why_nothing(raw, thinking, len(new) >= max_new_tokens, max_new_tokens)
 
     def unload(self):
         del self.model
@@ -527,15 +566,28 @@ class Exl3Runner:
         except Exception as e:
             print(f"[progress] WARN no HF tokenizer ({e}); raw prompt", flush=True)
 
-    def generate(self, prompt: str, max_new_tokens: int) -> str:
+    def generate(self, prompt: str, max_new_tokens: int) -> tuple[str, str]:
         from exllamav3 import GreedySampler
-        text, special = _chat_wrap(self.tok, prompt)
+        text, special, thinking = _chat_wrap(self.tok, prompt)
         out = self.gen.generate(
             prompt=text, max_new_tokens=max_new_tokens, sampler=GreedySampler(),
             completion_only=True, encode_special_tokens=special, add_bos=not special,
             stop_conditions=(list(dict.fromkeys(self.stop)) or None),
         )
-        return _trim(out if isinstance(out, str) else (out[0] if out else ""))
+        raw = out if isinstance(out, str) else (out[0] if out else "")
+        return _trim(raw), _why_nothing(raw, thinking, self._capped(raw, max_new_tokens),
+                                        max_new_tokens)
+
+    def _capped(self, raw: str, budget: int) -> bool:
+        """Did generation stop because it ran out of budget? exllamav3 hands back
+        text, not a stop reason, so measure it. Off by a token either way is
+        fine: this only picks the wording of an error message."""
+        if not raw or self.tok is None:
+            return False
+        try:
+            return len(self.tok(raw, add_special_tokens=False)["input_ids"]) >= budget - 2
+        except Exception:
+            return False
 
     def unload(self):
         self.model.unload()
@@ -605,14 +657,14 @@ def main() -> None:
         result["prompts"] = {"svg": PROMPT_SVG, "python": PROMPT_PY}
 
         print("[progress] prompt 1/2 (svg)", flush=True)
-        svg_reply = runner.generate(PROMPT_SVG, MAX_NEW_SVG)
+        svg_reply, svg_note = runner.generate(PROMPT_SVG, MAX_NEW_SVG)
         print("[progress] prompt 2/2 (python)", flush=True)
-        py_reply = runner.generate(PROMPT_PY, MAX_NEW_PY)
+        py_reply, py_note = runner.generate(PROMPT_PY, MAX_NEW_PY)
 
         svg = extract_svg(svg_reply)
         result["svg"] = svg
         if not svg:
-            result["svg_error"] = "no <svg> element in the reply"
+            result["svg_error"] = svg_note or "no <svg> element in the reply"
             # What it said instead. Without this the reply is thrown away and
             # "no <svg> element" is all anyone ever learns, on a run that
             # already cost a pod -- you cannot tell a refusal from a ramble
@@ -622,7 +674,7 @@ def main() -> None:
         code = extract_python(py_reply)
         result["python_source"] = code
         if not code:
-            result["python_error"] = "no python in the reply"
+            result["python_error"] = py_note or "no python in the reply"
             result["python_reply"] = py_reply[:2000]
         else:
             print("[progress] rendering the python answer (sandboxed)", flush=True)
