@@ -78,7 +78,15 @@ RUN python -m pip install \
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
 # providers/runpod/provider.py); this ref reports 1.4.1.
-ARG EXLLAMAV3_REF=4f8ad0121f483ba66a5336244a4c3b6d7210385e
+#
+# This is a `dev` commit, not a release. Releases lag the architectures they
+# support by days -- MuseGlimmer landed on dev before turboderp had published
+# the quant, and 1.4.1 cannot load it -- and quantizing a model nobody can
+# quantize yet is most of the point of this bot. Pinned to the exact commit,
+# never to the branch name, so a rebuild is reproducible. Rolling back is one
+# RUNPOD_IMAGE env change and a restart; the previous release image is
+# sha-83f22ed70eb7be1d5f39d45ce18bdb5d0d86f13b (exllamav3 4f8ad01, v1.4.1).
+ARG EXLLAMAV3_REF=6884772a157074a24a712956756a8abe70c0b3be
 RUN EXLLAMA_NOCOMPILE=1 python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 

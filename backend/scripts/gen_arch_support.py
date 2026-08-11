@@ -23,10 +23,12 @@ from pathlib import Path
 
 # The ref the image is built at (docker/Dockerfile.runpod EXLLAMAV3_REF). Bump
 # both together, behind an end-to-end validation pass.
-IMAGE_REF = "4f8ad0121f483ba66a5336244a4c3b6d7210385e"
+IMAGE_REF = "6884772a157074a24a712956756a8abe70c0b3be"
 
-# What --check measures the committed file against.
-UPSTREAM_REF = "origin/master"
+# What --check measures the committed file against. dev, not master: the image
+# is pinned to a dev commit, so master is behind us and comparing against it
+# would report "up to date" while dev grows architectures we do not list.
+UPSTREAM_REF = "origin/dev"
 
 
 def _arch_strings(exl_dir: Path, ref: str) -> set[str]:
@@ -61,6 +63,8 @@ def build(exl_dir: Path, ref: str = IMAGE_REF) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--exllamav3", required=True, help="path to an exllamav3 git checkout")
+    p.add_argument("--ref", default=IMAGE_REF,
+                   help="ref to read arch strings at (default: the baked image ref)")
     p.add_argument("--out", default=str(Path(__file__).parent.parent / "arch_support.json"))
     p.add_argument("--check", action="store_true",
                    help="diff exllamav3 master against the committed JSON; exit 1 if new archs")
@@ -82,7 +86,7 @@ def main() -> None:
               f"{upstream['exllamav3']['version']}")
         return
 
-    data = build(exl)
+    data = build(exl, args.ref)
     Path(args.out).write_text(json.dumps(data, indent=2) + "\n")
     print(f"wrote {args.out}: {len(data['architectures'])} archs "
           f"(exllamav3 {data['exllamav3']['version']})")
