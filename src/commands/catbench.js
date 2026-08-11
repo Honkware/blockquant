@@ -266,17 +266,37 @@ export async function handleCatbench(interaction) {
         })
         .catch(() => {});
 
-    await status('Provisioning', 'looking for the cheapest card that fits');
-    let lastEdit = 0;
-    const result = await runCatbench({
-      modelId,
-      onProgress: ({ stage, message }) => {
-        // Discord rate-limits edits; a slow cadence is plenty for a short run.
-        if (Date.now() - lastEdit < 8000) return;
-        lastEdit = Date.now();
-        status(stage, message);
-      },
-    });
+    let stage = 'Provisioning';
+    let detail = 'looking for the cheapest card that fits';
+    await status(stage, detail);
+    let lastEdit = Date.now();
+
+    // The log only speaks when something matches, and the download is minutes
+    // of `Fetching 42 files: 12%`, which matches nothing. Without a beat the
+    // embed sits on "Provisioning ... 0m elapsed" for the whole run and looks
+    // hung. Re-render on a timer so the minutes move even when the pod is quiet.
+    const beat = setInterval(() => {
+      if (Date.now() - lastEdit < 45_000) return;
+      lastEdit = Date.now();
+      status(stage, detail);
+    }, 15_000);
+
+    let result;
+    try {
+      result = await runCatbench({
+        modelId,
+        onProgress: (p) => {
+          stage = p.stage;
+          detail = p.message;
+          // Discord rate-limits edits; a slow cadence is plenty for a short run.
+          if (Date.now() - lastEdit < 8000) return;
+          lastEdit = Date.now();
+          status(stage, detail);
+        },
+      });
+    } finally {
+      clearInterval(beat);
+    }
 
     // Rasterize the SVG here, with resvg: a static renderer with no script
     // engine and no network, fed sanitized markup. Posting the .svg itself is
