@@ -406,11 +406,12 @@ def _ensure_matplotlib() -> None:
     )
 
 
-def download(model_id: str, token: str) -> None:
+def download(model_id: str, token: str, revision: str = "") -> None:
     from huggingface_hub import snapshot_download
-    print(f"[download] {model_id}", flush=True)
+    print(f"[download] {model_id}{'@' + revision if revision else ''}", flush=True)
     snapshot_download(
         model_id, local_dir=str(MODEL_DIR), token=token or None, max_workers=8,
+        revision=revision or None,
         allow_patterns=["*.safetensors", "*.safetensors.index.json", "*.json",
                         "*.txt", "*.model", "tokenizer*", "*.jinja"],
     )
@@ -718,17 +719,18 @@ def main() -> None:
         pass
 
     model_id = cfg["model_id"]
+    revision = cfg.get("revision", "")
     token = cfg.get("hf_token", "")
     _arm_self_terminate_backstop(
         cfg.get("pod_id", ""), cfg.get("runpod_api_key", ""),
         float(cfg.get("backstop_seconds", 1800)),
     )
 
-    result: dict = {"status": "error", "model_id": model_id}
+    result: dict = {"status": "error", "model_id": model_id, "revision": revision}
     runner = None
     try:
         _ensure_matplotlib()
-        download(model_id, token)
+        download(model_id, token, revision)
         # Download is the only step that needs the token. Drop it before any
         # model code or model-written code gets a chance to read the env.
         for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN",

@@ -416,6 +416,30 @@ export async function inspectUploadRepo(repoName, expected = {}) {
 // ── Utilities ───────────────────────────────────────────────────────────────
 
 /** Extract "org/model" from various URL formats. */
+/**
+ * `{ modelId, revision }` for an input that may name a branch.
+ *
+ * A HuggingFace URL points at a branch as `/tree/<rev>` or `/blob/<rev>/...`,
+ * and pasting one is how anybody actually refers to a repo that keeps one
+ * quant per branch. `org/model@rev` is accepted too, since that is how the
+ * hub's own tooling spells it. Revision is '' when none was named.
+ */
+export function parseModelRef(input) {
+  const raw = String(input).trim();
+  const at = /^([\w.-]+\/[\w.-]+)@(.+)$/.exec(raw);
+  if (at) return { modelId: at[1], revision: at[2].trim() };
+
+  let revision = '';
+  try {
+    const parts = new URL(raw).pathname.split('/').filter(Boolean);
+    const i = parts.findIndex((p) => p === 'tree' || p === 'blob');
+    if (i > 1 && parts[i + 1]) revision = decodeURIComponent(parts[i + 1]);
+  } catch {
+    /* not a URL */
+  }
+  return { modelId: parseModelId(raw), revision };
+}
+
 export function parseModelId(input) {
   // Already in org/model format
   if (/^[\w.-]+\/[\w.-]+$/.test(input)) return input;

@@ -50,6 +50,12 @@ export const commands = [
         .setDescription('(Admin) Ignore the stored result and bench it again on a fresh pod')
         .setRequired(false)
     )
+    .addStringOption((opt) =>
+      opt
+        .setName('revision')
+        .setDescription('Branch to bench, e.g. 4.00bpw. For repos that keep one quant per branch.')
+        .setRequired(false)
+    )
     .addBooleanOption((opt) =>
       opt
         .setName('contribute')

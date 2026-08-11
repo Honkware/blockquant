@@ -39,9 +39,11 @@ const RE = {
  * JSON line. Resolves { ok, gb, error }; a crashed preflight is a rejection,
  * because a size we can't read is a size we can't promise fits one H100.
  */
-export function preflight(modelId) {
+export function preflight(modelId, revision = '') {
   return new Promise((resolve) => {
-    const child = spawn(PYTHON, [SCRIPT, '--model', modelId, '--preflight'], {
+    const args = [SCRIPT, '--model', modelId, '--preflight'];
+    if (revision) args.push('--revision', revision);
+    const child = spawn(PYTHON, args, {
       cwd: ROOT,
       env: { ...process.env, HF_TOKEN: config.HF_TOKEN, PYTHONUNBUFFERED: '1' },
     });
@@ -97,16 +99,17 @@ function pruneResults() {
  * Resolves the controller's result JSON: { svg, python_source, python_png_b64,
  * python_error, svg_error, cost_usd, wall_seconds }.
  */
-export function runCatbench({ modelId, onProgress }) {
+export function runCatbench({ modelId, revision = '', onProgress }) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     pruneResults();
-    const slug = modelId.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const slug = `${modelId}${revision ? `@${revision}` : ''}`.replace(/[^a-zA-Z0-9._-]/g, '_');
     const stamp = Date.now();
     const logPath = path.join(LOG_DIR, `catbench-${slug}-${stamp}.log`);
     const outPath = path.join(LOG_DIR, `catbench-${slug}-${stamp}.json`);
 
     const args = [SCRIPT, '--model', modelId, '--out', outPath];
+    if (revision) args.push('--revision', revision);
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (config.CATBENCH_MAX_GB) args.push('--max-gb', String(config.CATBENCH_MAX_GB));
 
@@ -120,7 +123,7 @@ export function runCatbench({ modelId, onProgress }) {
         env: { ...process.env, PYTHONUNBUFFERED: '1' },
         logPath,
         kind: 'catbench',
-        meta: { modelId, resultPath: outPath },
+        meta: { modelId, revision, resultPath: outPath },
       });
     } catch (err) {
       return reject(err);
@@ -248,12 +251,13 @@ export function storeRun(payload) {
     };
     const body = {
       model_id: payload.model_id,
-      display_name: payload.display_name || String(payload.model_id).split('/').pop(),
+      display_name: payload.displayName || String(payload.model_id).split('/').pop(),
       loader: payload.loader || '',
       engine: payload.engine || '',
       format: payload.format || '',
       run_date: payload.run_date || new Date().toISOString(),
       prompts: payload.prompts || {},
+      revision: payload.revision || '',
       svg_source: payload.svgSource || '',
       python_source: payload.pythonSource || '',
       upstream_render_ok: payload.upstreamRenderOk ?? null,

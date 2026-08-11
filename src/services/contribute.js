@@ -34,8 +34,11 @@ export function enabled() {
  * says nothing about the model that drew the kitten. The quant level stays,
  * because at 4.5bpw that is the thing being benchmarked.
  */
-export function upstreamStem(modelId) {
-  const stem = String(modelId).split('/').pop();
+export function upstreamStem(modelId, name = '') {
+  // `name` is the benched name, which already carries the branch for a repo
+  // that keeps one quant per branch. Falling back to the repo stem would send
+  // 4bpw and 6bpw upstream under one filename.
+  const stem = name || String(modelId).split('/').pop();
   return stem.replace(/[-_]bf16(?=[-_]|$)/i, '').replace(/^bf16[-_]/i, '');
 }
 
@@ -170,7 +173,7 @@ async function openPr() {
  * Resolves `{ ok, skipped, why, stem, url, added }`. `skipped` is the ordinary
  * outcome for a model upstream already has; it is not an error.
  */
-export async function contribute(modelId, { svgSource, pythonSource, upstreamRenderOk }) {
+export async function contribute(modelId, { svgSource, pythonSource, upstreamRenderOk, name }) {
   if (!enabled()) {
     return { ok: false, why: 'contributing is not configured (GITHUB_TOKEN and CATBENCH_FORK)' };
   }
@@ -190,7 +193,7 @@ export async function contribute(modelId, { svgSource, pythonSource, upstreamRen
     };
   }
 
-  const stem = upstreamStem(modelId);
+  const stem = upstreamStem(modelId, name);
   const key = normKey(stem);
   const base = await upstreamBase();
 

@@ -98,13 +98,14 @@ def _default_codebook(model_id: str, token: str) -> str:
     return "mul1"
 
 
-def _resolve_arch(model_id: str, token: str):
+def _resolve_arch(model_id: str, token: str, revision: str = ""):
     """(arch, supported, config_read_ok). arch is the first declared architecture
     exllamav3 knows, else whatever the config declares first."""
     import json as _json
     from huggingface_hub import hf_hub_download
     try:
-        p = hf_hub_download(model_id, "config.json", token=token or None)
+        p = hf_hub_download(model_id, "config.json", token=token or None,
+                            revision=revision or None)
         cfg = _json.loads(Path(p).read_text())
     except Exception:
         return "", False, False

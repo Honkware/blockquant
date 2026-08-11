@@ -31,6 +31,27 @@ export function modelKey(modelId) {
   return normKey(String(modelId).split('/').pop());
 }
 
+/**
+ * What a benched model is called: the repo stem, plus the branch when the run
+ * pinned one.
+ *
+ * A repo that keeps one quant per branch -- turboderp publishes every EXL3
+ * that way, main holding nothing but a README -- is many models wearing one
+ * name. Without the branch in the identity, 4bpw overwrites 6bpw in the cache
+ * and the two contribute upstream as the same file.
+ *
+ * Kept byte-identical to bench_name in backend/scripts/catbench_store.py.
+ */
+export function benchName(modelId, revision = '') {
+  const stem = String(modelId).split('/').pop();
+  return revision ? `${stem}-${revision}` : stem;
+}
+
+/** The identity a revision-pinned run is stored and looked up under. */
+export function modelRef(modelId, revision = '') {
+  return revision ? `${modelId}@${revision}` : String(modelId);
+}
+
 // ── Upstream gallery ────────────────────────────────────────────────────────
 
 let cache = { at: 0, entries: null };
@@ -130,6 +151,7 @@ function ourEntry(key, m, urlBase, dir) {
     key,
     name: m.display_name || m.model_id || key,
     modelId: m.model_id || null,
+    revision: m.revision || '',
     // Local copy when the box still has it, the dataset URL when it doesn't.
     svgFile: file(m.svg),
     pythonFile: file(m.python_render),
@@ -161,7 +183,9 @@ function indexOurs(manifest, urlBase, dir) {
     const entry = ourEntry(key, m, urlBase, dir);
     if (!entry.svgFile && !entry.pythonFile && !entry.svg && !entry.python) continue;
     byKey.set(key, entry);
-    if (entry.modelId) byModel.set(entry.modelId.toLowerCase(), entry);
+    // Keyed by the pinned identity, not the bare repo: two branches of one
+    // repo are two models, and a re-run of 4bpw must not answer with 6bpw.
+    if (entry.modelId) byModel.set(modelRef(entry.modelId, entry.revision).toLowerCase(), entry);
   }
   return { byKey, byModel };
 }

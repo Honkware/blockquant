@@ -230,6 +230,22 @@ export async function handleCatbench(interaction) {
   const input = (interaction.options.getString('model') || '').trim();
   const refresh = interaction.options.getBoolean('refresh') ?? false;
   const wantsPr = interaction.options.getBoolean('contribute') ?? false;
+  // A repo can keep one quant per branch with a README on main, so the branch
+  // is part of which model this is -- not a detail of how to fetch it.
+  const optRevision = (interaction.options.getString('revision') || '').trim();
+  // Resolved before the cache is consulted, not after: a pasted /tree/<branch>
+  // URL names a different model than the same repo's default, and looking the
+  // unpinned name up first would answer 4bpw with whatever branch we benched
+  // last. The option wins over the URL -- someone who typed a branch meant it.
+  let revision = optRevision;
+  let parsed = '';
+  try {
+    const ref = hf.parseModelRef(input);
+    parsed = ref.modelId;
+    revision = optRevision || ref.revision;
+  } catch {
+    /* a bare gallery name rather than a model id; the roster can still serve it */
+  }
 
   // No model: the roster. Keeps `/catbench <model>` exactly as specified while
   // still giving a zero-argument way to browse.
@@ -270,7 +286,9 @@ export async function handleCatbench(interaction) {
   let entry = null;
   if (!refresh) {
     try {
-      entry = await gallery.lookup(input);
+      // The pinned identity when we have one, so a 4bpw request cannot be
+      // answered with the 6bpw run.
+      entry = await gallery.lookup(parsed ? gallery.modelRef(parsed, revision) : input);
     } catch (err) {
       log.warn(`gallery lookup failed: ${err.message}`);
     }
@@ -281,7 +299,10 @@ export async function handleCatbench(interaction) {
     // entries are not ours to send back, so they are skipped here rather than
     // rejected by the API three calls later.
     if (wantsPr && entry.source === 'ours') {
-      await announce(interaction, entry.modelId || input, await storedSources(entry));
+      await announce(interaction, entry.modelId || input, {
+        ...(await storedSources(entry)),
+        name: entry.name,
+      });
     } else if (wantsPr) {
       await interaction
         .followUp({ content: '📮 That one is upstream\'s own entry, nothing to contribute.' })
@@ -291,10 +312,8 @@ export async function handleCatbench(interaction) {
   }
 
   // Not benched: this will cost money, so everything below is a gate.
-  let modelId;
-  try {
-    modelId = hf.parseModelId(input);
-  } catch {
+  const modelId = parsed;
+  if (!modelId) {
     return interaction.editReply({
       content:
         `\`${truncate(input, 60)}\` is not in the gallery and is not a HuggingFace model ID. ` +
@@ -316,11 +335,12 @@ export async function handleCatbench(interaction) {
   }
   // Claim the slot before the size check, not after: the check takes seconds
   // and two clicks inside that window would otherwise both get through.
-  running = modelId;
+  const name = gallery.benchName(modelId, revision);
+  running = gallery.modelRef(modelId, revision);
   const started = Date.now();
   try {
     // Size gate. Runs against the HF API, before a pod exists.
-    const gate = await preflight(modelId);
+    const gate = await preflight(modelId, revision);
     if (!gate.ok) {
       return interaction.editReply({ content: `❌ ${gate.error}` });
     }
@@ -330,7 +350,7 @@ export async function handleCatbench(interaction) {
         .editReply({
           embeds: [
             new EmbedBuilder()
-              .setTitle(`🐱 Benching \`${truncate(modelId, 60)}\``)
+              .setTitle(`🐱 Benching \`${truncate(name, 60)}\``)
               .setColor(COLOR)
               .setDescription(
                 `**${stage}** · ${truncate(message || '…', 90)}\n` +
@@ -359,6 +379,7 @@ export async function handleCatbench(interaction) {
     try {
       result = await runCatbench({
         modelId,
+        revision,
         onProgress: (p) => {
           stage = p.stage;
           detail = p.message;
@@ -414,7 +435,7 @@ export async function handleCatbench(interaction) {
       return deliver(interaction, `${modelId} drew nothing usable (${why})`, {
         embeds: [
           new EmbedBuilder()
-            .setTitle(`🐱 CatBench · ${truncate(modelId, 80)}`)
+            .setTitle(`🐱 CatBench · ${truncate(name, 80)}`)
             .setColor(COLOR)
             .setURL(gallery.GALLERY_URL)
             .setDescription(`Nothing renderable came back.\n${why}`)
@@ -428,7 +449,7 @@ export async function handleCatbench(interaction) {
     const grade = gallery.gradeRun(result, { svgPng, pythonPng });
     await deliver(interaction, `${modelId} benched in ${mins}m${cost}`, {
       embeds: resultEmbeds({
-        name: modelId,
+        name,
         svgImage,
         pythonImage,
         footer: grade.ok
@@ -452,6 +473,8 @@ export async function handleCatbench(interaction) {
           engine: result.engine,
           format: result.format,
           prompts: result.prompts,
+          revision,
+          displayName: name,
           upstreamRenderOk: result.upstream_render_ok,
         })
         .catch((e) => log.warn(`could not cache result: ${e.message}`));
@@ -460,6 +483,7 @@ export async function handleCatbench(interaction) {
           svgSource: result.svg,
           pythonSource: result.python_source,
           upstreamRenderOk: result.upstream_render_ok,
+          name,
         });
       }
     }

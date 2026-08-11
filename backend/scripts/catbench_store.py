@@ -69,14 +69,26 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def pick_key(model_id: str, models: dict) -> str:
+def bench_name(model_id: str, revision: str = "") -> str:
+    """What a benched model is called: the repo stem, plus the branch when the
+    run pinned one.
+
+    A repo that keeps one quant per branch is many models wearing one name, so
+    the branch has to be part of the identity or 4bpw overwrites 6bpw in the
+    cache and they contribute upstream as the same file.
+    """
+    stem = str(model_id).split("/")[-1]
+    return f"{stem}-{revision}" if revision else stem
+
+
+def pick_key(model_id: str, models: dict, display_name: str = "") -> str:
     """The manifest key for this model, avoiding a stem collision.
 
     Two orgs can publish the same stem, and upstream's key format cannot tell
     them apart. First one in keeps the plain key; the next gets its owner
     folded in, so a second org's kitten never overwrites the first's.
     """
-    base = model_key(model_id)
+    base = norm_key(display_name) if display_name else model_key(model_id)
     if models.get(base, {}).get("model_id", model_id) == model_id:
         return base
     owner = norm_key(str(model_id).split("/")[0]) if "/" in model_id else "x"
@@ -173,13 +185,16 @@ def build_entry(p: dict, key: str, prev: dict) -> dict:
     """
     model_id = p["model_id"]
     return {
-        "display_name": p.get("display_name") or str(model_id).split("/")[-1],
+        "display_name": p.get("display_name") or bench_name(model_id, p.get("revision", "")),
         "svg": f"assets/{key}-svg.jpg",
         "python_render": f"assets/{key}-python.jpg",
         "svg_source": f"assets/{key}.svg",
         "python_source": f"assets/{key}.py",
         "_first_seen": prev.get("_first_seen") or _now(),
         "model_id": model_id,
+        # The branch this came off, when it was not the default one. Without it
+        # a repo's 4bpw and 6bpw entries are indistinguishable after the fact.
+        **({"revision": p["revision"]} if p.get("revision") else {}),
         "loader": p.get("loader") or "",
         "engine": p.get("engine") or "",
         "format": p.get("format") or "",
@@ -274,7 +289,8 @@ def main() -> int:
                 catchup += rels
             manifest = remote
 
-    key = pick_key(payload["model_id"], manifest["models"])
+    key = pick_key(payload["model_id"], manifest["models"],
+                   payload.get("display_name", ""))
     entry = build_entry(payload, key, manifest["models"].get(key, {}))
     sizes = write_mirror(mirror, key, entry, payload, manifest)
     files = [entry["svg"], entry["python_render"], entry["svg_source"],

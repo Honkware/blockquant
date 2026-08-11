@@ -134,6 +134,28 @@ def test_a_run_from_before_the_check_records_no_verdict_at_all(store, tmp_path):
     assert "upstream_render_ok" not in entry
 
 
+def test_a_branch_pinned_run_is_named_and_keyed_apart(store, tmp_path):
+    """One repo, one quant per branch: 4bpw must not overwrite 6bpw."""
+    assert store.bench_name("turboderp/M-exl3", "4.00bpw") == "M-exl3-4.00bpw"
+    assert store.bench_name("turboderp/M-exl3") == "M-exl3"
+
+    models = {}
+    for rev in ("4.00bpw", "6.00bpw"):
+        key = store.pick_key("turboderp/M-exl3", models,
+                             store.bench_name("turboderp/M-exl3", rev))
+        payload = dict(_payload(tmp_path), model_id="turboderp/M-exl3", revision=rev,
+                       display_name=store.bench_name("turboderp/M-exl3", rev))
+        models[key] = store.build_entry(payload, key, {})
+    assert sorted(models) == ["m-exl3-4.00bpw", "m-exl3-6.00bpw"]
+    assert models["m-exl3-4.00bpw"]["revision"] == "4.00bpw"
+
+
+def test_an_unpinned_run_keys_exactly_as_it_always_did(store, tmp_path):
+    """The revision work must not re-key the entries already in the dataset."""
+    assert store.pick_key("Qwen/Qwen3-8B", {}, "Qwen3-8B") == store.pick_key("Qwen/Qwen3-8B", {})
+    assert "revision" not in store.build_entry(_payload(tmp_path), "qwen3-8b", {})
+
+
 def test_a_re_run_keeps_the_original_first_seen(store, tmp_path):
     prev = {"_first_seen": "2026-01-01T00:00:00Z"}
     entry = store.build_entry(_payload(tmp_path), "qwen3-8b", prev)

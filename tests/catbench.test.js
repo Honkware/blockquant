@@ -7,9 +7,10 @@ process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
 process.env.CATBENCH_DATASET ??= 'Honkware/catbench-results';
 
-const { normKey, modelKey, lookup, listAll, gradeRun } = await import(
+const { normKey, modelKey, benchName, modelRef, lookup, listAll, gradeRun } = await import(
   '../src/services/catbench.js'
 );
+const { parseModelRef } = await import('../src/services/huggingface.js');
 const { sanitizeSvg } = await import('../src/utils/svg.js');
 
 // One model, shaped exactly like upstream's demos/CatBench/manifest.json.
@@ -201,5 +202,55 @@ describe('sanitizeSvg', () => {
   it('keeps an inline data image', () => {
     const svg = '<svg><image href="data:image/png;base64,AAAA"/></svg>';
     expect(sanitizeSvg(svg)).toContain('data:image/png;base64,AAAA');
+  });
+});
+
+// ── Repos that keep one quant per branch ────────────────────────────────────
+// turboderp publishes every EXL3 this way: main holds a README, the weights
+// live on 2.00bpw..6.00bpw. The branch is part of which model this is, so it
+// has to survive naming, caching and lookup.
+
+describe('a branch-pinned bench', () => {
+  it('names the branch, so two bpw are two models', () => {
+    expect(benchName('turboderp/Muse-Glimmer-30B-exl3', '4.00bpw')).toBe(
+      'Muse-Glimmer-30B-exl3-4.00bpw'
+    );
+    expect(benchName('turboderp/Muse-Glimmer-30B-exl3')).toBe('Muse-Glimmer-30B-exl3');
+  });
+
+  it('keys the cache by repo and branch together', () => {
+    expect(modelRef('a/B', '4.00bpw')).toBe('a/B@4.00bpw');
+    expect(modelRef('a/B')).toBe('a/B');
+  });
+
+  it('reads the branch out of a pasted tree URL', () => {
+    expect(parseModelRef('https://huggingface.co/turboderp/Muse-Glimmer-30B-exl3/tree/4.00bpw'))
+      .toEqual({ modelId: 'turboderp/Muse-Glimmer-30B-exl3', revision: '4.00bpw' });
+  });
+
+  it('reads it out of a blob URL too, which is what a file link gives you', () => {
+    const got = parseModelRef(
+      'https://huggingface.co/org/m/blob/6.00bpw/config.json'
+    );
+    expect(got).toEqual({ modelId: 'org/m', revision: '6.00bpw' });
+  });
+
+  it('accepts the hub\'s own org/model@rev spelling', () => {
+    expect(parseModelRef('org/m@3.50bpw')).toEqual({ modelId: 'org/m', revision: '3.50bpw' });
+  });
+
+  it('leaves a plain id and a plain URL unpinned', () => {
+    expect(parseModelRef('org/m')).toEqual({ modelId: 'org/m', revision: '' });
+    expect(parseModelRef('https://huggingface.co/org/m')).toEqual({
+      modelId: 'org/m',
+      revision: '',
+    });
+  });
+
+  it('does not mistake a repo called tree for a branch', () => {
+    expect(parseModelRef('https://huggingface.co/tree/m')).toEqual({
+      modelId: 'tree/m',
+      revision: '',
+    });
   });
 });

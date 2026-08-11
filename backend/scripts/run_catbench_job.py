@@ -72,7 +72,7 @@ class _CatBenchProvider(RunPodProvider):
         return result["stdout"].strip() == "running"
 
 
-def repo_format(model_id: str, token: str) -> str:
+def repo_format(model_id: str, token: str, revision: str = "") -> str:
     """What kind of weights the repo holds: "exl3", "gguf", another
     quant_method, or "" for plain fp16/bf16 safetensors.
 
@@ -81,13 +81,14 @@ def repo_format(model_id: str, token: str) -> str:
     from huggingface_hub import HfApi, hf_hub_download
     names: list[str] = []
     try:
-        info = HfApi(token=token or None).model_info(model_id)
+        info = HfApi(token=token or None).model_info(model_id, revision=revision or None)
         names = [s.rfilename for s in (info.siblings or [])]
     except Exception:
         pass
     try:
         cfg = json.loads(Path(hf_hub_download(
-            model_id, "config.json", token=token or None)).read_text(encoding="utf-8"))
+            model_id, "config.json", token=token or None,
+            revision=revision or None)).read_text(encoding="utf-8"))
     except Exception:
         cfg = {}
     method = str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
@@ -105,20 +106,60 @@ def repo_format(model_id: str, token: str) -> str:
     return ""
 
 
-def format_check(model_id: str, token: str) -> dict:
+WEIGHT_EXT = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+
+
+def _weightless(model_id: str, token: str, revision: str = "") -> bool:
+    """True when the branch we would download carries no weight file at all."""
+    from huggingface_hub import HfApi
+
+    try:
+        info = HfApi(token=token or None).model_info(model_id, revision=revision or None)
+    except Exception:
+        return False  # unreadable is size_check's rejection to make, not ours
+    return not any(s.rfilename.lower().endswith(WEIGHT_EXT)
+                   for s in (info.siblings or []))
+
+
+def _branches(model_id: str, token: str) -> list[str]:
+    """Branch names other than the default. Best effort: this only ever
+    improves an error message."""
+    from huggingface_hub import HfApi
+
+    try:
+        refs = HfApi(token=token or None).list_repo_refs(model_id)
+        return sorted(b.name for b in refs.branches if b.name != "main")
+    except Exception:
+        return []
+
+
+def format_check(model_id: str, token: str, revision: str = "") -> dict:
     """Gate the weight format BEFORE anything is provisioned.
 
     The pod has two loaders, transformers and exllamav3, so a GGUF/AWQ/GPTQ repo
     can only die at "loading weights" six minutes and one pod in. Reject it here
     instead. For EXL3 the architecture also has to be one exllamav3 knows.
     """
-    fmt = repo_format(model_id, token)
+    # No weights at all comes first, because everything below reads a config
+    # that a weightless repo may still have. The usual cause is one quant per
+    # branch with a README on main -- turboderp publishes every EXL3 that way.
+    # Sizing measures that README as 3 KB, not as nothing, so the size gate
+    # waves it through and the pod dies at load having cost a boot.
+    if _weightless(model_id, token, revision):
+        revs = [r for r in _branches(model_id, token) if r != revision]
+        where = (" Try one of its other branches: "
+                 + ", ".join(f"`{r}`" for r in revs[:8]) + ".") if revs else ""
+        which = f"branch `{revision}`" if revision else "its default branch"
+        return {"ok": False, "format": "",
+                "error": f"`{model_id}` has no weight files on {which}.{where}"}
+
+    fmt = repo_format(model_id, token, revision)
     if fmt and fmt != "exl3":
         return {"ok": False, "format": fmt,
                 "error": f"`{model_id}` holds {fmt.upper()} weights. CatBench loads fp16/bf16 "
                          f"safetensors or an EXL3 quant; nothing on the pod reads {fmt.upper()}."}
     if fmt == "exl3":
-        arch, supported, ok = _resolve_arch(model_id, token)
+        arch, supported, ok = _resolve_arch(model_id, token, revision)
         if ok and not supported:
             return {"ok": False, "format": fmt,
                     "error": f"`{model_id}` is an EXL3 quant of `{arch}`, an architecture "
@@ -127,7 +168,29 @@ def format_check(model_id: str, token: str) -> dict:
     return {"ok": True, "format": fmt, "error": None}
 
 
-def size_check(model_id: str, token: str, max_gb: float) -> dict:
+def _download_gb(model_id: str, token: str, revision: str = "") -> float | None:
+    """Download size in GB of the branch we would actually fetch.
+
+    Unpinned goes through RunPodProvider._base_download_gb, the same lookup
+    /quant sizes GPUs with -- one implementation for the case that is 99% of
+    runs. Only a pinned branch needs the copy, because /quant has never had to
+    size one.
+    """
+    if not revision:
+        return RunPodProvider._base_download_gb(model_id, token)
+
+    from huggingface_hub import HfApi
+
+    try:
+        info = HfApi(token=token or None).model_info(
+            model_id, revision=revision, files_metadata=True)
+        gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
+    except Exception:
+        return None
+    return gb if gb > 0 else None
+
+
+def size_check(model_id: str, token: str, max_gb: float, revision: str = "") -> dict:
     """Gate on model size BEFORE anything is provisioned.
 
     Reuses RunPodProvider._base_download_gb, the same HF lookup that drives
@@ -136,7 +199,7 @@ def size_check(model_id: str, token: str, max_gb: float) -> dict:
     size is a rejection: a model we cannot measure is a model we cannot promise
     fits one H100.
     """
-    gb = RunPodProvider._base_download_gb(model_id, token)
+    gb = _download_gb(model_id, token, revision)
     if gb is None:
         return {"ok": False, "gb": None,
                 "error": f"could not read the size of `{model_id}` from HuggingFace "
@@ -177,6 +240,9 @@ def failure_reason(provider, instance_id, outcome: str) -> str:
 def main():
     p = argparse.ArgumentParser(description="Run CatBench for one model on RunPod")
     p.add_argument("--model", required=True, help="HuggingFace model ID")
+    p.add_argument("--revision", default="",
+                   help="Branch/tag/commit to bench. Repos that keep one quant "
+                        "per branch need this; main is usually just a README.")
     p.add_argument("--out", default="", help="Where to write the result JSON")
     p.add_argument("--preflight", action="store_true",
                    help="Size gate only: print one JSON line and exit, no pod")
@@ -199,8 +265,8 @@ def main():
     args = p.parse_args()
 
     # Format first: "we cannot read GGUF" is more use than "that is 300 GB".
-    fmt = format_check(args.model, args.hf_token)
-    gate = (size_check(args.model, args.hf_token, args.max_gb) if fmt["ok"]
+    fmt = format_check(args.model, args.hf_token, args.revision)
+    gate = (size_check(args.model, args.hf_token, args.max_gb, args.revision) if fmt["ok"]
             else {"ok": False, "gb": None, "error": fmt["error"]})
     gate["format"] = fmt["format"] or "bf16"
     if args.preflight:
@@ -307,6 +373,7 @@ def main():
         print("[4/5] Starting CatBench...", flush=True)
         cfg = {
             "model_id": args.model,
+            "revision": args.revision,
             "hf_token": args.hf_token,
             "pod_id": instance_id,
             "runpod_api_key": args.runpod_api_key,

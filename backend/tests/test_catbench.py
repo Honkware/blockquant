@@ -20,11 +20,20 @@ QUANT_JOB = "scripts/run_runpod_job.py"
 
 
 def _load(src, want, ns):
-    """Exec just the named top-level defs/assigns of a script into ns."""
+    """Exec just the named top-level defs/assigns of a script into ns.
+
+    Annotations are turned back into strings first. The scripts run on 3.11,
+    where `float | None` in a signature is fine, but lifting a def out of its
+    module leaves it evaluating that annotation under whatever interpreter the
+    tests happen to be on -- and on 3.9 that is a TypeError at import.
+    """
     body = [n for n in ast.parse(open(src).read()).body
             if (isinstance(n, ast.FunctionDef) and n.name in want)
             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in want)]
-    exec(compile(ast.Module(body=body, type_ignores=[]), src, "exec"), ns)
+    future = ast.ImportFrom(module="__future__",
+                            names=[ast.alias(name="annotations", asname=None)], level=0)
+    mod = ast.fix_missing_locations(ast.Module(body=[future] + body, type_ignores=[]))
+    exec(compile(mod, src, "exec"), ns)
     return ns
 
 
@@ -44,9 +53,10 @@ def job():
     import re
     from pathlib import Path
     ns = {"RunPodProvider": _P, "json": json, "Path": Path, "re": re,
-          "_resolve_arch": lambda m, t: ("ArchForCausalLM", True, True)}
+          "_resolve_arch": lambda m, t, r="": ("ArchForCausalLM", True, True)}
     _load(QUANT_JOB, ("_FRAME", "_last_exception", "_GHCR_ACCEPT", "_image_missing"), ns)
-    _load(JOB, ("size_check", "DEFAULT_MAX_GB", "format_check", "failure_reason"), ns)
+    _load(JOB, ("size_check", "DEFAULT_MAX_GB", "format_check", "failure_reason",
+                "_download_gb", "_weightless", "_branches", "WEIGHT_EXT"), ns)
     return ns
 
 
@@ -405,9 +415,12 @@ def test_size_check_rejects_an_unmeasurable_model(size_check):
 
 # ── The format cap, also before any pod exists ──────────────────────────────
 
-def _fmt(job, fmt, supported=True, arch="Qwen3ForCausalLM"):
-    job["repo_format"] = lambda m, t: fmt
-    job["_resolve_arch"] = lambda m, t: (arch, supported, True)
+def _fmt(job, fmt, supported=True, arch="Qwen3ForCausalLM", weightless=False, branches=()):
+    job["repo_format"] = lambda m, t, r="": fmt
+    job["_resolve_arch"] = lambda m, t, r="": (arch, supported, True)
+    # Stubbed, not left to reach HuggingFace: format_check asks this first now.
+    job["_weightless"] = lambda m, t, r="": weightless
+    job["_branches"] = lambda m, t: list(branches)
     return job["format_check"]("org/m", "")
 
 
@@ -435,6 +448,25 @@ def test_a_format_with_no_loader_is_rejected_by_name(job, fmt):
     got = _fmt(job, fmt)
     assert got["ok"] is False
     assert fmt.upper() in got["error"]
+
+
+def test_a_repo_whose_weights_live_on_branches_is_rejected_with_the_branch_list(job):
+    """turboderp publishes one quant per branch and leaves a README on main.
+
+    Sizing measures that README as 3 KB rather than as nothing, so the size
+    gate calls it small enough to fit and the pod dies at load having cost a
+    boot. Catching it needs the file list, not a byte count.
+    """
+    got = _fmt(job, "", weightless=True, branches=["4.00bpw", "6.00bpw"])
+    assert got["ok"] is False
+    assert "no weight files" in got["error"]
+    assert "4.00bpw" in got["error"] and "6.00bpw" in got["error"]
+
+
+def test_a_weightless_repo_with_no_branches_still_says_so(job):
+    got = _fmt(job, "", weightless=True)
+    assert got["ok"] is False
+    assert "branches" not in got["error"]
 
 
 # ── What a failed run actually says ─────────────────────────────────────────
