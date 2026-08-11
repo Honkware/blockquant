@@ -1,5 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseRunTag, controllerAlive, reapOrphans } from '../src/services/reaper.js';
+
+// reaper.js reaches config.js, which hard-exits on missing required env vars.
+// Set them before the import, not after: a static import would run first and
+// take the whole file down at collection time.
+process.env.BOT_TOKEN ??= 'test';
+process.env.CLIENT_ID ??= 'test';
+process.env.GUILD_ID ??= 'test';
+process.env.HF_TOKEN ??= 'test';
+
+const { parseRunTag, controllerAlive, reapOrphans } = await import('../src/services/reaper.js');
 
 // A pod name carries the controller pid and the second it was created, so these
 // tests can drive the exact ambiguity the reaper has to resolve: a pid that

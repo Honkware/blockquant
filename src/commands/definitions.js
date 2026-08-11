@@ -49,6 +49,12 @@ export const commands = [
         .setName('refresh')
         .setDescription('(Admin) Ignore the stored result and bench it again on a fresh pod')
         .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('contribute')
+        .setDescription('(Admin) Offer this result to the upstream CatBench gallery')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),

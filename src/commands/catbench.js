@@ -1,9 +1,10 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { AttachmentBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
 import * as hf from '../services/huggingface.js';
 import * as gallery from '../services/catbench.js';
+import * as upstream from '../services/contribute.js';
 import { preflight, runCatbench } from '../services/catbenchCli.js';
 import { list as listControllers } from '../services/detached.js';
 import { sanitizeSvg, renderSvgToPng } from '../utils/svg.js';
@@ -138,6 +139,51 @@ async function showCached(interaction, entry) {
   });
 }
 
+/**
+ * The two files upstream wants, for a run we already have. Local mirror first,
+ * dataset URL when this box no longer holds it.
+ */
+async function storedSources(entry) {
+  const load = async (file, url) => {
+    if (file && existsSync(file)) return readFileSync(file, 'utf8');
+    if (!url) return '';
+    const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+    return res.ok ? res.text() : '';
+  };
+  return {
+    svgSource: await load(entry.svgSourceFile, entry.svgSourceUrl),
+    pythonSource: await load(entry.pythonSourceFile, entry.pythonSourceUrl),
+    upstreamRenderOk: entry.upstreamRenderOk,
+  };
+}
+
+/**
+ * Offer one run to Katehuuh's gallery and say what happened, as a follow-up
+ * rather than as part of the result: the kitten is the answer to /catbench,
+ * and a contribution is a separate thing that can fail on its own.
+ */
+async function announce(interaction, modelId, sources) {
+  let res;
+  try {
+    res = await upstream.contribute(modelId, sources);
+  } catch (err) {
+    log.warn(`contribute ${modelId} failed: ${err.message}`);
+    res = { ok: false, why: err.message };
+  }
+  const line = !res.ok
+    ? `📮 Not contributed: ${truncate(res.why, 160)}`
+    : res.skipped
+      ? `📮 \`${res.stem}\` is already in the gallery, nothing to send.`
+      : `📮 ${res.added ? 'Staged' : 'Already staged'} \`${res.stem}\` · ` +
+        `${res.pending} waiting on ${res.url}`;
+  log.info(`contribute ${modelId}: ${line}`);
+  await interaction.followUp({ content: line }).catch(async () => {
+    const ch = interaction.channel
+      || (await interaction.client.channels.fetch(interaction.channelId).catch(() => null));
+    await ch?.send({ content: `<@${interaction.user.id}> ${line}` }).catch(() => {});
+  });
+}
+
 async function showList(interaction) {
   const all = await gallery.listAll();
   if (!all.length) {
@@ -183,6 +229,7 @@ export async function autocompleteCatbench(interaction) {
 export async function handleCatbench(interaction) {
   const input = (interaction.options.getString('model') || '').trim();
   const refresh = interaction.options.getBoolean('refresh') ?? false;
+  const wantsPr = interaction.options.getBoolean('contribute') ?? false;
 
   // No model: the roster. Keeps `/catbench <model>` exactly as specified while
   // still giving a zero-argument way to browse.
@@ -204,6 +251,20 @@ export async function handleCatbench(interaction) {
     });
   }
 
+  // Contributing opens a pull request against someone else's repository under
+  // our account. That is not a thing a passer-by gets to do with a slash
+  // command, so it is admin-only and off by default.
+  if (wantsPr && !isAdmin) {
+    return interaction.editReply({
+      content: 'Only an admin can contribute a run to the CatBench gallery.',
+    });
+  }
+  if (wantsPr && !upstream.enabled()) {
+    return interaction.editReply({
+      content: 'Contributing is not configured on this box (needs GITHUB_TOKEN and CATBENCH_FORK).',
+    });
+  }
+
   // Cached first, before any validation — an upstream hit needs no HF lookup,
   // no pod, no GPU.
   let entry = null;
@@ -214,7 +275,20 @@ export async function handleCatbench(interaction) {
       log.warn(`gallery lookup failed: ${err.message}`);
     }
   }
-  if (entry) return showCached(interaction, entry);
+  if (entry) {
+    await showCached(interaction, entry);
+    // A run we already have is contributable without a pod. Upstream's own
+    // entries are not ours to send back, so they are skipped here rather than
+    // rejected by the API three calls later.
+    if (wantsPr && entry.source === 'ours') {
+      await announce(interaction, entry.modelId || input, await storedSources(entry));
+    } else if (wantsPr) {
+      await interaction
+        .followUp({ content: '📮 That one is upstream\'s own entry, nothing to contribute.' })
+        .catch(() => {});
+    }
+    return;
+  }
 
   // Not benched: this will cost money, so everything below is a gate.
   let modelId;
@@ -378,8 +452,16 @@ export async function handleCatbench(interaction) {
           engine: result.engine,
           format: result.format,
           prompts: result.prompts,
+          upstreamRenderOk: result.upstream_render_ok,
         })
         .catch((e) => log.warn(`could not cache result: ${e.message}`));
+      if (wantsPr) {
+        await announce(interaction, modelId, {
+          svgSource: result.svg,
+          pythonSource: result.python_source,
+          upstreamRenderOk: result.upstream_render_ok,
+        });
+      }
     }
   } catch (err) {
     log.error(`catbench failed for ${modelId}`, { error: err.message });

@@ -118,6 +118,22 @@ def test_the_entry_keeps_upstream_field_names(store, tmp_path):
     assert entry["run_date"] == "2026-08-09T12:00:00Z"
 
 
+def test_the_upstream_render_verdict_is_kept_when_the_pod_gave_one(store, tmp_path):
+    """Contributing a cached run depends on this; re-asking costs a pod."""
+    payload = _payload(tmp_path)
+    payload["upstream_render_ok"] = True
+    assert store.build_entry(payload, "qwen3-8b", {})["upstream_render_ok"] is True
+    payload["upstream_render_ok"] = False
+    assert store.build_entry(payload, "qwen3-8b", {})["upstream_render_ok"] is False
+
+
+def test_a_run_from_before_the_check_records_no_verdict_at_all(store, tmp_path):
+    """Absent and False have to stay different: one means "their renderer got
+    nothing", the other means nobody ever asked. Only the first is a refusal."""
+    entry = store.build_entry(_payload(tmp_path), "qwen3-8b", {})
+    assert "upstream_render_ok" not in entry
+
+
 def test_a_re_run_keeps_the_original_first_seen(store, tmp_path):
     prev = {"_first_seen": "2026-01-01T00:00:00Z"}
     entry = store.build_entry(_payload(tmp_path), "qwen3-8b", prev)

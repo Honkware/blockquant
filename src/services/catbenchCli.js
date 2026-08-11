@@ -256,6 +256,7 @@ export function storeRun(payload) {
       prompts: payload.prompts || {},
       svg_source: payload.svgSource || '',
       python_source: payload.pythonSource || '',
+      upstream_render_ok: payload.upstreamRenderOk ?? null,
       svg_png: payload.svgPng ? write('svg.png', payload.svgPng) : '',
       python_png: payload.pythonPng ? write('python.png', payload.pythonPng) : '',
     };

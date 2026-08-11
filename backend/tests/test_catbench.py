@@ -280,6 +280,103 @@ def test_sandbox_survives_a_script_that_crashes_after_drawing():
     assert "ValueError" in err
 
 
+# ── Would CatBench's own Action render this? ────────────────────────────────
+# The tails are what differ between us and upstream; the confinement above them
+# is shared and is what the tests above cover. Running a tail on its own also
+# means these pass off-pod, where dropping to `nobody` does not work.
+
+_STUB_PREAMBLE = """
+import builtins, os, sys, traceback
+WORK, CODE, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+plt.show = lambda *a, **k: None
+"""
+
+
+def _run_tail(tmp_path, tail, code, out_name="figure.jpg"):
+    """Exec one tail against `code`. Returns (bytes|None, exit status)."""
+    import subprocess
+    import sys
+
+    (tmp_path / "kitten.py").write_text(code, encoding="utf-8")
+    (tmp_path / "r.py").write_text(_STUB_PREAMBLE + tail, encoding="utf-8")
+    out = tmp_path / out_name
+    proc = subprocess.run(
+        [sys.executable, str(tmp_path / "r.py"), str(tmp_path),
+         str(tmp_path / "kitten.py"), str(out)],
+        cwd=str(tmp_path), capture_output=True, timeout=120,
+    )
+    blob = out.read_bytes() if out.exists() and out.stat().st_size else None
+    return blob, proc.returncode
+
+
+def test_upstream_renders_an_ordinary_kitten(tmp_path):
+    blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, KITTEN)
+    assert rc == 0 and blob
+
+
+def test_upstream_gets_nothing_from_a_script_that_wrote_its_own_file(tmp_path):
+    """Our tail falls back to an image the script wrote; theirs does not.
+
+    A model that reaches for PIL, or savefig's and then closes the figure,
+    passes here and lands in the gallery as a broken cell.
+    """
+    code = (
+        "import matplotlib\nmatplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots()\nax.plot([1, 2])\n"
+        "fig.savefig('kitten_out.png')\nplt.close('all')\n"
+    )
+    blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, code)
+    assert rc == 3 and blob is None
+    # Ours keeps it, which is why the two answers have to be asked separately.
+    ours, _ = _run_tail(tmp_path, cb._TAIL_OURS, code, out_name="figure.png")
+    assert ours
+
+
+def test_upstream_treats_a_crash_after_drawing_as_fatal(tmp_path):
+    """We keep the picture and report the crash; upstream returns 1 and saves
+    nothing, so a partial run is contributable here and broken there."""
+    code = (
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots()\nax.plot([1, 2])\n"
+        "raise ValueError('boom')\n"
+    )
+    blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, code)
+    assert rc == 1 and blob is None
+
+
+def test_upstream_survives_a_script_that_parses_args(tmp_path):
+    """Their renderer blanks argv before exec. Ours passes the sandbox's own
+    argv through, so a script calling parse_args() sees three stray paths."""
+    code = (
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\np.add_argument('--size', type=int, default=3)\n"
+        "a = p.parse_args()\n"
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots(figsize=(a.size, a.size))\nax.plot([1, 2])\n"
+    )
+    blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, code)
+    assert rc == 0 and blob
+
+
+def test_a_blank_trailing_figure_is_caught(tmp_path):
+    """Upstream saves the CURRENT figure, not the one with the kitten in it.
+
+    Their script would exit 0 here and publish an empty cell. File size cannot
+    separate the two -- a blank JPEG runs ~3 KB against ~4.5 KB for a plain
+    circle-and-ears kitten -- so the guard looks at the axes instead.
+    """
+    blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, KITTEN + "\nplt.figure()\n")
+    assert rc == 6 and blob is None
+    # Ours picks the figure with the kitten in it, so this only fails upstream.
+    ours, _ = _run_tail(tmp_path, cb._TAIL_OURS, KITTEN + "\nplt.figure()\n",
+                        out_name="figure.png")
+    assert ours
+
+
 # ── The size cap, before any pod exists ─────────────────────────────────────
 
 def test_size_check_passes_a_small_model(size_check):

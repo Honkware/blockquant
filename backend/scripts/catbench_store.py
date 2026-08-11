@@ -185,6 +185,12 @@ def build_entry(p: dict, key: str, prev: dict) -> dict:
         "format": p.get("format") or "",
         "run_date": p.get("run_date") or _now(),
         "prompts": p.get("prompts") or {},
+        # Whether CatBench's own renderer got a picture out of this script, as
+        # answered on the pod. Recorded because contributing the run upstream
+        # depends on it and re-asking would cost another pod. Absent on entries
+        # written before the check existed, which is not the same as False.
+        **({"upstream_render_ok": bool(p["upstream_render_ok"])}
+           if p.get("upstream_render_ok") is not None else {}),
     }
 
 

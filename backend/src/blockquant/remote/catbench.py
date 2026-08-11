@@ -110,7 +110,9 @@ def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float
 # an unprivileged uid, clamps rlimits, blinds the socket module, and only then
 # execs the model's code. Written to disk rather than passed with -c so a
 # traceback has real line numbers to report.
-_RUNNER = r'''
+#
+# The confinement is shared; the tail below it is not. See _TAIL_UPSTREAM.
+_PREAMBLE = r'''
 import builtins, os, resource, socket, sys, traceback
 
 WORK, CODE, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -157,7 +159,10 @@ import matplotlib.pyplot as plt
 # Most answers end in plt.show(). Swallow it and save at the end instead, so we
 # get the figure whether the model shows it, saves it, or just builds it.
 plt.show = lambda *a, **k: None
+'''
 
+# Our tail: keep whatever the script managed to draw, however it drew it.
+_TAIL_OURS = r'''
 src = open(CODE, encoding="utf-8", errors="replace").read()
 g = {"__name__": "__main__", "__file__": CODE, "__builtins__": builtins}
 failed = None
@@ -200,6 +205,50 @@ if failed:
     sys.exit(5)
 sys.exit(0)
 '''
+
+# CatBench's scripts/render_python.py, reproduced under the same confinement.
+# Their Action is stricter than our tail in three ways, and each one is a script
+# that draws a kitten here and an empty cell there: an exception during exec is
+# fatal even when a figure exists, there is no wrote-its-own-file fallback, and
+# it saves the CURRENT figure rather than the first one holding axes. Checking
+# it costs a few seconds and is the difference between contributing a kitten and
+# contributing a `⚠ render failed`.
+_TAIL_UPSTREAM = r'''
+# Bare argv, so an argparse.parse_args() in the script sees no positionals.
+sys.argv = [CODE]
+ns = {"__name__": "__main__", "__file__": CODE}
+try:
+    exec(compile(open(CODE, encoding="utf-8", errors="replace").read(), CODE, "exec"), ns)
+except SystemExit as e:
+    if e.code not in (None, 0):
+        print(f"[sbx] NOTE sys.exit({e.code}); checking figures anyway", file=sys.stderr)
+except Exception as e:
+    print(f"[sbx] ERROR {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not plt.get_fignums():
+    print("[sbx] WARN no figure produced", file=sys.stderr)
+    sys.exit(3)
+
+# One deliberate departure from their script. plt.savefig writes the CURRENT
+# figure, so a script that opens a fresh one after drawing gets a clean exit
+# and a blank cell in the gallery. Upstream would call that a success; we are
+# asking whether their Action produces a kitten, not whether it returns 0, and
+# a blank JPEG is only a few hundred bytes short of a simple real one -- so the
+# axes, not the file size, are what decide it.
+if not plt.gcf().get_axes():
+    print("[sbx] WARN the figure upstream would save is empty", file=sys.stderr)
+    sys.exit(6)
+
+kw = {"dpi": 120, "bbox_inches": "tight", "facecolor": "white"}
+if OUT.lower().endswith((".jpg", ".jpeg")):
+    kw["pil_kwargs"] = {"quality": 92, "optimize": True}
+plt.savefig(OUT, **kw)
+plt.close("all")
+sys.exit(0)
+'''
+
+_TAILS = {"ours": _TAIL_OURS, "upstream": _TAIL_UPSTREAM}
 
 
 def _parses(s: str) -> bool:
@@ -271,22 +320,27 @@ def _unshare_works() -> bool:
     return _unshare_ok
 
 
-def run_untrusted_python(code: str) -> tuple[bytes | None, str | None]:
-    """Execute model-written matplotlib code and return (png_bytes, error).
+def run_untrusted_python(code: str, mode: str = "ours") -> tuple[bytes | None, str | None]:
+    """Execute model-written matplotlib code and return (image_bytes, error).
 
     Every layer of confinement is applied here; see the module docstring. The
     pod is throwaway, but the pod also holds the HF token, so this does not
     lean on the pod being disposable.
+
+    `mode` picks the tail: "ours" keeps whatever got drawn, "upstream" answers
+    the narrower question of whether CatBench's Action would render this.
     """
     work = Path(tempfile.mkdtemp(prefix="catbench-", dir="/tmp"))
     try:
         code_path = work / "kitten.py"
         runner_path = work / "_runner.py"
-        out_path = work / "figure.png"
+        # .jpg upstream: that is what their build writes, and it is a different
+        # savefig branch (pil_kwargs) than the .png one.
+        out_path = work / ("figure.jpg" if mode == "upstream" else "figure.png")
         code_path.write_text(code, encoding="utf-8")
         runner_path.write_text(
-            _RUNNER % {"mem": SBX_MEM_BYTES, "cpu": SBX_CPU_S,
-                       "fsize": SBX_FSIZE_BYTES, "nproc": SBX_NPROC},
+            _PREAMBLE % {"mem": SBX_MEM_BYTES, "cpu": SBX_CPU_S,
+                         "fsize": SBX_FSIZE_BYTES, "nproc": SBX_NPROC} + _TAILS[mode],
             encoding="utf-8",
         )
         # The dropped-privilege uid has to be able to read both and write here.
@@ -722,6 +776,15 @@ def main() -> None:
                 result["python_png_b64"] = base64.b64encode(png).decode("ascii")
             if err:
                 result["python_error"] = err
+            if png:
+                # Only asked when we already have a picture: this decides
+                # whether the run is fit to contribute upstream, not whether it
+                # is fit to post here.
+                up, up_err = run_untrusted_python(code, "upstream")
+                result["upstream_render_ok"] = bool(up)
+                result["upstream_render_bytes"] = len(up) if up else 0
+                if up_err:
+                    result["upstream_render_error"] = up_err
 
         result["status"] = "complete"
         result["elapsed"] = round(time.time() - t0, 1)

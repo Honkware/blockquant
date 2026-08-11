@@ -137,6 +137,19 @@ const config = Object.freeze({
   // the first write. Authenticated with HF_TOKEN, no second credential.
   CATBENCH_DATASET: process.env.CATBENCH_DATASET || '',
 
+  // Contributing runs back to Katehuuh's gallery. Off until GITHUB_TOKEN and
+  // CATBENCH_FORK are both set, because between them they are write access to
+  // a repo that is not ours and a pull request with our name on it.
+  //
+  // Contributions batch onto one branch rather than opening a PR per bench:
+  // the maintainer gets one thread to review, not a stream of them, and a
+  // model added while a PR is open just updates it.
+  GITHUB_TOKEN: process.env.GITHUB_TOKEN || '',
+  CATBENCH_UPSTREAM: process.env.CATBENCH_UPSTREAM || 'Katehuuh/Katehuuh.github.io',
+  CATBENCH_FORK: process.env.CATBENCH_FORK || '',
+  CATBENCH_BRANCH: process.env.CATBENCH_BRANCH || 'catbench',
+  CATBENCH_ASSET_DIR: process.env.CATBENCH_ASSET_DIR || 'demos/CatBench/assets',
+
   // Paths (.env file overrides inherited env for these two)
   WORKSPACE_DIR: resolveRepoPath(workspaceDirRaw, './tmp/workdir'),
   EXLLAMAV3_DIR: resolveRepoPath(exllamav3DirRaw, './exllamav3'),

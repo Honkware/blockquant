@@ -62,7 +62,12 @@ async function fetchUpstream() {
   const entries = new Map();
   try {
     const manifest = await getJson(`${BASE}/manifest.json`);
-    for (const [key, m] of Object.entries(manifest.models || {})) {
+    for (const [raw, m] of Object.entries(manifest.models || {})) {
+      // Re-key rather than trust. Their builder normalizes before it writes, so
+      // in practice these already match -- but every other path through this
+      // file keys with normKey, and a manifest key that skipped it would miss
+      // silently and look like a model nobody has benched.
+      const key = normKey(raw);
       entries.set(key, {
         key,
         name: m.display_name || key,
@@ -130,6 +135,16 @@ function ourEntry(key, m, urlBase, dir) {
     pythonFile: file(m.python_render),
     svg: url(m.svg),
     python: url(m.python_render),
+    // What the model actually wrote. The rasters are for looking at; these two
+    // are what upstream wants, so a cached run can be contributed without
+    // renting the card a second time.
+    svgSourceFile: file(m.svg_source),
+    pythonSourceFile: file(m.python_source),
+    svgSourceUrl: url(m.svg_source),
+    pythonSourceUrl: url(m.python_source),
+    // Tri-state on purpose: absent means the run predates the check, which is
+    // not the same as the check having failed.
+    upstreamRenderOk: m.upstream_render_ok,
     loader: m.loader || '',
     engine: m.engine || '',
     at,
