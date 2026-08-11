@@ -136,42 +136,34 @@ async function putFile(path, text, message) {
 }
 
 /**
- * A title in upstream's voice, listing what the branch adds. Their own history
- * reads `Fix visit counter tooltip text` -- imperative, sentence case, no
- * prefix -- so a batch says what it adds and stops.
+ * Where a human goes to turn the branch into a pull request.
+ *
+ * The bot does not open one. Opening a pull request against a repository we do
+ * not own needs a token that can write to it, and the only thing this feature
+ * actually needs is push access to our own fork -- so the credential stays that
+ * narrow and the last step stays a person's.
  */
-export function prTitle(stems) {
-  const names = [...stems].sort((a, b) => a.localeCompare(b));
-  if (!names.length) return 'Add CatBench results';
-  if (names.length === 1) return `Add ${names[0]}`;
-  // Long quant names blow past GitHub's title field fast; past three, count.
-  const joined = names.length <= 3 && names.join(', ').length < 120;
-  if (!joined) return `Add ${names[0]} and ${names.length - 1} more to CatBench`;
-  return `Add ${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
-}
-
-/** The open PR from our branch, or null. */
-async function openPr() {
+export function compareUrl(base = 'main') {
   const owner = config.CATBENCH_FORK.split('/')[0];
-  const prs = await gh(
-    `/repos/${config.CATBENCH_UPSTREAM}/pulls` +
-      `?state=open&head=${encodeURIComponent(`${owner}:${config.CATBENCH_BRANCH}`)}`
-  );
-  return Array.isArray(prs) && prs.length ? prs[0] : null;
+  return `https://github.com/${config.CATBENCH_UPSTREAM}/compare/` +
+    `${encodeURIComponent(base)}...${owner}:${encodeURIComponent(config.CATBENCH_BRANCH)}?expand=1`;
 }
 
 // ── The one entry point ─────────────────────────────────────────────────────
 
 /**
- * Stage one benched model onto the contribution branch and open or update the
- * pull request.
+ * Stage one benched model onto the contribution branch of our fork.
+ *
+ * That is the whole job. Nothing here touches the upstream repository beyond
+ * reading it, so the token this needs is push access to a fork we own and
+ * nothing more.
  *
  * `sources` is the SVG the model wrote and the script it wrote, exactly as
  * stored -- the same two files whether they came from a fresh pod or from the
  * mirror of an earlier run.
  *
- * Resolves `{ ok, skipped, why, stem, url, added }`. `skipped` is the ordinary
- * outcome for a model upstream already has; it is not an error.
+ * Resolves `{ ok, skipped, why, stem, url, added, pending }`. `skipped` is the
+ * ordinary outcome for a model upstream already has; it is not an error.
  */
 export async function contribute(modelId, { svgSource, pythonSource, upstreamRenderOk, name }) {
   if (!enabled()) {
@@ -212,41 +204,22 @@ export async function contribute(modelId, { svgSource, pythonSource, upstreamRen
   ];
   const added = wrote.some(Boolean);
 
-  // Everything on our branch that upstream does not have yet: what the PR is
-  // actually offering, recomputed rather than remembered, so a bot restart or
-  // a second box still titles it correctly.
+  // Everything on our branch upstream does not have yet. Recomputed from the
+  // two listings rather than remembered, so a restart or a second box still
+  // reports the batch correctly.
   // Stems, not normalized keys: the key is for matching, the stem is what a
   // human reads. Seeded with this run's, since a listing can lag a write.
   const offering = new Set([stem]);
   const ours = await assetsOn(config.CATBENCH_FORK, config.CATBENCH_BRANCH);
-  for (const [k, name] of ours) {
-    if (!theirs.has(k)) offering.add(name.replace(/\.(svg|py|png|jpe?g|gif)$/i, ''));
-  }
-  const title = prTitle(offering);
-
-  let pr = await openPr();
-  if (!pr) {
-    // Body stays empty on purpose. The diff says what this is, and upstream's
-    // own commits do not pad.
-    pr = await gh(`/repos/${config.CATBENCH_UPSTREAM}/pulls`, {
-      method: 'POST',
-      body: {
-        title,
-        body: '',
-        head: `${config.CATBENCH_FORK.split('/')[0]}:${config.CATBENCH_BRANCH}`,
-        base: base.branch,
-      },
-    });
-    log.info(`opened ${pr.html_url} for ${stem}`);
-  } else if (pr.title !== title) {
-    await gh(`/repos/${config.CATBENCH_UPSTREAM}/pulls/${pr.number}`, {
-      method: 'PATCH',
-      body: { title },
-    });
-    log.info(`updated ${pr.html_url}: ${title}`);
+  for (const [k, file] of ours) {
+    if (!theirs.has(k)) offering.add(file.replace(/\.(svg|py|png|jpe?g|gif)$/i, ''));
   }
 
-  return { ok: true, added, stem, url: pr.html_url, pending: offering.size };
+  log.info(`staged ${stem} on ${config.CATBENCH_FORK}#${config.CATBENCH_BRANCH} ` +
+    `(${offering.size} waiting)`);
+  return {
+    ok: true, added, stem, pending: offering.size, url: compareUrl(base.branch),
+  };
 }
 
 /** What the branch is offering right now, for a status line. */
@@ -259,6 +232,5 @@ export async function pending() {
   for (const [k, name] of ours) {
     if (!theirs.has(k)) stems.add(name.replace(/\.(svg|py|png|jpe?g|gif)$/i, ''));
   }
-  const pr = await openPr();
-  return { stems: [...stems].sort(), url: pr?.html_url || '' };
+  return { stems: [...stems].sort(), url: compareUrl(base.branch) };
 }

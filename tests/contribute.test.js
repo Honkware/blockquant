@@ -11,7 +11,7 @@ process.env.CATBENCH_FORK = 'Us/site';
 process.env.CATBENCH_BRANCH = 'catbench';
 process.env.CATBENCH_ASSET_DIR = 'demos/CatBench/assets';
 
-const { contribute, upstreamStem, prTitle, enabled } = await import(
+const { contribute, upstreamStem, compareUrl, enabled } = await import(
   '../src/services/contribute.js'
 );
 
@@ -20,7 +20,7 @@ const { contribute, upstreamStem, prTitle, enabled } = await import(
  * test says what the world looks like rather than scripting a call order --
  * the code is free to reorder its reads without rewriting every test.
  */
-function github({ theirs = [], ours = null, pr = null } = {}) {
+function github({ theirs = [], ours = null } = {}) {
   const calls = [];
   const files = (names) =>
     names.map((n) => ({ type: 'file', name: n, sha: `sha-${n}` }));
@@ -54,11 +54,11 @@ function github({ theirs = [], ours = null, pr = null } = {}) {
         : json({ message: 'Not Found' }, 404);
     }
     if (path.startsWith('/repos/Us/site/contents/') && method === 'PUT') return json({});
-    if (path.startsWith('/repos/Kate/site/pulls?')) return json(pr ? [pr] : []);
-    if (path === '/repos/Kate/site/pulls' && method === 'POST') {
-      return json({ number: 1, html_url: 'https://gh/pr/1', title: opts.body && JSON.parse(opts.body).title });
-    }
-    if (/\/repos\/Kate\/site\/pulls\/\d+$/.test(path) && method === 'PATCH') return json({});
+    // Deliberately still answered, as a trap. If the code ever goes back to
+    // opening pull requests these routes succeed quietly rather than throwing
+    // "unstubbed", so the assertion below is what catches it -- and it names
+    // the actual problem instead of a missing stub.
+    if (path.includes('/pulls')) return json([]);
     throw new Error(`unstubbed ${method} ${path}`);
   });
   return { handler, calls };
@@ -98,18 +98,16 @@ describe('the name upstream carries', () => {
   });
 });
 
-describe('the pull request title', () => {
-  it('names one model plainly', () => {
-    expect(prTitle(['GLM-5.2'])).toBe('Add GLM-5.2');
+describe('the compare link', () => {
+  it('points a human at the pull request they open themselves', () => {
+    // The bot deliberately stops at the push, so this URL is the handoff.
+    expect(compareUrl('main')).toBe(
+      'https://github.com/Kate/site/compare/main...Us:catbench?expand=1'
+    );
   });
 
-  it('joins a short batch', () => {
-    expect(prTitle(['B', 'A'])).toBe('Add A and B');
-  });
-
-  it('counts instead of listing once the names get long', () => {
-    const long = ['a', 'b', 'c', 'd'].map((c) => c.repeat(40));
-    expect(prTitle(long)).toMatch(/and 3 more to CatBench$/);
+  it('uses upstream\'s real default branch, not an assumed main', () => {
+    expect(compareUrl('gh-pages')).toContain('/compare/gh-pages...Us:catbench');
   });
 });
 
@@ -173,36 +171,30 @@ describe('contributing a run', () => {
     expect(mk.body).toEqual({ ref: 'refs/heads/catbench', sha: 'base1' });
   });
 
-  it('opens a pull request with an empty body', async () => {
+  it('never touches upstream beyond reading it', async () => {
     const { handler, calls } = github();
     globalThis.fetch = handler;
-    const res = await contribute('org/Kit', GOOD);
-    const open = calls.find((c) => c.path === '/repos/Kate/site/pulls' && c.method === 'POST');
-    expect(open.body).toMatchObject({ title: 'Add Kit', body: '', base: 'main', head: 'Us:catbench' });
-    expect(res.url).toBe('https://gh/pr/1');
+    await contribute('org/Kit', GOOD);
+    const writes = calls.filter((c) => c.method !== 'GET');
+    expect(writes.length).toBeGreaterThan(0);
+    // Every write lands on our own fork. That is what keeps the token small.
+    for (const c of writes) expect(c.path).toContain('/repos/Us/site');
+    expect(calls.some((c) => c.path.includes('/pulls'))).toBe(false);
   });
 
-  it('adds to the open pull request instead of opening a second one', async () => {
-    const { handler, calls } = github({
-      ours: ['Old.svg', 'Old.py'],
-      pr: { number: 7, html_url: 'https://gh/pr/7', title: 'Add Old' },
-    });
+  it('hands back the compare link so a person can open the PR', async () => {
+    const { handler } = github();
+    globalThis.fetch = handler;
+    const res = await contribute('org/Kit', GOOD);
+    expect(res.url).toBe('https://github.com/Kate/site/compare/main...Us:catbench?expand=1');
+  });
+
+  it('adds to the same branch rather than starting a new one', async () => {
+    const { handler, calls } = github({ ours: ['Old.svg', 'Old.py'] });
     globalThis.fetch = handler;
     const res = await contribute('org/New', GOOD);
-    expect(calls.some((c) => c.path === '/repos/Kate/site/pulls' && c.method === 'POST')).toBe(false);
-    const retitle = calls.find((c) => c.method === 'PATCH');
-    expect(retitle.body.title).toBe('Add New and Old');
-    expect(res).toMatchObject({ url: 'https://gh/pr/7', pending: 2 });
-  });
-
-  it('leaves the title alone when the batch has not changed', async () => {
-    const { handler, calls } = github({
-      ours: ['Kit.svg', 'Kit.py'],
-      pr: { number: 7, html_url: 'https://gh/pr/7', title: 'Add Kit' },
-    });
-    globalThis.fetch = handler;
-    await contribute('org/Kit', GOOD);
-    expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
+    expect(calls.some((c) => c.path === '/repos/Us/site/git/refs')).toBe(false);
+    expect(res.pending).toBe(2);
   });
 
   it('reports a GitHub failure instead of claiming a contribution', async () => {

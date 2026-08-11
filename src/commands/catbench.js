@@ -174,8 +174,8 @@ async function announce(interaction, modelId, sources) {
     ? `📮 Not contributed: ${truncate(res.why, 160)}`
     : res.skipped
       ? `📮 \`${res.stem}\` is already in the gallery, nothing to send.`
-      : `📮 ${res.added ? 'Staged' : 'Already staged'} \`${res.stem}\` · ` +
-        `${res.pending} waiting on ${res.url}`;
+      : `📮 ${res.added ? 'Pushed' : 'Already on the branch'} \`${res.stem}\` · ` +
+        `${res.pending} waiting · open the PR when you want: <${res.url}>`;
   log.info(`contribute ${modelId}: ${line}`);
   await interaction.followUp({ content: line }).catch(async () => {
     const ch = interaction.channel

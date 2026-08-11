@@ -138,12 +138,14 @@ const config = Object.freeze({
   CATBENCH_DATASET: process.env.CATBENCH_DATASET || '',
 
   // Contributing runs back to Katehuuh's gallery. Off until GITHUB_TOKEN and
-  // CATBENCH_FORK are both set, because between them they are write access to
-  // a repo that is not ours and a pull request with our name on it.
+  // CATBENCH_FORK are both set.
   //
-  // Contributions batch onto one branch rather than opening a PR per bench:
-  // the maintainer gets one thread to review, not a stream of them, and a
-  // model added while a PR is open just updates it.
+  // The bot pushes to the fork and stops there; a person opens the pull
+  // request. That keeps the token down to write access on a repo we own,
+  // instead of something that can file a PR against a repo we do not.
+  //
+  // Contributions batch onto one branch rather than one per bench, so the
+  // maintainer reads one diff.
   GITHUB_TOKEN: process.env.GITHUB_TOKEN || '',
   CATBENCH_UPSTREAM: process.env.CATBENCH_UPSTREAM || 'Katehuuh/Katehuuh.github.io',
   CATBENCH_FORK: process.env.CATBENCH_FORK || '',
