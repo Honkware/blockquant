@@ -78,30 +78,102 @@ def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float
     )
 
 
-def _qwen2vl_preprocessor_shim(model_dir: Path) -> bool:
-    """Drop a Qwen2VL preprocessor stub if missing — required by some VL
-    builds even when we're only using the LM, otherwise convert.py barfs
-    when it tries to read the processor config.
+_CLIP_MEAN_STD = ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+_HALF_MEAN_STD = ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 
-    Returns True when it wrote one. The caller must keep it out of the published
-    artifact: these sizes are placeholders that only need to satisfy the reader
-    during conversion, and a vision loader that believes them computes a zero
-    grid ("height and width must be > 0"). We shipped this stub on the Qwopus
-    quants and broke image input for everyone who downloaded them.
+# What each vision family's own preprocessor_config.json says, keyed by the
+# vision_config->model_type prefix. The pixel budgets are upstream's, restated
+# as merged-token counts (pixels / (patch * merge)^2) so they hold for a model
+# whose patch size differs: Qwen2-VL ships 3136/12845056 at factor 28,
+# Qwen3-VL 65536/16777216 at factor 32, GLM-4V 12544/9633792 at factor 28.
+# (processor_type, mean/std, min_tokens, max_tokens)
+_VL_PREP_FAMILIES = (
+    ("qwen3_5", ("Qwen2VLImageProcessorFast", _HALF_MEAN_STD, 64, 16384)),
+    ("qwen3_vl", ("Qwen2VLImageProcessorFast", _HALF_MEAN_STD, 64, 16384)),
+    ("glm4v", ("Glm4vImageProcessor", _CLIP_MEAN_STD, 16, 12288)),
+    ("qwen2", ("Qwen2VLImageProcessorFast", _CLIP_MEAN_STD, 4, 16384)),
+)
+_VL_PREP_FALLBACK = _VL_PREP_FAMILIES[-1][1]
+
+
+def _vision_preprocessor_config(model_dir: Path) -> None:
+    """Give a VL source dir the preprocessor_config.json exllamav3 requires.
+
+    A config.json with a vision_config makes exllamav3 open the file
+    unconditionally -- there is no language-model-only path anywhere in it --
+    so a merge that dropped the file is unloadable, FileNotFoundError before
+    the first shard. convert.py copies every non-tensor file into the output,
+    so whatever is here is what the published quant ships.
+
+    It has to be *right*, not merely present. The 56px stub we used to write
+    loaded fine and then broke every image: size->shortest/longest_edge are
+    read as min/max_pixels, total pixel counts rather than edge lengths, and a
+    56-pixel ceiling floors smart_resize to a zero-size grid ("height and width
+    must be > 0"). Prefer the model's own numbers out of processor_config.json,
+    which HF-style VL repos carry alongside; otherwise derive them from
+    vision_config.
     """
     prep = model_dir / "preprocessor_config.json"
     if prep.exists():
-        return False
+        return
+    try:
+        cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return
+    vis = cfg.get("vision_config")
+    if not isinstance(vis, dict):
+        return
+
+    own = _image_processor_block(model_dir)
+    if own:
+        prep.write_text(json.dumps(own, indent=2))
+        print("[preprocess] wrote preprocessor_config.json from the model's own "
+              "processor_config.json", flush=True)
+        return
+
+    model_type = str(vis.get("model_type") or cfg.get("model_type") or "")
+    proc_type, (mean, std), min_tok, max_tok = next(
+        (v for k, v in _VL_PREP_FAMILIES if model_type.startswith(k)), _VL_PREP_FALLBACK
+    )
+    patch = int(vis.get("patch_size", 14))
+    merge = int(vis.get("spatial_merge_size", 2))
+    factor = patch * merge
     prep.write_text(json.dumps({
-        "size": {"shortest_edge": 56, "longest_edge": 56},
-        "patch_size": 14,
-        "temporal_patch_size": 2,
-        "merge_size": 2,
-        "image_mean": [0.48145466, 0.4578275, 0.40821073],
-        "image_std": [0.26862954, 0.26130258, 0.27577711],
-        "image_processor_type": "Qwen2VLImageProcessorFast",
-    }))
-    return True
+        # Pixel counts, not edge lengths. exllamav3 reads them as min/max_pixels.
+        "size": {"shortest_edge": min_tok * factor ** 2,
+                 "longest_edge": max_tok * factor ** 2},
+        "patch_size": patch,
+        "temporal_patch_size": int(vis.get("temporal_patch_size", 2)),
+        "merge_size": merge,
+        "image_mean": mean,
+        "image_std": std,
+        "image_processor_type": proc_type,
+    }, indent=2))
+    print(f"[preprocess] no preprocessor_config.json; derived one for {model_type or 'vl'} "
+          f"(patch {patch}, merge {merge})", flush=True)
+
+
+def _image_processor_block(model_dir: Path) -> dict | None:
+    """The image_processor half of a processor_config.json, if it is complete.
+
+    exllamav3 only looks in processor_config.json for Mistral3; every other
+    arch wants the split-out file, so hoist the block across when we have it.
+    """
+    try:
+        blk = json.loads((model_dir / "processor_config.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    blk = blk.get("image_processor")
+    if not isinstance(blk, dict):
+        return None
+    need = ("size", "patch_size", "temporal_patch_size", "merge_size",
+            "image_mean", "image_std", "image_processor_type")
+    if not all(k in blk for k in need):
+        return None
+    size = blk["size"]
+    if not (isinstance(size, dict) and "shortest_edge" in size and "longest_edge" in size):
+        return None
+    return blk
 
 
 def _ensure_fast_tokenizer(model_dir: Path) -> None:
@@ -785,7 +857,7 @@ def main() -> int:
 
         _sanitize_config(model_dir)
         _disable_missing_mtp(model_dir)
-        shimmed_prep = _qwen2vl_preprocessor_shim(model_dir)
+        _vision_preprocessor_config(model_dir)
         _ensure_fast_tokenizer(model_dir)
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
@@ -956,11 +1028,6 @@ def main() -> int:
                 _q_done.set()
                 _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
-            if shimmed_prep:
-                # Our placeholder, not the model's. Shipping it breaks vision.
-                (out_dir / "preprocessor_config.json").unlink(missing_ok=True)
-                print("[quantize] dropped the placeholder preprocessor_config.json",
-                      flush=True)
             rec = {"variant": variant, "path": str(out_dir)}
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
