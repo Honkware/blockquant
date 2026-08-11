@@ -78,14 +78,20 @@ def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float
     )
 
 
-def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
+def _qwen2vl_preprocessor_shim(model_dir: Path) -> bool:
     """Drop a Qwen2VL preprocessor stub if missing — required by some VL
     builds even when we're only using the LM, otherwise convert.py barfs
     when it tries to read the processor config.
+
+    Returns True when it wrote one. The caller must keep it out of the published
+    artifact: these sizes are placeholders that only need to satisfy the reader
+    during conversion, and a vision loader that believes them computes a zero
+    grid ("height and width must be > 0"). We shipped this stub on the Qwopus
+    quants and broke image input for everyone who downloaded them.
     """
     prep = model_dir / "preprocessor_config.json"
     if prep.exists():
-        return
+        return False
     prep.write_text(json.dumps({
         "size": {"shortest_edge": 56, "longest_edge": 56},
         "patch_size": 14,
@@ -95,6 +101,7 @@ def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
         "image_std": [0.26862954, 0.26130258, 0.27577711],
         "image_processor_type": "Qwen2VLImageProcessorFast",
     }))
+    return True
 
 
 def _ensure_fast_tokenizer(model_dir: Path) -> None:
@@ -778,7 +785,7 @@ def main() -> int:
 
         _sanitize_config(model_dir)
         _disable_missing_mtp(model_dir)
-        _qwen2vl_preprocessor_shim(model_dir)
+        shimmed_prep = _qwen2vl_preprocessor_shim(model_dir)
         _ensure_fast_tokenizer(model_dir)
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
@@ -949,6 +956,11 @@ def main() -> int:
                 _q_done.set()
                 _qt.join(timeout=2)
             print(f"[quantize] {variant} complete", flush=True)
+            if shimmed_prep:
+                # Our placeholder, not the model's. Shipping it breaks vision.
+                (out_dir / "preprocessor_config.json").unlink(missing_ok=True)
+                print("[quantize] dropped the placeholder preprocessor_config.json",
+                      flush=True)
             rec = {"variant": variant, "path": str(out_dir)}
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
