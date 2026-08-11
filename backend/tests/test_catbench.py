@@ -5,6 +5,7 @@ size_check lives in scripts/run_catbench_job.py, which pulls the provider stack
 at import time, so it is AST-loaded the way test_drain_failure does it.
 """
 import ast
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -229,6 +230,15 @@ def test_an_empty_run_says_whether_it_reasoned_or_answered():
 
 # ── The sandbox. This is the part that runs model-written code. ─────────────
 
+# Everything below draws something, so it needs matplotlib. Pods install it;
+# neither the VPS nor a dev box has to. Skipped rather than left failing --
+# test_upstream_treats_a_crash_after_drawing_as_fatal expects exit 1, and a
+# missing import exits 1 too, so without this it passes for the wrong reason.
+needs_mpl = pytest.mark.skipif(
+    importlib.util.find_spec("matplotlib") is None,
+    reason="matplotlib is only needed where a kitten is actually drawn",
+)
+
 KITTEN = """
 import matplotlib.pyplot as plt
 fig, ax = plt.subplots(figsize=(3, 3))
@@ -238,12 +248,14 @@ plt.show()
 """
 
 
+@needs_mpl
 def test_sandbox_renders_a_figure():
     png, err = cb.run_untrusted_python(KITTEN)
     assert png and png[:8] == b"\x89PNG\r\n\x1a\n"
     assert err is None
 
 
+@needs_mpl
 def test_sandbox_saves_a_figure_the_script_never_showed():
     png, _ = cb.run_untrusted_python(
         "import matplotlib.pyplot as plt\nfig, ax = plt.subplots()\nax.plot([1, 2, 3])\n"
@@ -251,6 +263,7 @@ def test_sandbox_saves_a_figure_the_script_never_showed():
     assert png and png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+@needs_mpl
 def test_sandbox_blocks_the_network():
     png, err = cb.run_untrusted_python(
         "import socket\nsocket.create_connection(('1.1.1.1', 80), 3)\n"
@@ -259,6 +272,7 @@ def test_sandbox_blocks_the_network():
     assert "network disabled" in err
 
 
+@needs_mpl
 def test_sandbox_kills_a_script_that_never_ends(monkeypatch):
     monkeypatch.setattr(cb, "SBX_CPU_S", 3)
     monkeypatch.setattr(cb, "SBX_TIMEOUT_S", 15)
@@ -267,6 +281,7 @@ def test_sandbox_kills_a_script_that_never_ends(monkeypatch):
     assert err
 
 
+@needs_mpl
 def test_sandbox_hands_the_child_no_secrets(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_do_not_leak")
     monkeypatch.setenv("RUNPOD_API_KEY", "rp_do_not_leak")
@@ -280,6 +295,7 @@ def test_sandbox_hands_the_child_no_secrets(monkeypatch):
     assert png, err
 
 
+@needs_mpl
 def test_sandbox_survives_a_script_that_crashes_after_drawing():
     png, err = cb.run_untrusted_python(
         "import matplotlib.pyplot as plt\n"
@@ -322,11 +338,13 @@ def _run_tail(tmp_path, tail, code, out_name="figure.jpg"):
     return blob, proc.returncode
 
 
+@needs_mpl
 def test_upstream_renders_an_ordinary_kitten(tmp_path):
     blob, rc = _run_tail(tmp_path, cb._TAIL_UPSTREAM, KITTEN)
     assert rc == 0 and blob
 
 
+@needs_mpl
 def test_upstream_gets_nothing_from_a_script_that_wrote_its_own_file(tmp_path):
     """Our tail falls back to an image the script wrote; theirs does not.
 
@@ -346,6 +364,7 @@ def test_upstream_gets_nothing_from_a_script_that_wrote_its_own_file(tmp_path):
     assert ours
 
 
+@needs_mpl
 def test_upstream_treats_a_crash_after_drawing_as_fatal(tmp_path):
     """We keep the picture and report the crash; upstream returns 1 and saves
     nothing, so a partial run is contributable here and broken there."""
@@ -358,6 +377,7 @@ def test_upstream_treats_a_crash_after_drawing_as_fatal(tmp_path):
     assert rc == 1 and blob is None
 
 
+@needs_mpl
 def test_upstream_survives_a_script_that_parses_args(tmp_path):
     """Their renderer blanks argv before exec. Ours passes the sandbox's own
     argv through, so a script calling parse_args() sees three stray paths."""
@@ -372,6 +392,7 @@ def test_upstream_survives_a_script_that_parses_args(tmp_path):
     assert rc == 0 and blob
 
 
+@needs_mpl
 def test_a_blank_trailing_figure_is_caught(tmp_path):
     """Upstream saves the CURRENT figure, not the one with the kitten in it.
 
