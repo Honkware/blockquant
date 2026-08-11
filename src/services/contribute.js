@@ -22,7 +22,24 @@ const API = 'https://api.github.com';
 
 /** Is contributing configured at all? */
 export function enabled() {
-  return Boolean(config.GITHUB_TOKEN && config.CATBENCH_FORK && config.CATBENCH_UPSTREAM);
+  return !whyDisabled();
+}
+
+/**
+ * What is actually missing, or '' when nothing is.
+ *
+ * Names only the settings that are empty. Listing every requirement -- when
+ * one of three is unset -- reads as though none of them are, and sends whoever
+ * hit it looking in the wrong place.
+ */
+export function whyDisabled() {
+  const missing = [
+    ['GITHUB_TOKEN', config.GITHUB_TOKEN],
+    ['CATBENCH_FORK', config.CATBENCH_FORK],
+    ['CATBENCH_UPSTREAM', config.CATBENCH_UPSTREAM],
+  ].filter(([, v]) => !v).map(([k]) => k);
+  if (!missing.length) return '';
+  return `${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} not set`;
 }
 
 /**
@@ -167,7 +184,7 @@ export function compareUrl(base = 'main') {
  */
 export async function contribute(modelId, { svgSource, pythonSource, upstreamRenderOk, name }) {
   if (!enabled()) {
-    return { ok: false, why: 'contributing is not configured (GITHUB_TOKEN and CATBENCH_FORK)' };
+    return { ok: false, why: `contributing is not configured: ${whyDisabled()}` };
   }
   if (!String(svgSource || '').trim() || !String(pythonSource || '').trim()) {
     return { ok: false, why: 'the run has no stored sources to contribute' };

@@ -11,7 +11,7 @@ process.env.CATBENCH_FORK = 'Us/site';
 process.env.CATBENCH_BRANCH = 'catbench';
 process.env.CATBENCH_ASSET_DIR = 'demos/CatBench/assets';
 
-const { contribute, upstreamStem, compareUrl, enabled } = await import(
+const { contribute, upstreamStem, compareUrl, enabled, whyDisabled } = await import(
   '../src/services/contribute.js'
 );
 
@@ -210,5 +210,18 @@ describe('contributing a run', () => {
 describe('configuration', () => {
   it('is on when a token and a fork are both set', () => {
     expect(enabled()).toBe(true);
+    expect(whyDisabled()).toBe('');
+  });
+
+  it('names only what is missing', async () => {
+    // Listing every requirement when one is unset reads as though none are,
+    // and sends whoever hit it looking in the wrong place.
+    const real = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = '';
+    vi.resetModules();
+    const fresh = await import('../src/services/contribute.js?nocache=1');
+    expect(fresh.whyDisabled()).toBe('GITHUB_TOKEN is not set');
+    expect(fresh.whyDisabled()).not.toContain('CATBENCH_FORK');
+    process.env.GITHUB_TOKEN = real;
   });
 });

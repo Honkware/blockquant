@@ -277,7 +277,10 @@ export async function handleCatbench(interaction) {
   }
   if (wantsPr && !upstream.enabled()) {
     return interaction.editReply({
-      content: 'Contributing is not configured on this box (needs GITHUB_TOKEN and CATBENCH_FORK).',
+      content:
+        `Contributing is off on this box: ${upstream.whyDisabled()}. ` +
+        'A token with write access to the fork is all it needs — the bot pushes there ' +
+        'and a person opens the pull request.',
     });
   }
 
