@@ -40,12 +40,15 @@ MODEL_DIR = Path("/quant/cb-model")
 PROMPT_SVG = "Create a detailed SVG image of a cute kitten."
 PROMPT_PY = "Write a Python script that draws a cute kitten using matplotlib."
 
-# SVG needs room to finish the drawing; a truncated one renders as junk.
-MAX_NEW_SVG = 4096
+# SVG needs room to finish the drawing; a truncated one has no </svg> and reads
+# as no answer at all. 4096 was not enough: a 27B asked for a DETAILED kitten
+# spends ~2 characters a token on gradients and tabby stripes and stops with the
+# whiskers left to draw.
+MAX_NEW_SVG = 8192
 MAX_NEW_PY = 2048
 # exllamav3 allocates its cache up front, so it has to cover the longest turn
 # (prompt + template + MAX_NEW_SVG) with room to spare.
-CACHE_TOKENS = 8192
+CACHE_TOKENS = 12288
 
 END_MARKERS = ("<|im_end|>", "<|eot_id|>", "<|end|>", "<end_of_turn>", "<|endoftext|>")
 
