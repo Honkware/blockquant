@@ -103,6 +103,15 @@ RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
 COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
 RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 
+# The corpus the KL metric is measured on, which must NOT be the one above:
+# that is what EXL3 calibrates against, so measuring there is measuring on the
+# training set. Baked rather than downloaded at run time so a paid pod cannot
+# lose a job to a dataset outage.
+COPY docker/fetch_kl_corpus.py /tmp/fetch_kl_corpus.py
+RUN mkdir -p /opt/blockquant \
+    && python /tmp/fetch_kl_corpus.py /opt/blockquant/kl_eval_corpus.utf8 \
+    && rm /tmp/fetch_kl_corpus.py
+
 # ---- Verify the stack at build time ---------------------------------------
 RUN python - <<'PY'
 import sys, torch, importlib.metadata as m

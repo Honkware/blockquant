@@ -220,9 +220,18 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         )
     table = header + "\n" + "\n".join(body)
     if has_kl:
-        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence from the "
-                  "fp16 source over wikitext rows &mdash; lower is closer to the "
-                  "original.</sub>")
+        # State the method, don't describe it from memory. The old footnote said
+        # "wikitext rows"; it was actually exllamav3's calibration corpus, which
+        # is both a different corpus and the one the quantizer trains on.
+        methods = {r.get("kl_method") for r in rows if r.get("kl_div") is not None}
+        methods.discard(None)
+        how = (f" Measured on {methods.pop()}."
+               if len(methods) == 1
+               else " Measurement setup varies across these rows; see each quant's"
+                    " bq_quality.json." if methods else "")
+        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence of this "
+                  "quant from the fp16 source it was made from &mdash; lower is "
+                  f"closer to the original.{how}</sub>")
     return table
 
 

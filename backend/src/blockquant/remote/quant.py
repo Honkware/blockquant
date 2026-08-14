@@ -294,14 +294,58 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
-def _eval_text() -> str:
-    """Eval text for the KL metric: exllamav3's bundled calibration corpus.
+def _chat_format(model_dir: Path, text: str) -> tuple[str, str]:
+    """(text, label) with the model's chat template applied, when it has one.
 
-    Read straight off disk (the image bakes conversion/standard_cal_data/*.utf8),
-    so the eval never depends on a live dataset download.
+    turboderp's published curves are measured on chat-formatted text, and an
+    instruct model puts real probability mass on the control tokens, so raw
+    prose is a different distribution than the one anyone actually runs. Best
+    effort: a model with no template, or a template that will not render, gets
+    the raw text and says so rather than failing the whole measurement.
+    """
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=False)
+        if not getattr(tok, "chat_template", None):
+            return text, "raw (no chat template)"
+        out = tok.apply_chat_template(
+            [{"role": "user", "content": text}], tokenize=False,
+            add_generation_prompt=True,
+        )
+        return (out, "formatted") if out and out.strip() else (text, "raw (template empty)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[kl] WARN chat template not applied: {type(e).__name__}: {e}", flush=True)
+        return text, "raw (template failed)"
+
+
+# Held-out text for the KL metric, baked into the image at build time.
+# Read off disk rather than pulled with load_dataset() so a paid pod can never
+# lose a run to a dataset outage -- the same reason the old corpus was a file.
+KL_CORPUS = Path("/opt/blockquant/kl_eval_corpus.utf8")
+
+
+def _eval_text() -> tuple[str, str]:
+    """(text, source) for the KL metric.
+
+    Held-out text, NOT exllamav3's standard_cal_data. That is the corpus EXL3
+    calibrates the quant against, so measuring KL on it is measuring on the
+    training set: it flatters every quant we publish and is not comparable to
+    turboderp's own numbers, which use openwebtext for exactly this reason.
+
+    Falls back to the calibration corpus on an image built before the eval text
+    was baked, and says so, because a wrong number reported as a right one is
+    worse than a missing one.
     """
     import glob
     import os
+    try:
+        if KL_CORPUS.is_file():
+            text = KL_CORPUS.read_text(encoding="utf-8")
+            if text.strip():
+                return text, "openwebtext (held out)"
+    except Exception as e:
+        print(f"[kl] WARN eval corpus unreadable: {type(e).__name__}: {e}", flush=True)
+
     import exllamav3
     base = os.path.join(os.path.dirname(exllamav3.__file__),
                         "conversion", "standard_cal_data")
@@ -312,12 +356,26 @@ def _eval_text() -> str:
                 parts.append(f.read())
         except Exception:
             pass
-    return "\n\n".join(parts)
+    if parts:
+        print("[kl] WARN no baked eval corpus; falling back to the CALIBRATION "
+              "data, which understates KL. Rebuild the image.", flush=True)
+    return "\n\n".join(parts), "standard-cal-data (calibration set!)"
 
 
-def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
-                 seq_len: int = 2048) -> float | None:
-    """Mean KL(fp16 || quant) over a few rows of calibration text, for the card.
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
+                 seq_len: int = 8192) -> tuple[float | None, str]:
+    """Mean KL(fp16 || quant) over held-out text. Returns (kl, method).
+
+    8 x 8192 over openwebtext, chat-formatted, matching the setup behind
+    turboderp's published EXL3 curves so a number on our card can be read
+    against his chart. The maths already agreed -- his compute_kl_div is
+    F.kl_div(log_softmax(input), softmax(target)).sum(-1), which is the same
+    quantity computed below -- so the corpus and the chunking were the whole
+    difference.
+
+    `method` travels with the number. Two incompatible measurement series
+    silently sharing a field name is the bug this change exists to fix, so the
+    fix must not create a second one.
 
     Loads ONE model at a time (fp16, then quant) via the high-level Model API
     that the smoke-test path already proved works, forwards each row to get
@@ -335,14 +393,16 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
         from exllamav3 import Config, Model, Cache, Tokenizer
     except Exception as e:
         print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
 
     # Tokenize the eval text once, with the quant's tokenizer, into fixed rows.
     try:
-        text = _eval_text()
+        text, corpus = _eval_text()
         if not text:
             print("[kl] WARN no bundled eval text found", flush=True)
-            return None
+            return None, ""
+        text, fmt = _chat_format(quant_dir, text)
+        method = f"{corpus} | {rows}x{seq_len} | {fmt}"
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
         all_ids = tokenizer.encode(text)
@@ -352,10 +412,10 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
                 for a in range(0, n - seq_len, seq_len)][:rows]
         if not seqs:
             print("[kl] WARN not enough eval tokens", flush=True)
-            return None
+            return None, ""
     except Exception as e:
         print(f"[kl] WARN tokenize failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
 
     def _forward_rows(model_dir, on_row) -> None:
         """Load model_dir, forward each seq, call on_row(i, logits_2d), unload."""
@@ -398,10 +458,13 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
             kls.append(kl)
 
         _forward_rows(quant_dir, _cmp)
-        return (sum(kls) / len(kls)) if kls else None
+        if not kls:
+            return None, ""
+        print(f"[kl] {sum(kls) / len(kls):.5f} over {method}", flush=True)
+        return sum(kls) / len(kls), method
     except Exception as e:
         print(f"[kl] WARN eval failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
@@ -571,6 +634,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         "size_gb": o.get("_size_gb"),
         "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
         "kl_div": o.get("kl_div"),
+        "kl_method": o.get("kl_method"),
     } for o in outputs]
 
     license_id = cards.fetch_license(model_id, hf_token or None)
@@ -625,6 +689,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     for o in outputs:
         repo = f"{owner}/{model_name}-exl3-{o['variant']}bpw"
         table[o["variant"]] = {"repo": repo, "kl": o.get("kl_div"),
+                               "kl_method": o.get("kl_method"),
                                "size_gb": o.get("_size_gb"), "codebook": codebook}
 
     try:
@@ -679,7 +744,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                                 "tokenizer*"],
             )
             print(f"[backfill] {v} measuring KL vs fp16 ...", flush=True)
-            kl = _kl_div_eval(bdir, model_dir, rows=kl_rows)
+            kl, _kl_method = _kl_div_eval(bdir, model_dir, rows=kl_rows)
         except Exception as e:
             print(f"[backfill] {v} eval failed: {type(e).__name__}: {e}", flush=True)
         finally:
@@ -689,7 +754,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             try:
                 api.upload_file(
                     path_or_fileobj=json.dumps(
-                        {"kl_div": kl, "kl_rows": kl_rows,
+                        {"kl_div": kl, "kl_rows": kl_rows, "kl_method": _kl_method,
                          "metric": "KL(fp16||quant)"}).encode(),
                     path_in_repo="bq_quality.json", repo_id=repo,
                 )
@@ -710,7 +775,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     quant_rows = [{
         "variant": v, "head_bits": head_bits, "cal_rows": rows_cal,
         "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
-        "kl_div": d["kl"],
+        "kl_div": d["kl"], "kl_method": d.get("kl_method"),
     } for v, d in table.items()]
     for v, d in sorted(table.items(), key=lambda x: float(x[0])):
         try:
@@ -905,6 +970,7 @@ def main() -> int:
                     q = json.loads((out_dir / "bq_quality.json").read_text())
                     if q.get("kl_div") is not None:
                         rec["kl_div"] = float(q["kl_div"])
+                        rec["kl_method"] = q.get("kl_method")
                 except Exception:
                     pass
                 _publish(variant, out_dir, work_dir, rec)
@@ -1031,15 +1097,20 @@ def main() -> int:
             rec = {"variant": variant, "path": str(out_dir)}
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
-                kl = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                kl, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
                 if kl is not None:
                     rec["kl_div"] = kl
+                    rec["kl_method"] = kl_method
                     print(f"[kl] {variant} KL(fp16||quant) = {kl:.6f}", flush=True)
                     # Persist next to the weights so a later card re-render
                     # (publish_quant) and retroactive backfill can read it back.
+                    # The method goes with it: a number measured on held-out
+                    # text and one measured on the calibration set are not the
+                    # same metric and must not share a field unlabelled.
                     try:
                         (out_dir / "bq_quality.json").write_text(
                             json.dumps({"kl_div": kl, "kl_rows": kl_rows,
+                                        "kl_method": kl_method,
                                         "metric": "KL(fp16||quant)"}),
                             encoding="utf-8")
                     except Exception:
