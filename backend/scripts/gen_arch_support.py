@@ -23,12 +23,11 @@ from pathlib import Path
 
 # The ref the image is built at (docker/Dockerfile.runpod EXLLAMAV3_REF). Bump
 # both together, behind an end-to-end validation pass.
-IMAGE_REF = "6884772a157074a24a712956756a8abe70c0b3be"
+IMAGE_REF = "5f3c537ca9d89893d771256f5c43c93656553fbb"
 
-# What --check measures the committed file against. dev, not master: the image
-# is pinned to a dev commit, so master is behind us and comparing against it
-# would report "up to date" while dev grows architectures we do not list.
-UPSTREAM_REF = "origin/dev"
+# What --check measures the committed file against: the branch releases are cut
+# from, matching what the image pins to.
+UPSTREAM_REF = "origin/master"
 
 
 def _arch_strings(exl_dir: Path, ref: str) -> set[str]:

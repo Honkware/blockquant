@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.4.1 covers all 58 registered
+# One image for every architecture. exllamav3 1.4.2 covers all 60 registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake. The old three-image split (stable 0.0.38 +
@@ -14,7 +14,7 @@
 # -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
 # ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
 #
-# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.1 ships
+# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.2 ships
 # Triton attention kernels that lead the dispatch order and handle sliding
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
@@ -77,16 +77,12 @@ RUN python -m pip install \
 # ext JIT-builds on the pod's first boot (GPU + ninja present).
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.4.1.
+# providers/runpod/provider.py); this ref reports 1.4.2.
 #
-# This is a `dev` commit, not a release. Releases lag the architectures they
-# support by days -- MuseGlimmer landed on dev before turboderp had published
-# the quant, and 1.4.1 cannot load it -- and quantizing a model nobody can
-# quantize yet is most of the point of this bot. Pinned to the exact commit,
-# never to the branch name, so a rebuild is reproducible. Rolling back is one
-# RUNPOD_IMAGE env change and a restart; the previous release image is
-# sha-83f22ed70eb7be1d5f39d45ce18bdb5d0d86f13b (exllamav3 4f8ad01, v1.4.1).
-ARG EXLLAMAV3_REF=6884772a157074a24a712956756a8abe70c0b3be
+# v1.4.2. We briefly tracked a dev commit to get MuseGlimmer, which 1.4.1 could
+# not load; 1.4.2 released it two days later, so this is back on a tag. Pinned
+# to the tag's commit rather than the tag name, since a tag can be moved.
+ARG EXLLAMAV3_REF=5f3c537ca9d89893d771256f5c43c93656553fbb
 RUN EXLLAMA_NOCOMPILE=1 python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
