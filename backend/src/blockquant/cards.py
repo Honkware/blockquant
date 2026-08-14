@@ -218,19 +218,10 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
             f"| {bpw_cell} | {row.get('head_bits', 8)} | "
             f"{row.get('cal_rows', 250)} | {size_str} |{kl_cell} {status} |"
         )
-    table = header + "\n" + "\n".join(body)
-    if has_kl:
-        # State the method, don't describe it from memory. The old footnote said
-        # "wikitext rows"; it was actually exllamav3's calibration corpus, which
-        # is both a different corpus and the one the quantizer trains on.
-        methods = {r.get("kl_method") for r in rows if r.get("kl_div") is not None}
-        methods.discard(None)
-        on = (methods.pop() if len(methods) == 1
-              else "mixed setups, see bq_quality.json" if methods else "")
-        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence from the "
-                  f"fp16 source{', ' + on if on else ''} &mdash; lower is closer to "
-                  "the original.</sub>")
-    return table
+    # No footnote: the column speaks for itself. How the number was measured
+    # lives in each quant's bq_quality.json (kl_method), which is where a reader
+    # who cares about the corpus should be looking anyway.
+    return header + "\n" + "\n".join(body)
 
 
 def _render(template: str, ctx: dict) -> str:

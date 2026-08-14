@@ -128,22 +128,25 @@ def _rows(method):
              "url": "https://x", "kl_div": 0.014, "kl_method": method}]
 
 
-def test_the_card_names_the_corpus_the_number_came_from(cards):
-    table = cards.build_quants_table(_rows("openwebtext · 8×8192 · formatted"), "5.0")
-    assert "openwebtext · 8×8192 · formatted" in table
-    # The old footnote claimed wikitext, which was never what it measured.
+def test_the_table_carries_the_kl_column_and_no_footnote(cards):
+    """The card stays a table. The method is recorded in bq_quality.json, not
+    explained under it."""
+    table = cards.build_quants_table(_rows("openwebtext \u00b7 8\u00d78192 \u00b7 formatted"), "5.0")
+    assert "0.0140" in table
+    assert "<sub>" not in table
+    assert "openwebtext" not in table
+    # The old footnote claimed these were wikitext rows. They never were, and
+    # now nothing on the card claims anything about the corpus.
     assert "wikitext" not in table.lower()
-
-
-def test_mixed_methods_are_flagged_rather_than_averaged_over(cards):
-    rows = _rows("openwebtext · 8×8192 · formatted")
-    rows.append({**rows[0], "variant": "4.0",
-                 "kl_method": "the calibration set (stale image)"})
-    table = cards.build_quants_table(rows, "5.0")
-    assert "mixed setups" in table.lower()
 
 
 def test_an_old_row_with_no_method_still_renders(cards):
     """Quants published before the field existed must not break a re-render."""
-    table = cards.build_quants_table(_rows(None), "5.0")
-    assert "0.0140" in table
+    assert "0.0140" in cards.build_quants_table(_rows(None), "5.0")
+
+
+def test_a_run_with_no_kl_at_all_drops_the_column(cards):
+    rows = _rows(None)
+    rows[0].pop("kl_div")
+    table = cards.build_quants_table(rows, "5.0")
+    assert "KL" not in table
