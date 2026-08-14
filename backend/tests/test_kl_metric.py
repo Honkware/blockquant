@@ -46,7 +46,7 @@ def test_the_baked_corpus_is_used_when_present(kl, tmp_path):
     kl["KL_CORPUS"] = corpus
     text, source = kl["_eval_text"]()
     assert "held out" in text
-    assert source == "openwebtext (held out)"
+    assert source == "openwebtext"
 
 
 @pytest.fixture
@@ -129,18 +129,18 @@ def _rows(method):
 
 
 def test_the_card_names_the_corpus_the_number_came_from(cards):
-    table = cards.build_quants_table(_rows("openwebtext (held out) | 8x8192 | formatted"), "5.0")
-    assert "openwebtext (held out) | 8x8192 | formatted" in table
+    table = cards.build_quants_table(_rows("openwebtext · 8×8192 · formatted"), "5.0")
+    assert "openwebtext · 8×8192 · formatted" in table
     # The old footnote claimed wikitext, which was never what it measured.
     assert "wikitext" not in table.lower()
 
 
 def test_mixed_methods_are_flagged_rather_than_averaged_over(cards):
-    rows = _rows("openwebtext (held out) | 8x8192 | formatted")
+    rows = _rows("openwebtext · 8×8192 · formatted")
     rows.append({**rows[0], "variant": "4.0",
-                 "kl_method": "standard-cal-data (calibration set!)"})
+                 "kl_method": "the calibration set (stale image)"})
     table = cards.build_quants_table(rows, "5.0")
-    assert "varies" in table.lower()
+    assert "mixed setups" in table.lower()
 
 
 def test_an_old_row_with_no_method_still_renders(cards):

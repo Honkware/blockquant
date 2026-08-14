@@ -342,7 +342,7 @@ def _eval_text() -> tuple[str, str]:
         if KL_CORPUS.is_file():
             text = KL_CORPUS.read_text(encoding="utf-8")
             if text.strip():
-                return text, "openwebtext (held out)"
+                return text, "openwebtext"
     except Exception as e:
         print(f"[kl] WARN eval corpus unreadable: {type(e).__name__}: {e}", flush=True)
 
@@ -359,7 +359,7 @@ def _eval_text() -> tuple[str, str]:
     if parts:
         print("[kl] WARN no baked eval corpus; falling back to the CALIBRATION "
               "data, which understates KL. Rebuild the image.", flush=True)
-    return "\n\n".join(parts), "standard-cal-data (calibration set!)"
+    return "\n\n".join(parts), "the calibration set (stale image)"
 
 
 def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
@@ -402,7 +402,7 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
             print("[kl] WARN no bundled eval text found", flush=True)
             return None, ""
         text, fmt = _chat_format(quant_dir, text)
-        method = f"{corpus} | {rows}x{seq_len} | {fmt}"
+        method = f"{corpus} \u00b7 {rows}\u00d7{seq_len} \u00b7 {fmt}"
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
         all_ids = tokenizer.encode(text)

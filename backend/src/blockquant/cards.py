@@ -225,13 +225,11 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         # is both a different corpus and the one the quantizer trains on.
         methods = {r.get("kl_method") for r in rows if r.get("kl_div") is not None}
         methods.discard(None)
-        how = (f" Measured on {methods.pop()}."
-               if len(methods) == 1
-               else " Measurement setup varies across these rows; see each quant's"
-                    " bq_quality.json." if methods else "")
-        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence of this "
-                  "quant from the fp16 source it was made from &mdash; lower is "
-                  f"closer to the original.{how}</sub>")
+        on = (methods.pop() if len(methods) == 1
+              else "mixed setups, see bq_quality.json" if methods else "")
+        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence from the "
+                  f"fp16 source{', ' + on if on else ''} &mdash; lower is closer to "
+                  "the original.</sub>")
     return table
 
 
