@@ -408,6 +408,63 @@ def test_a_blank_trailing_figure_is_caught(tmp_path):
     assert ours
 
 
+# ── Loading a plain bf16 model ──────────────────────────────────────────────
+# Every bench until now was an EXL3 quant, so the transformers branch had never
+# actually run on the image. Its first outing died on a missing accelerate,
+# 14 minutes and one pod in.
+
+def test_a_missing_accelerate_falls_back_instead_of_failing_the_pod(monkeypatch):
+    """device_map routes through accelerate, which transformers does not
+    require. Losing a paid pod to an optional dependency is not acceptable."""
+    calls = []
+
+    class _Model:
+        def to(self, dev):
+            calls.append(("to", dev))
+            return self
+
+        def eval(self):
+            return self
+
+    def from_pretrained(path, **kw):
+        calls.append(("load", tuple(sorted(k for k in kw if k != "dtype"))))
+        if "device_map" in kw:
+            raise ValueError(
+                "Using a `device_map` ... requires `accelerate`. You can install "
+                "it with `pip install accelerate`")
+        return _Model()
+
+    model = _fake_hf_load(monkeypatch, from_pretrained)
+    assert model is not None
+    # Tried the fast path, fell back, and put the model on the GPU itself.
+    assert calls[0][1] and "device_map" in calls[0][1]
+    assert ("to", "cuda:0") in calls
+
+
+def test_an_unrelated_load_error_is_not_swallowed(monkeypatch):
+    """Only the accelerate case falls back. A real failure must still surface."""
+    def from_pretrained(path, **kw):
+        raise ValueError("Unknown quantization type, got exl3")
+
+    with pytest.raises(ValueError, match="Unknown quantization"):
+        _fake_hf_load(monkeypatch, from_pretrained)
+
+
+def _fake_hf_load(monkeypatch, from_pretrained):
+    """Drive HfRunner.__init__'s loading block with a stubbed transformers."""
+    import types
+    tf = types.ModuleType("transformers")
+    tf.__version__ = "4.57.0"
+    tf.AutoModelForCausalLM = types.SimpleNamespace(from_pretrained=from_pretrained)
+    tf.AutoTokenizer = types.SimpleNamespace(
+        from_pretrained=lambda *a, **k: types.SimpleNamespace(chat_template=None))
+    monkeypatch.setitem(sys.modules, "transformers", tf)
+    monkeypatch.setattr(cb, "_hf_tokenizer", lambda: None)
+    runner = cb.HFRunner.__new__(cb.HFRunner)
+    cb.HFRunner.__init__(runner)
+    return runner.model
+
+
 # ── The size cap, before any pod exists ─────────────────────────────────────
 
 def test_size_check_passes_a_small_model(size_check):

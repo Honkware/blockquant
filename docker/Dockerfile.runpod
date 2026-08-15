@@ -53,6 +53,7 @@ RUN python -m pip install \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
         "transformers>=4.45.0,<5" \
+        "accelerate>=0.34" \
         "tokenizers>=0.21.1" \
         "safetensors>=0.4" \
         "datasets>=2.0" \
