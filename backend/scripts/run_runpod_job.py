@@ -126,12 +126,14 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     have succeeded even though the controller lost contact."""
     try:
         from huggingface_hub import HfApi
+
+        from blockquant import cards
         api = HfApi(token=token or None)
         base = model_id.split("/")[-1]
         org = hf_org or (api.whoami() or {}).get("name", "")
         for v in variants:
             try:
-                info = api.model_info(f"{org}/{base}-exl3-{v}bpw")
+                info = api.model_info(cards.exl3_repo_id(org, base, v))
                 if "config.json" in {s.rfilename for s in (info.siblings or [])}:
                     return True
             except Exception:
@@ -201,10 +203,14 @@ _PREFERRED_GPUS = [
 
 
 def _recommend_max_price(base_gb: float | None) -> float:
-    """Price cap scaled to model size. The quant is compute-bound, so a big
-    model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
-    while a small model is plenty fast on the cheap tier. Tiers by HF download
-    GB (35B ~= 72 GB, 8B ~= 17 GB)."""
+    """Price cap scaled to model size, PER GPU-HOUR. The quant is compute-bound,
+    so a big model finishes ~3x faster on an A100/H100 for roughly the same
+    TOTAL cost, while a small model is plenty fast on the cheap tier. Tiers by
+    HF download GB (35B ~= 72 GB, 8B ~= 17 GB).
+
+    The caller multiplies by the pod's GPU count, since --max-price caps the
+    pod, not the card.
+    """
     if not base_gb:
         return 1.5
     if base_gb <= 20:
@@ -214,6 +220,21 @@ def _recommend_max_price(base_gb: float | None) -> float:
     if base_gb <= 100:
         return 1.80   # ~25-50B: A100 tier (worth it, ~3x faster)
     return 2.80       # 50B+: A100 80GB / H100
+
+
+def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
+    """Resolve --max-price into a ceiling on the POD's $/hr.
+
+    RunPod bills per card, so the cap is compared against the card's rate times
+    gpu_count. 'auto' scales its per-card recommendation by the same count:
+    asking for four cards does not make each one less appropriate for the model,
+    and a cap left at the one-GPU figure would reject every candidate and burn
+    the whole launch sweep. A pinned number is taken at face value -- it already
+    names the pod, so 8 GPUs under --max-price 2 means eight cards at 25c.
+    """
+    if str(max_price).strip().lower() == "auto":
+        return _recommend_max_price(base_gb) * gpu_count
+    return float(max_price)
 
 
 def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
@@ -355,16 +376,26 @@ def main():
         help="Comma-separated GPU types to try if --gpu is out of stock. Ignored when --gpu auto.",
     )
     parser.add_argument(
+        "--gpu-count", type=int, default=1,
+        help="GPUs per pod (default 1). RunPod bills per card, so an N-GPU pod "
+             "burns N x the card's hourly rate -- --max-price caps the POD, and "
+             "is compared against that product. Multi-GPU stock is much thinner "
+             "than single: if none is free the run fails rather than quietly "
+             "renting fewer cards than asked for.",
+    )
+    parser.add_argument(
         "--min-vram", type=int, default=24,
         help="With --gpu auto, only consider cards with at least this many GB of VRAM "
              "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
     )
     parser.add_argument(
         "--max-price", default="auto",
-        help="With --gpu auto, skip any card over this $/hr. 'auto' scales the "
-             "cap to the model size (small models -> cheap cards; a big model -> "
-             "A100/H100 since it's compute-bound and ~3x faster for ~the same "
-             "total cost). A number pins it; 0 disables the cap.",
+        help="Ceiling on the POD's $/hr -- the card's rate times --gpu-count, "
+             "which is what RunPod actually bills. With --gpu auto, any card "
+             "whose pod would cost more is skipped. 'auto' scales the cap to the "
+             "model size (small models -> cheap cards; a big model -> A100/H100 "
+             "since it's compute-bound and ~3x faster for ~the same total cost) "
+             "and then by --gpu-count. A number pins it; 0 disables the cap.",
     )
     parser.add_argument(
         "--container-disk", default="auto",
@@ -479,6 +510,9 @@ def main():
         args.gpu = _PREFERRED_GPUS[0]
         args.gpu_fallback = ",".join(_PREFERRED_GPUS[1:])
 
+    if args.gpu_count < 1:
+        print(f"ERROR: --gpu-count must be at least 1 (got {args.gpu_count})")
+        sys.exit(1)
     if not args.hf_token:
         print("ERROR: HF_TOKEN required (set env var or pass --hf-token)")
         sys.exit(1)
@@ -508,11 +542,11 @@ def main():
     # big models go to a capable card (compute-bound, ~3x faster for ~same total
     # cost), small ones stay cheap. Computed once, reused for both.
     _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
-    if str(args.max_price).strip().lower() == "auto":
-        args.max_price = _recommend_max_price(_base_gb)
-    else:
-        args.max_price = float(args.max_price)
-    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
+    # A ceiling on the POD, not the card: it is compared against
+    # get_cost_per_hour(), which is the card's rate times --gpu-count.
+    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count)
+    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
+          f"({args.gpu_count} GPU), "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
 
     # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
@@ -541,6 +575,7 @@ def main():
             tune_provider = RunPodProvider(
                 api_key=args.runpod_api_key,
                 gpu_type=args.gpu,
+                gpu_count=args.gpu_count,
                 cloud_type=args.cloud,
             )
             rate = tune_provider.get_cost_per_hour()
@@ -550,6 +585,9 @@ def main():
         # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
         # NVL with cal_rows=250 — use that as the baseline.
         baseline_h = 3.7
+        # Not scaled by --gpu-count: the baseline is a single-card measurement
+        # and nobody has timed a multi-GPU convert yet, so the band reads
+        # pessimistic on a multi-GPU pod rather than promising a speedup.
         # If user picked SXM, knock another ~10% off; SECURE adds ~5% more
         # consistency (fewer slowdowns) so net wash with COMMUNITY+SXM.
         gpu_speedup = 0.9 if "HBM3" in args.gpu else 1.0
@@ -559,7 +597,8 @@ def main():
         cost_high = eta_high_h * rate
 
         print()
-        print(f"  GPU:     {args.gpu}   ${rate:.2f}/hr ({args.cloud.lower()})")
+        gpus = f"{args.gpu}{f' x{args.gpu_count}' if args.gpu_count > 1 else ''}"
+        print(f"  GPU:     {gpus}   ${rate:.2f}/hr per pod ({args.cloud.lower()})")
         print(f"  CAL:     {cal_rows} rows × {cal_cols} cols")
         print(f"  BOOK:    {args.codebook} codebook")
         if args.network_volume_id:
@@ -621,12 +660,17 @@ def main():
     ssh = None
     last_err = None
     _price_cache: dict = {}
+    _maxgpu_cache: dict = {}
+    # Only worth printing when it isn't the usual single card; log_dashboard
+    # parses the GPU id out of these lines and " x1" would just ride along.
+    n_tag = f" x{args.gpu_count}" if args.gpu_count > 1 else ""
     sweeps = max(1, args.launch_retries)
     for sweep in range(1, sweeps + 1):
         for candidate, cloud in candidate_pairs:
             attempt = RunPodProvider(
                 api_key=args.runpod_api_key,
                 gpu_type=candidate,
+                gpu_count=args.gpu_count,
                 cloud_type=cloud,
                 container_disk_gb=args.container_disk,
                 volume_gb=args.volume_disk,
@@ -636,9 +680,23 @@ def main():
                 data_center_id=args.data_center_id,
                 name_prefix=run_tag,
             )
-            # Price cap (cached per gpu+cloud so retries stay fast). Skip cards
-            # over --max-price so a stock-out can't push us onto an idle
-            # H100/A100 at several times the cost of a capable cheap card.
+            # Plenty of listed cards are only ever sold one to a pod. RunPod
+            # takes the create anyway and fails it, so without this every sweep
+            # spends a slot per such card. Asked once per card, and only in the
+            # multi-GPU path so single-GPU jobs make no extra API calls.
+            if args.gpu_count > 1:
+                if candidate not in _maxgpu_cache:
+                    _maxgpu_cache[candidate] = attempt.max_gpu_count()
+                per_pod = _maxgpu_cache[candidate]
+                if per_pod is not None and per_pod < args.gpu_count:
+                    print(f"      {candidate} tops out at {per_pod} GPU/pod, "
+                          f"need {args.gpu_count}, skipping", flush=True)
+                    continue
+            # Price cap (cached per gpu+cloud so retries stay fast). The rate is
+            # the POD's -- card rate x --gpu-count -- so the cap means the same
+            # thing whatever the count. Skip cards over --max-price so a
+            # stock-out can't push us onto an idle H100/A100 at several times
+            # the cost of a capable cheap card.
             ckey = (candidate, cloud)
             rate = _price_cache.get(ckey)
             if rate is None:
@@ -648,10 +706,10 @@ def main():
                     rate = 0.0
                 _price_cache[ckey] = rate
             if args.max_price and rate and rate > args.max_price:
-                print(f"      {candidate} ({cloud}) ${rate:.2f}/hr over cap "
+                print(f"      {candidate}{n_tag} ({cloud}) ${rate:.2f}/hr over cap "
                       f"${args.max_price:.2f}, skipping", flush=True)
                 continue
-            print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {cloud})...", flush=True)
+            print(f"[1/6] Trying {candidate}{n_tag}  (~${rate:.2f}/hr {cloud})...", flush=True)
             try:
                 instance_id = attempt.launch({})
             except Exception as e:
@@ -678,7 +736,8 @@ def main():
             # and fall through to the next card. So one bad host can't kill the
             # run while other stock is free, and the launch budget covers dead
             # hosts as well as stock-outs.
-            print(f"      Pod ID: {instance_id}  (GPU: {candidate}, {cloud}, ~${rate:.2f}/hr)", flush=True)
+            print(f"      Pod ID: {instance_id}  (GPU: {candidate}{n_tag}, "
+                  f"{cloud}, ~${rate:.2f}/hr)", flush=True)
             print("[2/6] Waiting for SSH (up to 10 min)...", flush=True)
             try:
                 active = attempt.wait_for_active(instance_id)
@@ -716,6 +775,15 @@ def main():
 
     if provider is None or instance_id is None:
         _terminate_stray_pods(args.runpod_api_key, run_tag)
+        if args.gpu_count > 1:
+            # The count is never reduced to whatever is free. A job asks for N
+            # cards because it needs N, and a pod silently handed one would run
+            # the whole thing on a single GPU (or OOM) while billing as though
+            # nothing was wrong. Fail, say why, let the caller decide.
+            print(f"[joberror] no {args.gpu_count}-GPU pod was free on any candidate card after "
+                  f"{sweeps} sweeps; multi-GPU stock is far thinner than single-GPU. The GPU "
+                  f"count is not reduced automatically -- re-run with a lower --gpu-count to "
+                  f"take what is available.", flush=True)
         print(f"ERROR: all GPU candidates out of stock after {sweeps} sweeps. "
               f"Last error: {last_err}")
         sys.exit(1)

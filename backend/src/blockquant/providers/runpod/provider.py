@@ -30,7 +30,7 @@ from pathlib import Path
 from blockquant.providers.base import Provider
 from blockquant.providers.runpod.constants import BOOTSTRAP_MARKER, REMOTE_LOG, REMOTE_RESULT, REMOTE_SCRIPT
 from blockquant.providers.runpod.deps import _ensure_paramiko, _ensure_runpod
-from blockquant.providers.runpod.pricing import lookup_live_price, static_price
+from blockquant.providers.runpod.pricing import lookup_live_price, lookup_max_gpu_count, static_price
 from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -53,6 +53,7 @@ class RunPodProvider(Provider):
         self,
         api_key: str = "",
         gpu_type: str = "NVIDIA H100 80GB HBM3",
+        gpu_count: int = 1,
         cloud_type: str = "ALL",
         container_disk_gb: int = 150,
         volume_gb: int = 100,
@@ -71,6 +72,12 @@ class RunPodProvider(Provider):
             )
         self.api_key = api_key
         self.gpu_type = gpu_type
+        if int(gpu_count) < 1:
+            raise ValueError(f"gpu_count must be at least 1, got {gpu_count}")
+        # RunPod bills per card, so an N-GPU pod burns N x the card's listed
+        # rate. get_cost_per_hour() reports the pod total for that reason and
+        # everything that compares against a cap uses that number.
+        self.gpu_count = int(gpu_count)
         self.cloud_type = cloud_type
         self.container_disk_gb = container_disk_gb
         self.volume_gb = volume_gb
@@ -182,7 +189,7 @@ class RunPodProvider(Provider):
     def launch(self, config: dict) -> str:
         rp = _ensure_runpod()
         rp.api_key = self.api_key
-        logger.info(f"Creating RunPod pod with GPU: {self.gpu_type}")
+        logger.info(f"Creating RunPod pod with GPU: {self.gpu_type} x{self.gpu_count}")
 
         # Image priority:
         #   1. Explicit override (constructor arg or BLOCKQUANT_RUNPOD_IMAGE env)
@@ -200,6 +207,9 @@ class RunPodProvider(Provider):
             name=f"{self.name_prefix}-{int(time.time())}",
             image_name=image,
             gpu_type_id=self.gpu_type,
+            # Never passed before: the SDK defaults it to 1, which is why
+            # every pod this launcher rented came back single-GPU.
+            gpu_count=self.gpu_count,
             cloud_type=self.cloud_type,
             container_disk_in_gb=self.container_disk_gb,
             volume_in_gb=self.volume_gb,
@@ -996,6 +1006,10 @@ class RunPodProvider(Provider):
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
+            # Carried for the remote side, which does not read it yet:
+            # exllamav3's convert defaults to --devices 0, so the extra cards on
+            # a multi-GPU pod sit idle until quant.py passes this through.
+            "gpu_count": self.gpu_count,
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)
@@ -1148,7 +1162,20 @@ class RunPodProvider(Provider):
         return None
 
     def get_cost_per_hour(self) -> float:
+        """$/hr for the whole pod, i.e. the card's rate times gpu_count. The
+        price lookups are all per-card; handing that figure to a cost estimate
+        or a price cap would understate a multi-GPU pod by exactly gpu_count,
+        which is how you rent an 8x H100 while believing you capped at one."""
         live = self._lookup_live_price()
-        if live is not None:
-            return live
-        return static_price(self.gpu_type)
+        rate = live if live is not None else static_price(self.gpu_type)
+        return rate * self.gpu_count
+
+    def max_gpu_count(self) -> int | None:
+        """How many of self.gpu_type RunPod will put in one pod, or None if the
+        lookup fails (caller should then just try the create)."""
+        rp = _ensure_runpod()
+        try:
+            return lookup_max_gpu_count(rp, self.api_key, self.gpu_type)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"maxGpuCount lookup failed ({e}); letting the create decide")
+            return None

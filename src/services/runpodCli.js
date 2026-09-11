@@ -101,6 +101,7 @@ export function runViaCli({
   codebook = config.CODEBOOK,
   vision = 'auto',
   headBits = null,
+  gpuCount = null,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -140,6 +141,10 @@ export function runViaCli({
     // entirely, so every quant came out at run_runpod_job.py's own default of
     // 8 while the bot recorded whatever the profile table said.
     if (headBits != null) args.push('--head-bits', String(headBits));
+    // GPUs per pod. Omitted means one, which is every quant job today. The CLI
+    // caps the POD price, not the card, so more GPUs raise the bill and the cap
+    // together rather than sneaking past it.
+    if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
     // Unset lets the profile decide, and 'balanced' leaves it to exllamav3
     // (250 rows x 2048 cols). This used to pass 250 unconditionally, which is
     // the same number but pinned it against both.
