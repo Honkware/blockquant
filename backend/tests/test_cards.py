@@ -60,7 +60,8 @@ def test_derive_facts_moe():
     assert facts["is_moe"] is True
     assert "40 layers" in facts["arch_line"]
     assert "256 experts" in facts["arch_line"]
-    assert facts["arch_badge"] == "MoE_35B--A3B"  # shields.io doubles hyphens
+    # The badge names the architecture family; dense/MoE lives in arch_line.
+    assert facts["arch_badge"] == "Qwen3Moe_35B--A3B"  # shields.io doubles hyphens
     assert "mixture-of-experts" in facts["extra_tags"]
     assert "MoE expert batching" in facts["parallel_line"]
 
@@ -72,7 +73,7 @@ def test_derive_facts_dense():
     )
     assert facts["is_moe"] is False
     assert facts["arch_line"] == "Dense &nbsp;·&nbsp; 32 layers"
-    assert facts["arch_badge"] == "Dense_8B"
+    assert facts["arch_badge"] == "Llama_8B"
     assert facts["extra_tags"] == ""
 
 

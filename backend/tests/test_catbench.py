@@ -239,6 +239,13 @@ needs_mpl = pytest.mark.skipif(
     reason="matplotlib is only needed where a kitten is actually drawn",
 )
 
+# HfRunner's loading block imports torch, which the controller venv has no
+# reason to carry -- it is a pod-side dependency.
+needs_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None,
+    reason="torch is only present on the pod image",
+)
+
 KITTEN = """
 import matplotlib.pyplot as plt
 fig, ax = plt.subplots(figsize=(3, 3))
@@ -413,6 +420,7 @@ def test_a_blank_trailing_figure_is_caught(tmp_path):
 # actually run on the image. Its first outing died on a missing accelerate,
 # 14 minutes and one pod in.
 
+@needs_torch
 def test_a_missing_accelerate_falls_back_instead_of_failing_the_pod(monkeypatch):
     """device_map routes through accelerate, which transformers does not
     require. Losing a paid pod to an optional dependency is not acceptable."""
@@ -441,6 +449,7 @@ def test_a_missing_accelerate_falls_back_instead_of_failing_the_pod(monkeypatch)
     assert ("to", "cuda:0") in calls
 
 
+@needs_torch
 def test_an_unrelated_load_error_is_not_swallowed(monkeypatch):
     """Only the accelerate case falls back. A real failure must still surface."""
     def from_pretrained(path, **kw):
