@@ -100,6 +100,7 @@ export function runViaCli({
   testPrompt = null,
   codebook = config.CODEBOOK,
   vision = 'auto',
+  headBits = null,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -136,6 +137,10 @@ export function runViaCli({
       // a genuinely dead pod, so give the stall watchdog a wide 3h window.
       '--stall-timeout', '10800',
     ];
+    // Head bits. Omitted means exllamav3 decides (6). This flag was missing
+    // entirely, so every quant came out at run_runpod_job.py's own default of
+    // 8 while the bot recorded whatever the profile table said.
+    if (headBits != null) args.push('--head-bits', String(headBits));
     if (hfOrg) args.push('--hf-org', hfOrg);
     // Optional pre-baked image (config.RUNPOD_IMAGE). Empty = bootstrap path.
     // The controller health-checks a baked image's ExLlamaV3 version and fails

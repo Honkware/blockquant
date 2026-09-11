@@ -1015,7 +1015,7 @@ class RunPodProvider(Provider):
         variants: list[str],
         hf_token: str = "",
         hf_org: str = "",
-        head_bits: int = 8,
+        head_bits: int | None = None,
         vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,

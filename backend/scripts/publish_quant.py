@@ -72,6 +72,23 @@ def _load_base_config(base_repo: str, token: str) -> dict:
         return {}
 
 
+def _repo_head_bits(repo_id: str, fallback: int | None) -> int | None:
+    """Head bits a published quant was actually made with, from its config.json.
+
+    This ran off a --head-bits CLI default for a long time, which is how every
+    card ended up claiming 8 regardless of the job. exllamav3 records the real
+    number in quantization_config, so read it.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+
+        p = hf_hub_download(repo_id, "config.json", token=os.environ.get("HF_TOKEN") or None)
+        qcfg = json.loads(pathlib.Path(p).read_text(encoding="utf-8")).get("quantization_config") or {}
+        return int(qcfg["head_bits"])
+    except Exception:
+        return fallback
+
+
 def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[dict]:
     """Build the Quants-table rows from which sibling repos exist on HF."""
     rows = []
@@ -86,7 +103,8 @@ def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[d
         except Exception:
             pass  # older quants predate the file; the column just stays empty
         rows.append({
-            "variant": v, "head_bits": head_bits, "cal_rows": cal_rows, "kl_div": kl,
+            "variant": v, "head_bits": _repo_head_bits(repo_id, head_bits),
+            "cal_rows": cal_rows, "kl_div": kl,
             "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
         })
@@ -146,7 +164,9 @@ def main():
                          "add to, or 'off' to skip collections.")
     ap.add_argument("--cal-rows", type=int, default=250,
                     help="Calibration rows shown in the recipe table.")
-    ap.add_argument("--head-bits", type=int, default=8)
+    ap.add_argument("--head-bits", type=int, default=None,
+                    help="Fallback only. Each repo's real head bits come from its own "
+                         "config.json; this covers one that cannot be read.")
     ap.add_argument("--codebook", choices=["mcg", "mul1", "3inst"], default="mul1",
                     help="Codebook shown in the recipe table. Quants made before "
                          "mul1 became the default are mcg.")
@@ -191,12 +211,14 @@ def main():
         sys.exit(1)
     print(f"[publish] finalizing cards for: {', '.join(published)}", flush=True)
 
+    rows_by_variant = {r["variant"]: r for r in quant_rows}
     for v in published:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
         size_gb = _real_size_gb(api, repo_id)
         rendered = cards.render_exl3_card(
             base_repo=args.base, repo_id=repo_id, variant=v,
-            head_bits=args.head_bits, cal_rows=args.cal_rows, size_gb=size_gb,
+            head_bits=rows_by_variant[v]["head_bits"],
+            cal_rows=args.cal_rows, size_gb=size_gb,
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
             quantized_by=hf_org, codebook=args.codebook, title_override=args.title,

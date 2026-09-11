@@ -87,18 +87,16 @@ export async function handleQuant(interaction) {
   // tower whole, so the same request gives a different artifact now. fp16 is
   // the way back.
   const vision = interaction.options.getString('vision') || 'auto';
+  // Omitted means exllamav3 decides (6), the same way `vision: auto` sends
+  // nothing. Tracking its default beats hardcoding a copy of it here.
+  const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
-  // The request is intentionally just model + bpw. Everything else is a fixed
-  // sensible default; an admin tunes anything exotic out of band.
-  const profile = 'balanced';
+  // The request is intentionally just model + bpw; the rest is exllamav3's own
+  // defaults unless the requester says otherwise.
   const category = 'General';
   const format = 'exl3';
   const provider = 'runpod';
-  const quantOptions = {
-    headBits: config.QUANT_PROFILES[profile].headBits,
-    profile,
-  };
 
   // ── Parse & validate variant list ─────────────────────────────────────────
   let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
@@ -125,6 +123,17 @@ export async function handleQuant(interaction) {
   // Normalize to one-decimal form so repo names are consistent
   // (3 -> "3.0", matching the -exl3-3.0bpw convention).
   variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
+
+  // exllamav3 takes 1-8, or 16 for an unquantized head; 9-15 are not lattice
+  // sizes it has codebooks for. Discord caps the range at 1-16, so only the
+  // hole in the middle needs catching.
+  if (headBits !== null && headBits > 8 && headBits !== 16) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('Invalid head bits', 'Head bits must be 1-8, or 16 to leave the head unquantized.'),
+      ],
+    });
+  }
 
   // ── Parse model URL ───────────────────────────────────────────────────────
   let modelId;
@@ -182,9 +191,8 @@ export async function handleQuant(interaction) {
         const repoName = exl3RepoName(modelName, bpw);
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
-          profile,
           bpw,
-          quantOptions,
+          quantOptions: { headBits },
         });
         precheckedRepos[String(bpw)] = state;
         if (state.exists && state.settingsMatch === false && state.reason !== 'manifest_missing') {
@@ -249,9 +257,8 @@ export async function handleQuant(interaction) {
     testPrompt,
     codebook,
     vision,
+    headBits,
     categories: [category],
-    profile,
-    quantOptions,
     provider,
     precheckedRepos,
     alreadyUploaded,
@@ -268,7 +275,8 @@ export async function handleQuant(interaction) {
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      `**Profile:** ${profile}  ·  **Provider:** ${provider}`,
+      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${vision}`,
+      `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
       alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
@@ -311,9 +319,9 @@ export async function runApprovedJob({ interaction, job }) {
     testPrompt = null,
     codebook = config.CODEBOOK,
     vision = 'auto',
+    // Older records predate the option; null keeps exllamav3's default.
+    headBits = null,
     categories,
-    profile,
-    quantOptions,
     provider,
     precheckedRepos = {},
   } = job;
@@ -502,6 +510,7 @@ export async function runApprovedJob({ interaction, job }) {
               testPrompt,
               codebook,
               vision,
+              headBits,
               onProgress: (d) => {
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();
@@ -597,8 +606,7 @@ export async function runApprovedJob({ interaction, job }) {
       url: urlInput,
       bpws,
       categories: [category],
-      profile,
-      quantOptions,
+      quantOptions: { headBits },
       precheckedRepos,
       userId,
       onProgress: (data) => updateEmbed(data),

@@ -212,7 +212,7 @@ def render_exl3_card(
     base_repo: str,
     repo_id: str,
     variant: str,
-    head_bits: int,
+    head_bits: int | None,
     cal_rows: int,
     size_gb: float | None,
     model_config: dict,
@@ -244,7 +244,10 @@ def render_exl3_card(
         "BPW": variant,
         "SIZE_GB": size_str,
         "SIZE_GB_BADGE": size_str,
-        "HEAD_BITS": str(head_bits),
+        # Callers read this off the quant's own config.json. None only happens
+        # when that read failed, and a card saying "None" is worse than one
+        # that omits a number it does not have.
+        "HEAD_BITS": str(head_bits) if head_bits is not None else "unrecorded",
         "CAL_ROWS": str(cal_rows),
         "CODEBOOK": (codebook or "mcg").lower(),
         "REPO_ID": repo_id,

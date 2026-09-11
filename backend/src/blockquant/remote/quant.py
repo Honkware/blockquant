@@ -598,20 +598,38 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
         time.sleep(wait)
 
 
+def _written_head_bits(out_dir, fallback: int | None = None) -> int | None:
+    """Head bits the converter actually used, from the config.json it wrote.
+
+    The request may not have pinned it, in which case exllamav3 chose (6 today).
+    Cards state this number, so read it rather than repeating the default here
+    and diverging the day upstream moves it.
+    """
+    try:
+        qcfg = json.loads((Path(out_dir) / "config.json").read_text(encoding="utf-8"))
+        return int((qcfg.get("quantization_config") or {})["head_bits"])
+    except Exception:
+        return fallback
+
+
+def _repo_quant_config(repo_id: str, hf_token: str) -> dict:
+    """A published quant's own quantization_config, or {} if unreadable."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        p = hf_hub_download(repo_id, "config.json", token=hf_token or None)
+        return json.loads(Path(p).read_text(encoding="utf-8")).get("quantization_config") or {}
+    except Exception:
+        return {}
+
+
 def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
     """Codebook a published quant was made with, from its own config.json.
 
     ExLlamaV3 records it in quantization_config. Older quants predate the key
     and were all mcg, which is also the converter's default.
     """
-    try:
-        from huggingface_hub import hf_hub_download
-
-        p = hf_hub_download(repo_id, "config.json", token=hf_token or None)
-        qcfg = json.loads(Path(p).read_text(encoding="utf-8")).get("quantization_config") or {}
-        return str(qcfg.get("codebook") or default)
-    except Exception:
-        return default
+    return str(_repo_quant_config(repo_id, hf_token).get("codebook") or default)
 
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
@@ -630,7 +648,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         model_config = {}
 
     quant_rows = [{
-        "variant": o["variant"], "head_bits": head_bits, "cal_rows": rows_cal,
+        "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
+        "cal_rows": rows_cal,
         "size_gb": o.get("_size_gb"),
         "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
         "kl_div": o.get("kl_div"),
@@ -644,7 +663,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
-            head_bits=head_bits, cal_rows=rows_cal, size_gb=o.get("_size_gb"),
+            head_bits=o.get("_head_bits", head_bits), cal_rows=rows_cal,
+            size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
             quantized_by=owner, codebook=codebook,
@@ -713,7 +733,9 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         size_gb = _repo_size_gb(repo)
         # A sibling may well have been quantized with a different codebook than
         # this run, so read each one's own rather than assuming ours.
-        cb_v = _repo_codebook(repo, hf_token)
+        qcfg_v = _repo_quant_config(repo, hf_token)
+        cb_v = str(qcfg_v.get("codebook") or "mcg")
+        hb_v = qcfg_v.get("head_bits", head_bits)
         # Already measured? read it back and skip the eval.
         existing = None
         try:
@@ -761,7 +783,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                 print(f"[backfill] {v} KL={kl:.6f} -> bq_quality.json", flush=True)
             except Exception as e:
                 print(f"[backfill] {v} quality upload failed: {e}", flush=True)
-        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v}
+        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v,
+                    "head_bits": hb_v}
 
     # Re-render every card so the Quants table shows KL for all bpws.
     try:
@@ -773,7 +796,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     collection_url = cards.ensure_collection(owner=owner, base_name=model_name,
                                              token=hf_token)
     quant_rows = [{
-        "variant": v, "head_bits": head_bits, "cal_rows": rows_cal,
+        "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
         "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
         "kl_div": d["kl"], "kl_method": d.get("kl_method"),
     } for v, d in table.items()]
@@ -781,7 +804,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         try:
             card = cards.render_exl3_card(
                 base_repo=model_id, repo_id=d["repo"], variant=v,
-                head_bits=head_bits, cal_rows=rows_cal, size_gb=d["size_gb"],
+                head_bits=d.get("head_bits", head_bits), cal_rows=rows_cal,
+                size_gb=d["size_gb"],
                 model_config=model_config, quant_rows=quant_rows,
                 collection_url=collection_url, license_id=license_id,
                 quantized_by=owner, codebook=d["codebook"],
@@ -806,7 +830,11 @@ def main() -> int:
         variants: list[str] = cfg["variants"]
         hf_token: str = cfg.get("hf_token", "")
         hf_org: str = cfg.get("hf_org", "")
-        head_bits: int = int(cfg.get("head_bits", 8))
+        _hb = cfg.get("head_bits")
+        # None means the request did not pin it, so exllamav3 picks its own
+        # default. The cards read the real number back off the written config
+        # rather than guessing, which is what _written_head_bits is for.
+        head_bits: int | None = int(_hb) if _hb is not None else None
         vision_bits = cfg.get("vision_bits")
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
@@ -943,6 +971,7 @@ def main() -> int:
             # sum over all variants. rmtree only AFTER a confirmed upload -- on
             # failure the dirs stay for rescue_upload.py.
             rec["_size_gb"] = _dir_size_gb(out_dir)
+            rec["_head_bits"] = _written_head_bits(out_dir, head_bits)
             if not hf_token:
                 return
             repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
@@ -985,7 +1014,6 @@ def main() -> int:
                 "-o", str(out_dir),
                 "-w", str(work_dir),
                 "-b", str(bpw),
-                "--head_bits", str(head_bits),
                 "--codebook", codebook,
                 # No-op on exllamav3 >= 1.4 (parallel mode became the default and
                 # the flag was kept as an accepted no-op), still meaningful on
@@ -997,6 +1025,8 @@ def main() -> int:
             # tower the arch declares validated to 6 bpw and copies the rest at
             # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
             # tracks the image, and an explicit value is how a request pins it.
+            if head_bits is not None:
+                argv += ["--head_bits", str(int(head_bits))]
             if vision_bits is not None:
                 argv += ["-vb", str(int(vision_bits))]
             if cal_rows is not None:

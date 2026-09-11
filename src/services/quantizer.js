@@ -45,11 +45,12 @@ export async function quantize(bpw, modelName, onProgress, signal, options = {})
     workDir,
     '-b',
     bpw.toString(),
-    '--head_bits',
-    headBits.toString(),
     '--codebook',
     codebook,
   ];
+  // Unset means exllamav3's own default (6). Passing a copy of that number
+  // would pin it here and silently diverge the day upstream changes it.
+  if (headBits != null) args.push('--head_bits', headBits.toString());
   if (Array.isArray(options.extraArgs) && options.extraArgs.length > 0) {
     args.push(...options.extraArgs);
   }

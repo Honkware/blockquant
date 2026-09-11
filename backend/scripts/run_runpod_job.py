@@ -389,7 +389,8 @@ def main():
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
-    parser.add_argument("--head-bits", type=int, default=8, help="Head bits for quantization")
+    parser.add_argument("--head-bits", type=int, default=None,
+                        help="Head bits (1-8, or 16 unquantized). Omitted: exllamav3's default of 6")
     parser.add_argument(
         "--codebook", choices=["auto", "mcg", "mul1", "3inst"],
         default=os.environ.get("BLOCKQUANT_CODEBOOK", "auto"),
@@ -584,10 +585,12 @@ def main():
     # placeholder "(personal)" as if it were a real account name.
     # codebook goes last: the parser's hf_org group has to sit directly after
     # head_bits, so anything new belongs past the end of what it reads.
-    header = (
-        f"[job] model={args.model} variants={args.variants} format=exl3 "
-        f"head_bits={args.head_bits}"
-    )
+    header = f"[job] model={args.model} variants={args.variants} format=exl3"
+    # Both optional fields are omitted rather than printed empty; the parser's
+    # groups are optional, so a missing one reads as "not pinned" instead of
+    # the dashboard showing the word None as if it were a setting.
+    if args.head_bits is not None:
+        header += f" head_bits={args.head_bits}"
     if args.hf_org:
         header += f" hf_org={args.hf_org}"
     header += f" codebook={args.codebook}"

@@ -57,7 +57,7 @@ class Provider(ABC):
         variants: list[str],
         hf_token: str = "",
         hf_org: str = "",
-        head_bits: int = 8,
+        head_bits: int | None = None,
         codebook: str = "mul1",
     ) -> dict:
         """Kick off the remote quantization. Default: not supported."""

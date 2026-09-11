@@ -33,6 +33,14 @@ export const commands = [
           { name: '6 — force 6bpw even on an unvalidated tower', value: '6' }
         )
     )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('head_bits')
+        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default: 6 (exllamav3)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(16)
+    )
     .addStringOption((opt) =>
       opt
         .setName('codebook')

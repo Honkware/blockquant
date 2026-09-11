@@ -189,18 +189,15 @@ const config = Object.freeze({
 
   // Quantization presets  (ExLlamaV3 uses bpw, typically 2-8)
   BPW_OPTIONS: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 8.0],
-  HEAD_BITS: intEnv('HEAD_BITS', 6),
+  // Local-path head bits. null omits --head_bits so exllamav3 picks its own
+  // default; the RunPod path takes it per job off /quant instead.
+  HEAD_BITS: process.env.HEAD_BITS ? intEnv('HEAD_BITS', 6) : null,
   // EXL3 trellis codebook for new quants. ExLlamaV3's own default is mcg; we
   // default to mul1. /quant overrides it per job; this sets what that defaults
   // to. Anything outside CODEBOOKS falls back rather than reaching a pod.
   CODEBOOK: CODEBOOKS.includes((process.env.CODEBOOK || '').trim().toLowerCase())
     ? process.env.CODEBOOK.trim().toLowerCase()
     : 'mul1',
-  QUANT_PROFILES: Object.freeze({
-    fast: { headBits: 4 },
-    balanced: { headBits: 6 },
-    quality: { headBits: 8 },
-  }),
 });
 
 export default config;
