@@ -1114,14 +1114,23 @@ def main() -> int:
                     # The method goes with it: a number measured on held-out
                     # text and one measured on the calibration set are not the
                     # same metric and must not share a field unlabelled.
+                    payload = json.dumps({"kl_div": kl, "kl_rows": kl_rows,
+                                          "kl_method": kl_method,
+                                          "metric": "KL(fp16||quant)"})
                     try:
-                        (out_dir / "bq_quality.json").write_text(
-                            json.dumps({"kl_div": kl, "kl_rows": kl_rows,
-                                        "kl_method": kl_method,
-                                        "metric": "KL(fp16||quant)"}),
-                            encoding="utf-8")
-                    except Exception:
-                        pass
+                        (out_dir / "bq_quality.json").write_text(payload, encoding="utf-8")
+                    except Exception as e:
+                        print(f"[kl] {variant} could not write bq_quality.json: {e}", flush=True)
+                    # KL is measured after the folder upload, so the file has to
+                    # be pushed on its own or it stays on a pod that is about to
+                    # be terminated -- which is why no published repo has one.
+                    rid = rec.get("hf_repo_id")
+                    if hf_token and rid:
+                        try:
+                            api.upload_file(path_or_fileobj=payload.encode(),
+                                            path_in_repo="bq_quality.json", repo_id=rid)
+                        except Exception as e:
+                            print(f"[kl] {variant} quality upload failed: {e}", flush=True)
             if test_prompt:
                 print(f"[sample] {variant} generating reply ...", flush=True)
                 resp = _sample_generate(out_dir, test_prompt)

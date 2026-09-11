@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -76,8 +77,16 @@ def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[d
     rows = []
     for v in variants:
         repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
+        kl = None
+        try:
+            from huggingface_hub import hf_hub_download
+            qp = hf_hub_download(repo_id, "bq_quality.json",
+                                 token=os.environ.get("HF_TOKEN") or None)
+            kl = json.loads(pathlib.Path(qp).read_text(encoding="utf-8")).get("kl_div")
+        except Exception:
+            pass  # older quants predate the file; the column just stays empty
         rows.append({
-            "variant": v, "head_bits": head_bits, "cal_rows": cal_rows,
+            "variant": v, "head_bits": head_bits, "cal_rows": cal_rows, "kl_div": kl,
             "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
         })
