@@ -83,6 +83,31 @@ export const commands = [
         .setRequired(false)
     ),
 
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop a running quantization and terminate its pods')
+    .addStringOption((opt) =>
+      opt
+        .setName('job')
+        .setDescription('Job ID from the request card. Leave empty to stop your own running job.')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('config')
+    .setDescription('(Admin) Bot settings')
+    .addSubcommand((sub) =>
+      sub
+        .setName('quanter-role')
+        .setDescription('Role whose members run /quant without approval')
+        .addRoleOption((opt) =>
+          opt
+            .setName('role')
+            .setDescription('The role. Leave empty to clear it and require approval from everyone.')
+            .setRequired(false)
+        )
+    ),
+
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),
   new SlashCommandBuilder().setName('health').setDescription('Check bot/service health summary'),
 
