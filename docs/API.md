@@ -95,8 +95,8 @@ The API reads `HF_TOKEN` from the API process environment and injects it into th
 | Field | Default | Notes |
 |---|---|---|
 | `model_id` | required | HuggingFace model ID. URLs should be normalized by callers before submitting. |
-| `format` | `exl3` | `exl3` or `gguf`. |
-| `variants` | `["4.0"]` | EXL3 bpw strings such as `4.0`; GGUF names such as `q4_k_m`. |
+| `format` | `exl3` | Only `exl3`. |
+| `variants` | `["4.0"]` | EXL3 bpw strings such as `4.0`. |
 | `provider` | `local` | `local` or `runpod`. |
 | `hf_org` | `""` | Blank uploads to the token owner's namespace. |
 | `workspace` | `null` | Optional override for `workspace_dir`. |

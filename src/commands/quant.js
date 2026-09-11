@@ -100,49 +100,27 @@ export async function handleQuant(interaction) {
   let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
   if (variants.length === 0) {
     return interaction.editReply({
-      embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0` or `q4_k_m,q5_k_m`')],
+      embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0`')],
     });
   }
 
-  let bpws;
-  if (format === 'gguf') {
-    const VALID_GGUF_VARIANTS = new Set([
-      'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m',
-      'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m',
-      'q6_k', 'q8_0', 'f16', 'bf16',
-    ]);
-    const invalid = variants.filter((v) => !VALID_GGUF_VARIANTS.has(v.toLowerCase()));
-    if (invalid.length) {
-      return interaction.editReply({
-        embeds: [
-          embeds.error(
-            'Invalid GGUF Variant',
-            `Unknown variant(s): ${invalid.join(', ')}. Valid: ${Array.from(VALID_GGUF_VARIANTS).join(', ')}`
-          ),
-        ],
-      });
-    }
-    variants = variants.map((v) => v.toLowerCase());
-    bpws = [];
-  } else {
-    bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
-    if (bpws.length === 0) {
-      return interaction.editReply({
-        embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
-      });
-    }
-    const invalid = bpws.filter((b) => b < 1 || b > 8);
-    if (invalid.length) {
-      return interaction.editReply({
-        embeds: [
-          embeds.error('BPW Out of Range', `Values must be between 1-8. Got: ${invalid.join(', ')}`),
-        ],
-      });
-    }
-    // Normalize to one-decimal form so repo names are consistent
-    // (3 -> "3.0", matching the -exl3-3.0bpw convention).
-    variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
+  const bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
+  if (bpws.length === 0) {
+    return interaction.editReply({
+      embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
+    });
   }
+  const invalid = bpws.filter((b) => b < 1 || b > 8);
+  if (invalid.length) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('BPW Out of Range', `Values must be between 1-8. Got: ${invalid.join(', ')}`),
+      ],
+    });
+  }
+  // Normalize to one-decimal form so repo names are consistent
+  // (3 -> "3.0", matching the -exl3-3.0bpw convention).
+  variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
 
   // ── Parse model URL ───────────────────────────────────────────────────────
   let modelId;
@@ -555,7 +533,7 @@ export async function runApprovedJob({ interaction, job }) {
     return { thread };
   }
 
-  const useApi = format === 'gguf' || (await isApiAvailable());
+  const useApi = await isApiAvailable();
 
   if (useApi) {
     try {

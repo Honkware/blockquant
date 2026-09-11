@@ -66,7 +66,6 @@ def test_run_pipeline_writes_receipt_and_manifest(monkeypatch, tmp_path):
     assert result.status == "complete"
     assert receipt["status"] == "complete"
     assert receipt["stages"]["download"] == "success"
-    assert receipt["stages"]["convert"] == "skipped"
     assert receipt["stages"]["quality"] == "skipped"
     assert receipt["stages"]["upload"] == "success"
     assert receipt["outputs"][0]["verified"] is True

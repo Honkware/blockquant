@@ -35,7 +35,7 @@ export async function isApiAvailable() {
  * Submit a quantization job to the backend API.
  * @param {Object} params
  * @param {string} params.model_id — HF model ID
- * @param {string} params.format — "exl3" | "gguf"
+ * @param {string} params.format — "exl3"
  * @param {string[]} params.variants — e.g., ["4.0"] or ["q4_k_m"]
  * @param {string} [params.provider] — "local" | "runpod"
  * @param {string} [params.hf_org]

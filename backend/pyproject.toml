@@ -25,7 +25,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "black", "ruff"]
-gguf = ["llama-cpp-python>=0.3.0"]
 
 [project.scripts]
 bq-pipeline = "blockquant.__main__:main"

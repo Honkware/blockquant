@@ -43,17 +43,6 @@ def test_quant_config_rejects_bad_inputs(patch):
         QuantConfig(**data)
 
 
-def test_gguf_variants_use_safe_names():
-    config = QuantConfig(model_id="test/model", format="gguf", variants=["q4_k_m", "q8_0"])
-    assert config.variants == ["q4_k_m", "q8_0"]
-
-
-@pytest.mark.parametrize("variant", ["4.0", "Q4_K_M", "q4-k-m", "../q4"])
-def test_gguf_rejects_non_gguf_variant_names(variant):
-    with pytest.raises(ValidationError):
-        QuantConfig(model_id="test/model", format="gguf", variants=[variant])
-
-
 def test_quant_config_defaults_to_mul1():
     config = QuantConfig(model_id="test/model")
     assert config.codebook == "mul1"

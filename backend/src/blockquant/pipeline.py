@@ -1,12 +1,11 @@
-"""6-stage pipeline.
+"""5-stage pipeline.
 
 Stages mirror the existing Node.js flow:
   1. download   → snapshot_download from HF Hub
-  2. convert    → FP16 for GGUF; no-op for EXL3 (uses HF directly)
-  3. quantize   → ExLlamaV3 convert.py OR llama.cpp quantize
-  4. verify     → load test + sample generation
-  5. report     → perplexity + model card generation
-  6. upload     → huggingface-cli upload
+  2. quantize   → ExLlamaV3 convert.py
+  3. verify     → load test + sample generation
+  4. report     → perplexity + model card generation
+  5. upload     → huggingface-cli upload
 
 The output shape matches what the existing queue.js expects.
 """
@@ -30,7 +29,7 @@ from blockquant.receipts import (
     update_receipt_remote,
     update_receipt_stage,
 )
-from blockquant.stages import download, convert, quantize, verify, report, upload, quality
+from blockquant.stages import download, quantize, verify, report, upload, quality
 from blockquant.providers import get_provider
 from blockquant.poll import poll_remote
 from blockquant.monitoring import record_job_start, record_job_complete
@@ -245,17 +244,7 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     if not stages[-1].success:
         return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
-    # Stage 2: Convert (GGUF only)
-    if config.format == QuantFormat.GGUF:
-        _report("convert", 18)
-        stages.append(_run_receipted_stage(receipt_path, "convert", convert.run, config, workspace))
-        _report("convert", 22)
-        if not stages[-1].success:
-            return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
-    else:
-        update_receipt_stage(receipt_path, "convert", "skipped")
-
-    # Stage 3: Quantize
+    # Stage 2: Quantize
     _report("quantize", 25, "starting quantization")
     update_receipt_stage(receipt_path, "quantize", "running")
     q_result = quantize.run(config, workspace, _report)
@@ -276,12 +265,12 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
         update_receipt_stage(receipt_path, "quantize", "failed")
         return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
-    # Stage 4: Verify
+    # Stage 3: Verify
     _report("verify", 90, "verifying outputs")
     stages.append(_run_receipted_stage(receipt_path, "verify", verify.run, config, workspace, outputs))
     update_receipt_outputs(receipt_path, outputs)
 
-    # Stage 4b: Quality (KL + PPL) — optional
+    # Stage 3b: Quality (KL + PPL) — optional
     if config.verify_quality and config.format == QuantFormat.EXL3 and outputs:
         _report("quality", 91, "running quality metrics (KL + PPL)")
         stages.append(_run_receipted_stage(receipt_path, "quality", _run_quality_stage, config, workspace, outputs))
@@ -290,11 +279,11 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     else:
         update_receipt_stage(receipt_path, "quality", "skipped")
 
-    # Stage 5: Report (model card)
+    # Stage 4: Report (model card)
     _report("report", 95, "generating model cards")
     stages.append(_run_receipted_stage(receipt_path, "report", report.run, config, workspace, outputs))
 
-    # Stage 6: Upload
+    # Stage 5: Upload
     _report("upload", 97, "uploading to HuggingFace")
     stages.append(_run_receipted_stage(receipt_path, "upload", upload.run, config, workspace, outputs))
     update_receipt_outputs(receipt_path, outputs)

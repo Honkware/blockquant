@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class QuantFormat(str, Enum):
-    GGUF = "gguf"
     EXL3 = "exl3"
 
 
@@ -41,7 +40,6 @@ DEFAULT_CODEBOOK = "mul1"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HF_ORG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EXL3_VARIANT_RE = re.compile(r"^(?:[1-9]\d*)(?:\.\d+)?$")
-_GGUF_VARIANT_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
 
 def validate_model_id(value: str) -> str:
@@ -71,11 +69,10 @@ def validate_variants(format: QuantFormat, variants: list[str]) -> list[str]:
     cleaned = [v.strip() for v in variants if v and v.strip()]
     if not cleaned:
         raise ValueError("variants must contain at least one value")
-    pattern = _EXL3_VARIANT_RE if format == QuantFormat.EXL3 else _GGUF_VARIANT_RE
-    label = "EXL3 bpw" if format == QuantFormat.EXL3 else "GGUF quant"
+    pattern = _EXL3_VARIANT_RE
     for variant in cleaned:
         if not pattern.match(variant) or ".." in variant or "/" in variant:
-            raise ValueError(f"invalid {label} variant: {variant!r}")
+            raise ValueError(f"invalid EXL3 bpw variant: {variant!r}")
     return cleaned
 
 
@@ -83,9 +80,8 @@ class QuantConfig(BaseModel):
     """Job configuration — maps to what the Discord bot collects."""
 
     model_id: str  # e.g., "mistralai/Mistral-7B-Instruct"
-    format: QuantFormat = QuantFormat.EXL3  # Default matches existing bot
+    format: QuantFormat = QuantFormat.EXL3
     variants: list[str] = Field(default_factory=lambda: ["4.0"])
-    use_imatrix: bool = True  # For GGUF
     provider: ProviderName = ProviderName.LOCAL
     spot: bool = False
     hf_org: str = ""  # Maps to existing HF_ORG
@@ -154,7 +150,7 @@ class VerificationResult(BaseModel):
 class QuantOutput(BaseModel):
     """Single quantized output — one per variant."""
 
-    variant: str  # "4.0" for EXL3, "q4_k_m" for GGUF
+    variant: str  # bpw, e.g. "4.0"
     format: QuantFormat
     output_path: str  # Absolute path to output dir/file
     file_size_mb: float = 0.0
