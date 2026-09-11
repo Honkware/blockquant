@@ -63,8 +63,11 @@ def _run_model_diff(base_dir: Path, quant_dir: Path, rows: int = 100, device: in
     kl_matches = _KL_RE.findall(out)
     ppl_matches = _PPL_RE.findall(out)
 
-    # KL divergence: take the first match (A, B direction)
-    kl_div = float(kl_matches[0]) if kl_matches else None
+    # model_diff prints "(A, B)" then "(B, A)", but those name the argument
+    # order, not the divergence. F.kl_div(log(probs_a), probs_b) is
+    # KL(B || A), so the first line is KL(quant || fp16) and the second is the
+    # forward KL(fp16 || quant) the cards claim to report. Take the second.
+    kl_div = float(kl_matches[1]) if len(kl_matches) >= 2 else None
 
     # Perplexity: model_diff prints A then B. B is the quantized model.
     ppl_base = float(ppl_matches[0]) if len(ppl_matches) >= 1 else None
