@@ -35,10 +35,12 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
-# Blackwell-class GPUs (sm_100/sm_120) need CUDA 12.8+ / torch >= 2.7; our
-# torch 2.6 + cu124 has no kernels for them. Matched as substrings of the
-# RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
-_BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
+# Datacenter Blackwell (sm_100). The image compiles for 8.0/8.6/8.9/9.0/12.0,
+# so consumer and pro Blackwell (sm_120: RTX 5090, RTX PRO Blackwell) run, but
+# sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
+# TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
+# RunPod GPU id.
+_BLACKWELL_EXCLUDE = ("B200", "B300")
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
@@ -393,6 +395,12 @@ def main():
         default=os.environ.get("BLOCKQUANT_CODEBOOK", "auto"),
         help="EXL3 trellis codebook. auto (default) picks mul1 for dense and mcg "
              "for MoE, which keeps the fused MoE kernel. ExLlamaV3's own default is mcg.",
+    )
+    parser.add_argument(
+        "--vision-bits", type=int, default=None,
+        help="Bits for a multimodal model's vision tower: 1-8, or 16 to copy it "
+             "unquantized. Omitted lets exllamav3 choose (6 where the tower is "
+             "validated, else 16).",
     )
     parser.add_argument(
         "--local-exllama",
@@ -751,6 +759,7 @@ def main():
             hf_org=args.hf_org,
             head_bits=args.head_bits,
             codebook=args.codebook,
+            vision_bits=args.vision_bits,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
