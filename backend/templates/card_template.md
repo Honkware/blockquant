@@ -11,6 +11,7 @@ tags:
   - quantized
 {{EXTRA_TAGS}}
 quantization_format: exl3
+inference: false
 bits_per_weight: {{BPW}}
 ---
 
@@ -93,6 +94,7 @@ hf download \
 | Bits per weight | `{{BPW}}` |
 | Head bits | `{{HEAD_BITS}}` |
 | Calibration rows | `{{CAL_ROWS}}` |
+| Calibration data | {{CAL_SOURCE}} |
 | Codebook | `{{CODEBOOK}}` |
 | Out&#8209;scales | `always` |
 | Parallel mode | {{PARALLEL_LINE}} |

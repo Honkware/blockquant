@@ -137,6 +137,7 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
     return {
         "arch_line": arch_line,
         "arch_badge": arch_badge,
+        "cal_source": "exllamav3 bundled mix (`c4`, `code`, `multilingual`, `technical`, `tiny`, `wiki`)",
         "extra_tags": "\n".join(extra_tags),
         "parallel_line": parallel_line,
         "architecture": archs[0] if archs else "",
@@ -263,6 +264,7 @@ def render_exl3_card(
         "TITLE": pretty_title(base_name, title_override),
         "ARCH_LINE": facts["arch_line"],
         "ARCH_BADGE": facts["arch_badge"],
+        "CAL_SOURCE": facts["cal_source"],
         "PARALLEL_LINE": facts["parallel_line"],
         "BPW": variant,
         "SIZE_GB": size_str,
