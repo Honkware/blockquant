@@ -24,6 +24,17 @@ export const commands = [
     )
     .addStringOption((opt) =>
       opt
+        .setName('vision')
+        .setDescription('Vision tower handling for multimodal models (default auto)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'auto — 6bpw where the tower is validated, else fp16 (default)', value: 'auto' },
+          { name: 'fp16 — never quantize the tower', value: 'fp16' },
+          { name: '6 — force 6bpw even on an unvalidated tower', value: '6' }
+        )
+    )
+    .addStringOption((opt) =>
+      opt
         .setName('codebook')
         .setDescription('EXL3 trellis codebook (default mul1)')
         .setRequired(false)

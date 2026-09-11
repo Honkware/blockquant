@@ -83,6 +83,10 @@ export async function handleQuant(interaction) {
   // Trellis codebook. Recorded in the quant itself, so it decides which
   // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
   const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
+  // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
+  // tower whole, so the same request gives a different artifact now. fp16 is
+  // the way back.
+  const vision = interaction.options.getString('vision') || 'auto';
   const userId = interaction.user.id;
 
   // The request is intentionally just model + bpw. Everything else is a fixed
@@ -244,6 +248,7 @@ export async function handleQuant(interaction) {
     bpws,
     testPrompt,
     codebook,
+    vision,
     categories: [category],
     profile,
     quantOptions,
@@ -305,6 +310,7 @@ export async function runApprovedJob({ interaction, job }) {
     bpws,
     testPrompt = null,
     codebook = config.CODEBOOK,
+    vision = 'auto',
     categories,
     profile,
     quantOptions,
@@ -495,6 +501,7 @@ export async function runApprovedJob({ interaction, job }) {
               calRows: 250,
               testPrompt,
               codebook,
+              vision,
               onProgress: (d) => {
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();

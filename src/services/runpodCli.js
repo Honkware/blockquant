@@ -99,6 +99,7 @@ export function runViaCli({
   calRows = 250,
   testPrompt = null,
   codebook = config.CODEBOOK,
+  vision = 'auto',
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -111,6 +112,11 @@ export function runViaCli({
       // EXL3 trellis codebook. The CLI validates it against the same three
       // values the converter takes, so a bad one dies here, not on a pod.
       '--codebook', String(codebook),
+      // Vision tower. 'auto' sends nothing, so exllamav3 decides -- which is
+      // what changed at 1.4.9, where a validated tower drops to 6 bpw instead
+      // of being copied whole. fp16 is the way back to the old artifact.
+      ...(vision === 'fp16' ? ['--vision-bits', '16']
+        : vision && vision !== 'auto' ? ['--vision-bits', String(vision)] : []),
       // Cheapest card that fits, walking up on stock-outs. Without this the
       // CLI uses the profile's H100/A100 list and dies fast when those are
       // unavailable. Disk is auto-sized by the CLI (default).

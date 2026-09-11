@@ -807,6 +807,7 @@ def main() -> int:
         hf_token: str = cfg.get("hf_token", "")
         hf_org: str = cfg.get("hf_org", "")
         head_bits: int = int(cfg.get("head_bits", 8))
+        vision_bits = cfg.get("vision_bits")
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -992,6 +993,12 @@ def main() -> int:
                 # matters because the image can be rolled back under it.
                 "--parallel_mode",
             ]
+            # Vision tower. Omitted means exllamav3 decides: >=1.4.9 quantizes a
+            # tower the arch declares validated to 6 bpw and copies the rest at
+            # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
+            # tracks the image, and an explicit value is how a request pins it.
+            if vision_bits is not None:
+                argv += ["-vb", str(int(vision_bits))]
             if cal_rows is not None:
                 argv += ["--cal_rows", str(int(cal_rows))]
             if cal_cols is not None:

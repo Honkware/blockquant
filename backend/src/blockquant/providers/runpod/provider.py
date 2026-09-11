@@ -232,7 +232,7 @@ class RunPodProvider(Provider):
             try:
                 bpws.append(float(v))
             except (TypeError, ValueError):
-                bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
+                bpws.append(8.0)  # non-numeric: worst case
         max_bpw = max(bpws) if bpws else 8.0
         out = work = base_gb * max_bpw / 16.0
         vocab = RunPodProvider._base_vocab(model_id, token) or 200000
@@ -1016,7 +1016,7 @@ class RunPodProvider(Provider):
         hf_token: str = "",
         hf_org: str = "",
         head_bits: int = 8,
-        use_imatrix: bool = True,
+        vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
         keep_pod: bool = False,
@@ -1053,6 +1053,7 @@ class RunPodProvider(Provider):
             "hf_token": hf_token,
             "hf_org": hf_org,
             "head_bits": head_bits,
+            "vision_bits": vision_bits,
             "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
