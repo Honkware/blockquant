@@ -30,9 +30,9 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio python-dotenv \
+          pip install pytest pytest-asyncio python-dotenv celery \
                       runpod paramiko huggingface-hub pydantic fastapi
 
       - name: Run provider tests
         working-directory: backend
-        run: pytest tests/providers -v --tb=short
+        run: pytest tests -v --tb=short
