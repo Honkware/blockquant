@@ -39,20 +39,3 @@ def test_verify_marks_missing_output_before_raising(tmp_path):
     assert "Output missing" in output.verification.message
 
 
-def test_gguf_verify_is_explicit_when_llama_cpp_is_missing(tmp_path, monkeypatch):
-    gguf = tmp_path / "model.gguf"
-    gguf.write_text("stub", encoding="utf-8")
-
-    def fake_import(name, *args, **kwargs):
-        if name == "llama_cpp":
-            raise ImportError("not installed")
-        return real_import(name, *args, **kwargs)
-
-    real_import = __import__
-    monkeypatch.setattr("builtins.__import__", fake_import)
-
-    result = verify._verify_gguf(Path(gguf))
-
-    assert result.status == VerificationStatus.SKIPPED
-    assert result.method == "llama_cpp"
-    assert "not installed" in result.message

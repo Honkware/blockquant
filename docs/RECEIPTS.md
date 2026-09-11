@@ -160,7 +160,7 @@ Verification status values:
 | `failed` | output was missing or failed verification |
 | `skipped` | verifier could not run, usually due to an optional dependency |
 
-GGUF verification uses `llama_cpp` when installed. If it is missing, verification is marked `skipped` instead of pretending to pass. EXL3 verification currently checks that the output directory exists and is non-empty.
+EXL3 verification currently checks that the output directory exists and is non-empty.
 
 ## Debugging with receipts
 

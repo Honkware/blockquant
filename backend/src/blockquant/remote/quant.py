@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -62,36 +63,117 @@ def _arm_self_terminate_backstop(pod_id: str, api_key: str, grace_seconds: float
     endpoint returns 403 for rpa_ keys. No dependency on the runpod SDK.
     """
     import subprocess
+    # Pass pod id + key via env, NOT argv -- argv shows up in `ps`/proc/cmdline.
     code = (
-        "import time, urllib.request as u;"
+        "import os, time, urllib.request as u;"
         f"time.sleep({float(grace_seconds)});"
-        f"u.urlopen(u.Request('https://rest.runpod.io/v1/pods/{pod_id}', "
-        f"method='DELETE', headers={{'Authorization': 'Bearer {api_key}'}}), timeout=20)"
+        "u.urlopen(u.Request('https://rest.runpod.io/v1/pods/' + os.environ['BQ_POD'], "
+        "method='DELETE', headers={'Authorization': 'Bearer ' + os.environ['BQ_KEY']}), timeout=20)"
     )
     subprocess.Popen(
         [sys.executable, "-c", code],
+        env={**os.environ, "BQ_POD": pod_id, "BQ_KEY": api_key},
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
 
-def _qwen2vl_preprocessor_shim(model_dir: Path) -> None:
-    """Drop a Qwen2VL preprocessor stub if missing — required by some VL
-    builds even when we're only using the LM, otherwise convert.py barfs
-    when it tries to read the processor config.
+_CLIP_MEAN_STD = ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+_HALF_MEAN_STD = ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+
+# What each vision family's own preprocessor_config.json says, keyed by the
+# vision_config->model_type prefix. The pixel budgets are upstream's, restated
+# as merged-token counts (pixels / (patch * merge)^2) so they hold for a model
+# whose patch size differs: Qwen2-VL ships 3136/12845056 at factor 28,
+# Qwen3-VL 65536/16777216 at factor 32, GLM-4V 12544/9633792 at factor 28.
+# (processor_type, mean/std, min_tokens, max_tokens)
+_VL_PREP_FAMILIES = (
+    ("qwen3_5", ("Qwen2VLImageProcessorFast", _HALF_MEAN_STD, 64, 16384)),
+    ("qwen3_vl", ("Qwen2VLImageProcessorFast", _HALF_MEAN_STD, 64, 16384)),
+    ("glm4v", ("Glm4vImageProcessor", _CLIP_MEAN_STD, 16, 12288)),
+    ("qwen2", ("Qwen2VLImageProcessorFast", _CLIP_MEAN_STD, 4, 16384)),
+)
+_VL_PREP_FALLBACK = _VL_PREP_FAMILIES[-1][1]
+
+
+def _vision_preprocessor_config(model_dir: Path) -> None:
+    """Give a VL source dir the preprocessor_config.json exllamav3 requires.
+
+    A config.json with a vision_config makes exllamav3 open the file
+    unconditionally -- there is no language-model-only path anywhere in it --
+    so a merge that dropped the file is unloadable, FileNotFoundError before
+    the first shard. convert.py copies every non-tensor file into the output,
+    so whatever is here is what the published quant ships.
+
+    It has to be *right*, not merely present. The 56px stub we used to write
+    loaded fine and then broke every image: size->shortest/longest_edge are
+    read as min/max_pixels, total pixel counts rather than edge lengths, and a
+    56-pixel ceiling floors smart_resize to a zero-size grid ("height and width
+    must be > 0"). Prefer the model's own numbers out of processor_config.json,
+    which HF-style VL repos carry alongside; otherwise derive them from
+    vision_config.
     """
     prep = model_dir / "preprocessor_config.json"
     if prep.exists():
         return
+    try:
+        cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return
+    vis = cfg.get("vision_config")
+    if not isinstance(vis, dict):
+        return
+
+    own = _image_processor_block(model_dir)
+    if own:
+        prep.write_text(json.dumps(own, indent=2))
+        print("[preprocess] wrote preprocessor_config.json from the model's own "
+              "processor_config.json", flush=True)
+        return
+
+    model_type = str(vis.get("model_type") or cfg.get("model_type") or "")
+    proc_type, (mean, std), min_tok, max_tok = next(
+        (v for k, v in _VL_PREP_FAMILIES if model_type.startswith(k)), _VL_PREP_FALLBACK
+    )
+    patch = int(vis.get("patch_size", 14))
+    merge = int(vis.get("spatial_merge_size", 2))
+    factor = patch * merge
     prep.write_text(json.dumps({
-        "size": {"shortest_edge": 56, "longest_edge": 56},
-        "patch_size": 14,
-        "temporal_patch_size": 2,
-        "merge_size": 2,
-        "image_mean": [0.48145466, 0.4578275, 0.40821073],
-        "image_std": [0.26862954, 0.26130258, 0.27577711],
-        "image_processor_type": "Qwen2VLImageProcessorFast",
-    }))
+        # Pixel counts, not edge lengths. exllamav3 reads them as min/max_pixels.
+        "size": {"shortest_edge": min_tok * factor ** 2,
+                 "longest_edge": max_tok * factor ** 2},
+        "patch_size": patch,
+        "temporal_patch_size": int(vis.get("temporal_patch_size", 2)),
+        "merge_size": merge,
+        "image_mean": mean,
+        "image_std": std,
+        "image_processor_type": proc_type,
+    }, indent=2))
+    print(f"[preprocess] no preprocessor_config.json; derived one for {model_type or 'vl'} "
+          f"(patch {patch}, merge {merge})", flush=True)
+
+
+def _image_processor_block(model_dir: Path) -> dict | None:
+    """The image_processor half of a processor_config.json, if it is complete.
+
+    exllamav3 only looks in processor_config.json for Mistral3; every other
+    arch wants the split-out file, so hoist the block across when we have it.
+    """
+    try:
+        blk = json.loads((model_dir / "processor_config.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    blk = blk.get("image_processor")
+    if not isinstance(blk, dict):
+        return None
+    need = ("size", "patch_size", "temporal_patch_size", "merge_size",
+            "image_mean", "image_std", "image_processor_type")
+    if not all(k in blk for k in need):
+        return None
+    size = blk["size"]
+    if not (isinstance(size, dict) and "shortest_edge" in size and "longest_edge" in size):
+        return None
+    return blk
 
 
 def _ensure_fast_tokenizer(model_dir: Path) -> None:
@@ -114,14 +196,156 @@ def _ensure_fast_tokenizer(model_dir: Path) -> None:
     print(f"[tokenizer] WARN could not build tokenizer.json: {last}", flush=True)
 
 
-def _eval_text() -> str:
-    """Eval text for the KL metric: exllamav3's bundled calibration corpus.
+# Config fields exllamav3 reads as ints. Fine-tunes/merges sometimes emit them
+# as floats (e.g. "original_max_position_embeddings": 16384.0), and a float where
+# an int is expected makes ext.rope() raise "incompatible function arguments"
+# (this killed pagestorm-14b / ministral3 -- diagnosed by turboderp).
+_INT_CFG_FIELDS = {
+    "original_max_position_embeddings", "max_position_embeddings",
+    "head_dim", "hidden_size", "intermediate_size", "moe_intermediate_size",
+    "shared_expert_intermediate_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "num_experts", "num_experts_per_tok", "num_local_experts",
+    "sliding_window", "vocab_size", "bos_token_id", "eos_token_id", "pad_token_id",
+}
 
-    Read straight off disk (the image bakes conversion/standard_cal_data/*.utf8),
-    so the eval never depends on a live dataset download.
+
+def _sanitize_config(model_dir: Path) -> None:
+    """Coerce known integer config fields that ship as floats back to ints, incl.
+    nested configs (llama_4_scaling, rope_parameters, text_config, ...). Only
+    rewrites integral floats of allow-listed int fields, so genuine floats
+    (rope_theta, scaling factors) are untouched."""
+    cfg_path = model_dir / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    fixed = []
+
+    def walk(o, pfx=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in _INT_CFG_FIELDS and isinstance(v, float) and v == int(v):
+                    o[k] = int(v)
+                    fixed.append(f"{pfx}{k}: {v} -> {int(v)}")
+                else:
+                    walk(v, f"{pfx}{k}.")
+        elif isinstance(o, list):
+            for x in o:
+                walk(x, pfx)
+
+    walk(cfg)
+    if fixed:
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        print(f"[config] coerced float int-fields: {', '.join(fixed)}", flush=True)
+
+
+def _model_has_tensor_prefix(model_dir: Path, prefix: str) -> bool:
+    """True if any model tensor key starts with `prefix`. Reads the safetensors
+    index when present, else scans each .safetensors header. Fails OPEN (True) so
+    we never wrongly strip something on an unreadable model."""
+    idx = model_dir / "model.safetensors.index.json"
+    if idx.exists():
+        try:
+            return any(k.startswith(prefix) for k in json.loads(idx.read_text()).get("weight_map", {}))
+        except Exception:
+            return True
+    import struct
+    files = list(model_dir.glob("*.safetensors"))
+    if not files:
+        return True
+    for sf in files:
+        try:
+            with open(sf, "rb") as f:
+                hdr = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+            if any(k.startswith(prefix) for k in hdr):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _disable_missing_mtp(model_dir: Path) -> None:
+    """Qwen3.5 declares an MTP draft head (mtp_num_hidden_layers > 0), and
+    exllamav3 quantizes it -- but most fine-tunes ship no mtp.* weights, so the
+    convert dies on 'Required tensor mtp....weight not found'. If the weights
+    aren't there, zero mtp_num_hidden_layers so exllamav3 skips MTP and quantizes
+    the base model. (Diagnosed on Qwythos-9B.)"""
+    cfg_path = model_dir / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if _model_has_tensor_prefix(model_dir, "mtp"):
+        return
+    fixed = []
+
+    def walk(o, pfx=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == "mtp_num_hidden_layers" and isinstance(v, int) and v > 0:
+                    o[k] = 0
+                    fixed.append(f"{pfx}{k}: {v} -> 0")
+                else:
+                    walk(v, f"{pfx}{k}.")
+
+    walk(cfg)
+    if fixed:
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
+
+
+def _chat_format(model_dir: Path, text: str) -> tuple[str, str]:
+    """(text, label) with the model's chat template applied, when it has one.
+
+    turboderp's published curves are measured on chat-formatted text, and an
+    instruct model puts real probability mass on the control tokens, so raw
+    prose is a different distribution than the one anyone actually runs. Best
+    effort: a model with no template, or a template that will not render, gets
+    the raw text and says so rather than failing the whole measurement.
+    """
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=False)
+        if not getattr(tok, "chat_template", None):
+            return text, "raw (no chat template)"
+        out = tok.apply_chat_template(
+            [{"role": "user", "content": text}], tokenize=False,
+            add_generation_prompt=True,
+        )
+        return (out, "formatted") if out and out.strip() else (text, "raw (template empty)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[kl] WARN chat template not applied: {type(e).__name__}: {e}", flush=True)
+        return text, "raw (template failed)"
+
+
+# Held-out text for the KL metric, baked into the image at build time.
+# Read off disk rather than pulled with load_dataset() so a paid pod can never
+# lose a run to a dataset outage -- the same reason the old corpus was a file.
+KL_CORPUS = Path("/opt/blockquant/kl_eval_corpus.utf8")
+
+
+def _eval_text() -> tuple[str, str]:
+    """(text, source) for the KL metric.
+
+    Held-out text, NOT exllamav3's standard_cal_data. That is the corpus EXL3
+    calibrates the quant against, so measuring KL on it is measuring on the
+    training set: it flatters every quant we publish and is not comparable to
+    turboderp's own numbers, which use openwebtext for exactly this reason.
+
+    Falls back to the calibration corpus on an image built before the eval text
+    was baked, and says so, because a wrong number reported as a right one is
+    worse than a missing one.
     """
     import glob
     import os
+    try:
+        if KL_CORPUS.is_file():
+            text = KL_CORPUS.read_text(encoding="utf-8")
+            if text.strip():
+                return text, "openwebtext"
+    except Exception as e:
+        print(f"[kl] WARN eval corpus unreadable: {type(e).__name__}: {e}", flush=True)
+
     import exllamav3
     base = os.path.join(os.path.dirname(exllamav3.__file__),
                         "conversion", "standard_cal_data")
@@ -132,12 +356,26 @@ def _eval_text() -> str:
                 parts.append(f.read())
         except Exception:
             pass
-    return "\n\n".join(parts)
+    if parts:
+        print("[kl] WARN no baked eval corpus; falling back to the CALIBRATION "
+              "data, which understates KL. Rebuild the image.", flush=True)
+    return "\n\n".join(parts), "the calibration set (stale image)"
 
 
-def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
-                 seq_len: int = 2048) -> float | None:
-    """Mean KL(fp16 || quant) over a few rows of calibration text, for the card.
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
+                 seq_len: int = 8192) -> tuple[float | None, str]:
+    """Mean KL(fp16 || quant) over held-out text. Returns (kl, method).
+
+    8 x 8192 over openwebtext, chat-formatted, matching the setup behind
+    turboderp's published EXL3 curves so a number on our card can be read
+    against his chart. The maths already agreed -- his compute_kl_div is
+    F.kl_div(log_softmax(input), softmax(target)).sum(-1), which is the same
+    quantity computed below -- so the corpus and the chunking were the whole
+    difference.
+
+    `method` travels with the number. Two incompatible measurement series
+    silently sharing a field name is the bug this change exists to fix, so the
+    fix must not create a second one.
 
     Loads ONE model at a time (fp16, then quant) via the high-level Model API
     that the smoke-test path already proved works, forwards each row to get
@@ -155,14 +393,16 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
         from exllamav3 import Config, Model, Cache, Tokenizer
     except Exception as e:
         print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
 
     # Tokenize the eval text once, with the quant's tokenizer, into fixed rows.
     try:
-        text = _eval_text()
+        text, corpus = _eval_text()
         if not text:
             print("[kl] WARN no bundled eval text found", flush=True)
-            return None
+            return None, ""
+        text, fmt = _chat_format(quant_dir, text)
+        method = f"{corpus} \u00b7 {rows}\u00d7{seq_len} \u00b7 {fmt}"
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
         all_ids = tokenizer.encode(text)
@@ -172,10 +412,10 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
                 for a in range(0, n - seq_len, seq_len)][:rows]
         if not seqs:
             print("[kl] WARN not enough eval tokens", flush=True)
-            return None
+            return None, ""
     except Exception as e:
         print(f"[kl] WARN tokenize failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
 
     def _forward_rows(model_dir, on_row) -> None:
         """Load model_dir, forward each seq, call on_row(i, logits_2d), unload."""
@@ -218,10 +458,13 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 32,
             kls.append(kl)
 
         _forward_rows(quant_dir, _cmp)
-        return (sum(kls) / len(kls)) if kls else None
+        if not kls:
+            return None, ""
+        print(f"[kl] {sum(kls) / len(kls):.5f} over {method}", flush=True)
+        return sum(kls) / len(kls), method
     except Exception as e:
         print(f"[kl] WARN eval failed: {type(e).__name__}: {e}", flush=True)
-        return None
+        return None, ""
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
@@ -307,49 +550,134 @@ def _sample_generate(quant_dir: Path, prompt: str, max_new_tokens: int = 256) ->
             pass
 
 
-def _write_cards(outputs, model_id, model_name, owner, hf_token,
-                 head_bits, cal_rows, model_dir) -> None:
-    """Render the polished card into each output dir before upload."""
-    import cards
+_UPLOAD_TRIES = 4
+# Nothing here comes good on a retry: bad request, bad token, no write access,
+# missing repo, payload rejected. Everything else (429, 5xx, a dropped socket)
+# is worth another go.
+_UPLOAD_TERMINAL = {400, 401, 403, 404, 413}
 
-    rows_cal = int(cal_rows) if cal_rows else 250
+
+def _upload_folder_hb(api, path, repo_id, variant) -> None:
+    """upload_folder on a worker thread with a 20s heartbeat -- pushing tens of
+    GB is silent for minutes, the last quiet phase that could trip the
+    controller's stall watchdog. Raises on failure (after join).
+
+    Retried, because the pod is torn down afterwards: one transient error used
+    to throw away a conversion that had already succeeded. upload_folder asks
+    the remote what it already has and pushes only the rest, so a retry resumes
+    a part-uploaded repo rather than starting it again.
+    """
+    import threading
+    for attempt in range(1, _UPLOAD_TRIES + 1):
+        done, err = threading.Event(), {}
+
+        def _do():
+            try:
+                api.upload_folder(folder_path=path, repo_id=repo_id, repo_type="model")
+            except Exception as exc:
+                err["exc"] = exc
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        secs = 0
+        while not done.wait(20):
+            secs += 20
+            print(f"[upload] {variant} pushing... {secs}s", flush=True)
+        t.join()
+        exc = err.get("exc")
+        if exc is None:
+            return
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code in _UPLOAD_TERMINAL or attempt == _UPLOAD_TRIES:
+            raise exc
+        wait = 30 * 2 ** (attempt - 1)
+        print(f"[upload] {variant} attempt {attempt}/{_UPLOAD_TRIES} failed "
+              f"({code or type(exc).__name__}); resuming in {wait}s", flush=True)
+        time.sleep(wait)
+
+
+def _written_quant_config(out_dir) -> dict:
+    """quantization_config the converter just wrote, or {} if unreadable.
+
+    Head bits, codebook and calibration size are all optional on the request
+    now -- unset means exllamav3 picks. Cards state those numbers, so read what
+    was actually produced instead of repeating upstream's defaults here and
+    diverging the day one of them moves.
+    """
+    try:
+        cfg = json.loads((Path(out_dir) / "config.json").read_text(encoding="utf-8"))
+        return cfg.get("quantization_config") or {}
+    except Exception:
+        return {}
+
+
+def _repo_quant_config(repo_id: str, hf_token: str) -> dict:
+    """A published quant's own quantization_config, or {} if unreadable."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        p = hf_hub_download(repo_id, "config.json", token=hf_token or None)
+        return json.loads(Path(p).read_text(encoding="utf-8")).get("quantization_config") or {}
+    except Exception:
+        return {}
+
+
+def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
+    """Codebook a published quant was made with, from its own config.json.
+
+    ExLlamaV3 records it in quantization_config. Older quants predate the key
+    and were all mcg, which is also the converter's default.
+    """
+    return str(_repo_quant_config(repo_id, hf_token).get("codebook") or default)
+
+
+def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
+                    head_bits, cal_rows, codebook, model_dir) -> None:
+    """Render each variant's card with the full cross-variant table and push
+    README.md to its repo. Runs after the serial upload+delete, so the out_dir
+    is gone -- sizes/KL come from the recs and the card goes up via the API."""
+    import cards
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
     try:
         model_config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     except Exception:
         model_config = {}
 
-    quant_rows = []
-    for out in outputs:
-        out["_size_gb"] = _dir_size_gb(Path(out["path"]))
-        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
-        quant_rows.append({
-            "variant": out["variant"], "head_bits": head_bits,
-            "cal_rows": rows_cal, "size_gb": out["_size_gb"],
-            "url": f"https://huggingface.co/{repo_id}",
-            "kl_div": out.get("kl_div"),
-        })
+    quant_rows = [{
+        "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
+        "cal_rows": o.get("_cal_rows", cal_rows),
+        "size_gb": o.get("_size_gb"),
+        "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
+        "kl_div": o.get("kl_div"),
+        "kl_method": o.get("kl_method"),
+    } for o in outputs]
 
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(
-        owner=owner, base_name=model_name, token=hf_token,
-    )
+    collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
 
-    for out in outputs:
-        repo_id = cards.exl3_repo_id(owner, model_name, out["variant"])
+    for o in outputs:
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
         card = cards.render_exl3_card(
-            base_repo=model_id, repo_id=repo_id, variant=out["variant"],
-            head_bits=head_bits, cal_rows=rows_cal, size_gb=out.get("_size_gb"),
+            base_repo=model_id, repo_id=repo_id, variant=o["variant"],
+            head_bits=o.get("_head_bits", head_bits),
+            cal_rows=o.get("_cal_rows", cal_rows),
+            size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
-            quantized_by=owner,
+            quantized_by=owner, codebook=o.get("_codebook", codebook),
         )
-        (Path(out["path"]) / "README.md").write_text(card, encoding="utf-8")
-        print(f"[card] {out['variant']} written", flush=True)
+        api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
+                        repo_id=repo_id, repo_type="model")
+        print(f"[card] {o['variant']} written", flush=True)
 
 
 def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
-                         head_bits, cal_rows, kl_rows, model_dir, scratch_dir,
-                         max_eval=8) -> None:
+                         head_bits, cal_rows, codebook, kl_rows, model_dir,
+                         scratch_dir, max_eval=8) -> None:
     """Retroactively fill KL for existing sibling quants of the same base.
 
     The fp16 source is already on the pod, so any {owner}/{model_name}-exl3-Xbpw
@@ -358,14 +686,13 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     collection so the Quants table carries KL for all bpws. Fully best-effort:
     the finished quant has already uploaded by the time this runs.
     """
-    import re as _re
     import shutil
     import cards
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.utils import EntryNotFoundError
 
     api = HfApi(token=hf_token)
-    rx = _re.compile(rf"^{_re.escape(model_name)}-exl3-([0-9.]+)bpw$")
+    rx = cards.exl3_slug_rx(model_name)
     new_variants = {o["variant"] for o in outputs}
 
     def _repo_size_gb(repo_id: str):
@@ -382,7 +709,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     for o in outputs:
         repo = f"{owner}/{model_name}-exl3-{o['variant']}bpw"
         table[o["variant"]] = {"repo": repo, "kl": o.get("kl_div"),
-                               "size_gb": o.get("_size_gb")}
+                               "kl_method": o.get("kl_method"),
+                               "size_gb": o.get("_size_gb"), "codebook": codebook}
 
     try:
         found = list(api.list_models(author=owner, search=f"{model_name}-exl3"))
@@ -392,8 +720,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     siblings = []
     for m in found:
         mm = rx.match(m.id.split("/")[-1])
-        if mm and mm.group(1) not in new_variants:
-            siblings.append((mm.group(1), m.id))
+        if mm and mm.group("variant") not in new_variants:
+            siblings.append((mm.group("variant"), m.id))
 
     if not siblings:
         print("[backfill] no existing siblings to fill", flush=True)
@@ -403,6 +731,11 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     evaled = 0
     for v, repo in sorted(siblings, key=lambda x: float(x[0])):
         size_gb = _repo_size_gb(repo)
+        # A sibling may well have been quantized with a different codebook than
+        # this run, so read each one's own rather than assuming ours.
+        qcfg_v = _repo_quant_config(repo, hf_token)
+        cb_v = str(qcfg_v.get("codebook") or "mcg")
+        hb_v = qcfg_v.get("head_bits", head_bits)
         # Already measured? read it back and skip the eval.
         existing = None
         try:
@@ -413,13 +746,14 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         except Exception:
             existing = None
         if existing is not None:
-            table[v] = {"repo": repo, "kl": float(existing), "size_gb": size_gb}
+            table[v] = {"repo": repo, "kl": float(existing), "size_gb": size_gb,
+                        "codebook": cb_v}
             print(f"[backfill] {v} already has KL={float(existing):.6f}", flush=True)
             continue
         if evaled >= max_eval:
             print(f"[backfill] eval cap {max_eval} hit, leaving {v} for later",
                   flush=True)
-            table[v] = {"repo": repo, "kl": None, "size_gb": size_gb}
+            table[v] = {"repo": repo, "kl": None, "size_gb": size_gb, "codebook": cb_v}
             continue
 
         bdir = scratch_dir / f"backfill-{v}bpw"
@@ -432,7 +766,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                                 "tokenizer*"],
             )
             print(f"[backfill] {v} measuring KL vs fp16 ...", flush=True)
-            kl = _kl_div_eval(bdir, model_dir, rows=kl_rows)
+            kl, _kl_method = _kl_div_eval(bdir, model_dir, rows=kl_rows)
         except Exception as e:
             print(f"[backfill] {v} eval failed: {type(e).__name__}: {e}", flush=True)
         finally:
@@ -442,14 +776,15 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             try:
                 api.upload_file(
                     path_or_fileobj=json.dumps(
-                        {"kl_div": kl, "kl_rows": kl_rows,
+                        {"kl_div": kl, "kl_rows": kl_rows, "kl_method": _kl_method,
                          "metric": "KL(fp16||quant)"}).encode(),
                     path_in_repo="bq_quality.json", repo_id=repo,
                 )
                 print(f"[backfill] {v} KL={kl:.6f} -> bq_quality.json", flush=True)
             except Exception as e:
                 print(f"[backfill] {v} quality upload failed: {e}", flush=True)
-        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb}
+        table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v,
+                    "head_bits": hb_v}
 
     # Re-render every card so the Quants table shows KL for all bpws.
     try:
@@ -461,18 +796,19 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     collection_url = cards.ensure_collection(owner=owner, base_name=model_name,
                                              token=hf_token)
     quant_rows = [{
-        "variant": v, "head_bits": head_bits, "cal_rows": rows_cal,
+        "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
         "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
-        "kl_div": d["kl"],
+        "kl_div": d["kl"], "kl_method": d.get("kl_method"),
     } for v, d in table.items()]
     for v, d in sorted(table.items(), key=lambda x: float(x[0])):
         try:
             card = cards.render_exl3_card(
                 base_repo=model_id, repo_id=d["repo"], variant=v,
-                head_bits=head_bits, cal_rows=rows_cal, size_gb=d["size_gb"],
+                head_bits=d.get("head_bits", head_bits), cal_rows=rows_cal,
+                size_gb=d["size_gb"],
                 model_config=model_config, quant_rows=quant_rows,
                 collection_url=collection_url, license_id=license_id,
-                quantized_by=owner,
+                quantized_by=owner, codebook=d["codebook"],
             )
             api.upload_file(path_or_fileobj=card.encode(),
                             path_in_repo="README.md", repo_id=d["repo"])
@@ -484,15 +820,33 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
 def main() -> int:
     try:
         cfg = json.loads(Path(CONFIG_PATH).read_text())
+        # cfg holds the HF token + RunPod key -- shred it now that it's in memory
+        # so it isn't sitting world-readable on disk for the pod's whole life.
+        try:
+            os.unlink(CONFIG_PATH)
+        except OSError:
+            pass
         model_id: str = cfg["model_id"]
         variants: list[str] = cfg["variants"]
         hf_token: str = cfg.get("hf_token", "")
         hf_org: str = cfg.get("hf_org", "")
-        head_bits: int = int(cfg.get("head_bits", 8))
+        _hb = cfg.get("head_bits")
+        # None means the request did not pin it, so exllamav3 picks its own
+        # default. The cards read the real number back off the written config
+        # rather than guessing, which is what _written_head_bits is for.
+        head_bits: int | None = int(_hb) if _hb is not None else None
+        vision_bits = cfg.get("vision_bits")
+        # How many cards the launcher rented. convert's -d defaults to "0", so
+        # without this an N-GPU pod quantizes on one card and bills for N.
+        gpu_count: int = max(1, int(cfg.get("gpu_count", 1) or 1))
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
         cal_cols: int | None = cfg.get("cal_cols")
+        # Trellis codebook. ExLlamaV3's own default is mcg; ours is mul1. The
+        # converter rejects anything outside mcg/mul1/3inst, and the choice is
+        # baked into the quant as a tensor, so the loader needs no config.
+        codebook: str = (cfg.get("codebook") or "mul1").strip().lower()
         # Post-quant KL-divergence of the quant against the fp16, measured on
         # the pod where both still live. On by default (best-effort: skips if the
         # fp16 won't fit the GPU). kl_rows trades accuracy for pod time.
@@ -507,36 +861,43 @@ def main() -> int:
         t0 = time.time()
 
         import torch
-        print(
-            f"[gpu] CUDA: {torch.cuda.is_available()} | "
-            f"{torch.cuda.get_device_name(0)} | "
-            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
-            flush=True,
+        # Every card, not just device 0: a multi-GPU pod that came up with
+        # fewer cards than were rented is worth seeing in the log rather than
+        # discovering from the bill.
+        _n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        _cards = " | ".join(
+            f"{torch.cuda.get_device_name(i)} "
+            f"{torch.cuda.get_device_properties(i).total_memory / 1e9:.0f}GB"
+            for i in range(_n)
         )
+        print(f"[gpu] CUDA: {torch.cuda.is_available()} | {_n} device(s) | {_cards}",
+              flush=True)
+        if _n < gpu_count:
+            print(f"[gpu] WARN rented {gpu_count} GPUs but torch sees {_n}", flush=True)
 
         from huggingface_hub import HfApi, snapshot_download, login as hf_login
 
-        # Disk split: the unquantized model + HF cache live on the VOLUME
-        # (/workspace, sized for the model), and the quantized outputs + work dir
-        # live on the CONTAINER disk (/quant). Keeping the big input and the
-        # outputs on separate disks means neither has to be sized for both, and
-        # both disks get used. Only /workspace is the mounted volume; everything
-        # else (so /quant) is the container disk.
-        workspace = Path("/workspace/blockquant")   # VOLUME: unquantized model + cache
+        # Everything on the LOCAL container disk (/quant): model, HF cache, work
+        # dir, and outputs. RunPod's /workspace volume is network-backed (mfs) in
+        # some data centers and throws IO errors under big-model load -- Xet
+        # reconstruction failures on download and stalled layer reads during
+        # convert. Local NVMe is reliable; the container is sized for all of it.
+        quant_root = Path("/quant")
+        quant_root.mkdir(parents=True, exist_ok=True)
+        workspace = quant_root / "blockquant"        # model + HF cache (local now)
         workspace.mkdir(parents=True, exist_ok=True)
         model_dir = workspace / "model"
 
-        quant_root = Path("/quant")                  # CONTAINER disk: outputs + work
-        quant_root.mkdir(parents=True, exist_ok=True)
-
-        # HF download cache sits next to the model on the volume, so the download
-        # can't fill the container disk regardless of hf_hub version.
         hf_cache = workspace / ".hf-cache"
         hf_cache.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_cache))
         os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
-        print(f"[disk] model+cache -> {workspace} (volume) | outputs+work -> "
-              f"{quant_root} (container)", flush=True)
+        # Disable Xet. Its chunk-reconstruction step hits "IO Error (os error 5)"
+        # on big repos written to the RunPod network volume; the plain HTTP path
+        # (accelerated by hf_transfer below) is reliable.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        print(f"[disk] all on local container disk: model+cache -> {workspace} | "
+              f"outputs+work -> {quant_root}", flush=True)
 
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
@@ -598,10 +959,47 @@ def main() -> int:
             raise _dl_err["exc"]
         print("[download] complete", flush=True)
 
-        _qwen2vl_preprocessor_shim(model_dir)
+        _sanitize_config(model_dir)
+        _disable_missing_mtp(model_dir)
+        _vision_preprocessor_config(model_dir)
         _ensure_fast_tokenizer(model_dir)
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
+
+        api = owner = model_name = None
+        repo_ids = []
+        if hf_token:
+            api = HfApi(token=hf_token)
+            model_name = model_id.split("/")[-1]
+            # Resolve the user portion when no org was supplied -- HF rejects
+            # bare slugs without a namespace.
+            owner = hf_org or api.whoami()["name"]
+
+        def _publish(variant, out_dir, work_dir, rec):
+            # Serial: upload one variant and free its disk before the next, so
+            # peak = model + one output + one work dir + one kl-stage, not the
+            # sum over all variants. rmtree only AFTER a confirmed upload -- on
+            # failure the dirs stay for rescue_upload.py.
+            rec["_size_gb"] = _dir_size_gb(out_dir)
+            _qc = _written_quant_config(out_dir)
+            rec["_head_bits"] = _qc.get("head_bits", head_bits)
+            rec["_codebook"] = _qc.get("codebook", codebook)
+            rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
+            if not hf_token:
+                return
+            repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
+            print(f"[upload] {variant} -> {repo_id} ...", flush=True)
+            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
+            _upload_folder_hb(api, str(out_dir), repo_id, variant)
+            rec["hf_repo_id"] = repo_id
+            rec["hf_revision"] = "main"
+            rec["hf_url"] = f"https://huggingface.co/{repo_id}"
+            repo_ids.append(repo_id)
+            # Echo the URL so the dashboard's HF_URL parser rule can populate
+            # state["hf_url"].
+            print(f"[upload] {variant} done -> {rec['hf_url']}", flush=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         outputs = []
         for variant in variants:
@@ -609,14 +1007,16 @@ def main() -> int:
             out_dir = quant_root / f"output-{bpw}bpw"
             work_dir = quant_root / f"work-{bpw}"
             if (out_dir / "config.json").exists():
-                print(f"[skip] {variant} exists at {out_dir}", flush=True)
+                print(f"[skip] {variant} already quantized at {out_dir}", flush=True)
                 rec = {"variant": variant, "path": str(out_dir)}
                 try:
                     q = json.loads((out_dir / "bq_quality.json").read_text())
                     if q.get("kl_div") is not None:
                         rec["kl_div"] = float(q["kl_div"])
+                        rec["kl_method"] = q.get("kl_method")
                 except Exception:
                     pass
+                _publish(variant, out_dir, work_dir, rec)
                 outputs.append(rec)
                 continue
             print(f"[quantize] {variant} bpw ...", flush=True)
@@ -627,9 +1027,23 @@ def main() -> int:
                 "-o", str(out_dir),
                 "-w", str(work_dir),
                 "-b", str(bpw),
-                "--head_bits", str(head_bits),
+                "--codebook", codebook,
+                # No-op on exllamav3 >= 1.4 (parallel mode became the default and
+                # the flag was kept as an accepted no-op), still meaningful on
+                # 0.0.38. Passing it keeps this script correct on either, which
+                # matters because the image can be rolled back under it.
                 "--parallel_mode",
             ]
+            # Vision tower. Omitted means exllamav3 decides: >=1.4.9 quantizes a
+            # tower the arch declares validated to 6 bpw and copies the rest at
+            # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
+            # tracks the image, and an explicit value is how a request pins it.
+            if gpu_count > 1:
+                argv += ["-d", ",".join(str(i) for i in range(gpu_count))]
+            if head_bits is not None:
+                argv += ["--head_bits", str(int(head_bits))]
+            if vision_bits is not None:
+                argv += ["-vb", str(int(vision_bits))]
             if cal_rows is not None:
                 argv += ["--cal_rows", str(int(cal_rows))]
             if cal_cols is not None:
@@ -735,19 +1149,33 @@ def main() -> int:
             rec = {"variant": variant, "path": str(out_dir)}
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
-                kl = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                kl, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
                 if kl is not None:
                     rec["kl_div"] = kl
+                    rec["kl_method"] = kl_method
                     print(f"[kl] {variant} KL(fp16||quant) = {kl:.6f}", flush=True)
                     # Persist next to the weights so a later card re-render
                     # (publish_quant) and retroactive backfill can read it back.
+                    # The method goes with it: a number measured on held-out
+                    # text and one measured on the calibration set are not the
+                    # same metric and must not share a field unlabelled.
+                    payload = json.dumps({"kl_div": kl, "kl_rows": kl_rows,
+                                          "kl_method": kl_method,
+                                          "metric": "KL(fp16||quant)"})
                     try:
-                        (out_dir / "bq_quality.json").write_text(
-                            json.dumps({"kl_div": kl, "kl_rows": kl_rows,
-                                        "metric": "KL(fp16||quant)"}),
-                            encoding="utf-8")
-                    except Exception:
-                        pass
+                        (out_dir / "bq_quality.json").write_text(payload, encoding="utf-8")
+                    except Exception as e:
+                        print(f"[kl] {variant} could not write bq_quality.json: {e}", flush=True)
+                    # KL is measured after the folder upload, so the file has to
+                    # be pushed on its own or it stays on a pod that is about to
+                    # be terminated -- which is why no published repo has one.
+                    rid = rec.get("hf_repo_id")
+                    if hf_token and rid:
+                        try:
+                            api.upload_file(path_or_fileobj=payload.encode(),
+                                            path_in_repo="bq_quality.json", repo_id=rid)
+                        except Exception as e:
+                            print(f"[kl] {variant} quality upload failed: {e}", flush=True)
             if test_prompt:
                 print(f"[sample] {variant} generating reply ...", flush=True)
                 resp = _sample_generate(out_dir, test_prompt)
@@ -758,70 +1186,20 @@ def main() -> int:
                     # status line above from being mis-parsed) so newlines/quotes
                     # in the reply survive the log relay; the bot decodes + previews.
                     print(f"[sample] {variant} b64 {b64}", flush=True)
+            _publish(variant, out_dir, work_dir, rec)
             outputs.append(rec)
 
         if hf_token:
-            print("[upload] to HuggingFace ...", flush=True)
-            api = HfApi(token=hf_token)
-            model_name = model_id.split("/")[-1]
-            # Resolve the user portion when no org was supplied — HF rejects
-            # bare slugs without a namespace.
-            owner = hf_org or api.whoami()["name"]
-
-            # Write the polished card into each output dir before upload, so
-            # upload_folder ships README.md with the weights. Best-effort:
-            # a card failure must never lose a finished quant.
+            # Re-render each card with the full cross-variant table now that every
+            # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
-                _write_cards(outputs, model_id, model_name, owner, hf_token,
-                             head_bits, cal_rows, model_dir)
+                _finalize_cards(outputs, model_id, model_name, owner, hf_token,
+                                head_bits, cal_rows, codebook, model_dir)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an
                 # UnboundLocalError in the outer handler's traceback.print_exc().
                 print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
-
-            repo_ids = []
-            for out in outputs:
-                slug = f"{model_name}-exl3-{out['variant']}bpw"
-                repo_id = f"{owner}/{slug}"
-                print(f"[upload] {out['variant']} -> {repo_id} ...", flush=True)
-                api.create_repo(
-                    repo_id=repo_id, repo_type="model",
-                    exist_ok=True, private=False,
-                )
-                # Upload on a worker thread with a heartbeat: pushing tens of GB
-                # is silent for minutes, the last quiet phase that could trip the
-                # controller's stall watchdog. Regular "[upload] still pushing"
-                # lines keep it alive. Errors surface after join().
-                import threading
-                _up_done = threading.Event()
-                _up_err: dict = {}
-
-                def _do_upload(path=out["path"], rid=repo_id) -> None:
-                    try:
-                        api.upload_folder(folder_path=path, repo_id=rid, repo_type="model")
-                    except Exception as exc:
-                        _up_err["exc"] = exc
-                    finally:
-                        _up_done.set()
-
-                _up_thread = threading.Thread(target=_do_upload, daemon=True)
-                _up_thread.start()
-                _up_secs = 0
-                while not _up_done.wait(20):
-                    _up_secs += 20
-                    print(f"[upload] {out['variant']} pushing... {_up_secs}s", flush=True)
-                _up_thread.join()
-                if "exc" in _up_err:
-                    raise _up_err["exc"]
-                out["hf_repo_id"] = repo_id
-                out["hf_revision"] = "main"
-                out["hf_url"] = f"https://huggingface.co/{repo_id}"
-                repo_ids.append(repo_id)
-                # Echo the URL so the dashboard's HF_URL parser rule can
-                # populate state["hf_url"] — without this, the run's last
-                # log line is just "[upload] complete" with no URL.
-                print(f"[upload] {out['variant']} done -> {out['hf_url']}", flush=True)
 
             try:
                 import cards
@@ -839,8 +1217,8 @@ def main() -> int:
                     _backfill_sibling_kl(
                         outputs=outputs, model_id=model_id, model_name=model_name,
                         owner=owner, hf_token=hf_token, head_bits=head_bits,
-                        cal_rows=cal_rows, kl_rows=kl_rows, model_dir=model_dir,
-                        scratch_dir=workspace,
+                        cal_rows=cal_rows, codebook=codebook, kl_rows=kl_rows,
+                        model_dir=model_dir, scratch_dir=workspace,
                     )
                 except Exception:
                     print("[backfill] WARN skipped:\n" + traceback.format_exc(),

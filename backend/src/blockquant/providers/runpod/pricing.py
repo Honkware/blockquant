@@ -1,4 +1,4 @@
-"""RunPod GPU price lookup helpers."""
+"""RunPod GPU catalogue lookups — price, and how many fit in one pod."""
 
 # Fallback prices used only when the live lookup fails. Values are the SECURE
 # rate (the higher of the two clouds) so the --max-price cap fails safe. Any
@@ -55,3 +55,14 @@ def lookup_live_price(runpod_sdk, api_key: str, gpu_type: str, cloud_type: str) 
 
 def static_price(gpu_type: str) -> float:
     return STATIC_PRICES.get(gpu_type, 2.00)
+
+
+def lookup_max_gpu_count(runpod_sdk, api_key: str, gpu_type: str) -> int | None:
+    """Most of this card RunPod will put in a single pod, or None when the
+    lookup fails. Plenty of listed cards only ever come one to a pod, and asking
+    for more of them is taken by the API and failed, which costs a whole slot in
+    the launch sweep per pass. None means "unknown, let the create decide"."""
+    runpod_sdk.api_key = api_key
+    gpu = runpod_sdk.get_gpu(gpu_type)
+    n = (gpu or {}).get("maxGpuCount")
+    return int(n) if isinstance(n, int) and n > 0 else None

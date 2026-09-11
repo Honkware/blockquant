@@ -3,6 +3,8 @@ import re
 import sys
 import types
 
+import pytest
+
 from blockquant import cards
 
 
@@ -60,7 +62,8 @@ def test_derive_facts_moe():
     assert facts["is_moe"] is True
     assert "40 layers" in facts["arch_line"]
     assert "256 experts" in facts["arch_line"]
-    assert facts["arch_badge"] == "MoE_35B--A3B"  # shields.io doubles hyphens
+    # The badge names the architecture family; dense/MoE lives in arch_line.
+    assert facts["arch_badge"] == "Qwen3Moe_35B--A3B"  # shields.io doubles hyphens
     assert "mixture-of-experts" in facts["extra_tags"]
     assert "MoE expert batching" in facts["parallel_line"]
 
@@ -72,7 +75,7 @@ def test_derive_facts_dense():
     )
     assert facts["is_moe"] is False
     assert facts["arch_line"] == "Dense &nbsp;·&nbsp; 32 layers"
-    assert facts["arch_badge"] == "Dense_8B"
+    assert facts["arch_badge"] == "Llama_8B"
     assert facts["extra_tags"] == ""
 
 
@@ -112,3 +115,79 @@ def test_render_leaves_no_placeholders():
     assert "bits_per_weight: 4.5" in card
     assert "blockblockblock/abc" in card
     assert "21.6&nbsp;GB" in card
+
+
+def test_card_states_the_codebook():
+    card = cards.render_exl3_card(
+        base_repo="org/Model-8B",
+        repo_id="blockblockblock/Model-8B-exl3-4.0bpw",
+        variant="4.0",
+        head_bits=8,
+        cal_rows=250,
+        size_gb=5.5,
+        model_config={"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 32},
+        quant_rows=[{"variant": "4.0", "head_bits": 8, "cal_rows": 250,
+                     "size_gb": 5.5, "url": None}],
+        collection_url="https://huggingface.co/collections/blockblockblock/abc",
+        quantized_by="blockblockblock",
+        codebook="mul1",
+    )
+    assert not re.search(r"\{\{[A-Z_]+\}\}", card), "unfilled placeholder left in card"
+    assert "| Codebook | `mul1` |" in card
+    assert "badge/codebook-mul1-" in card
+
+def test_slug_shapes():
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.0") == "Qwen3.8-27B-exl3-4.0bpw"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.0", vision_bits=6) == \
+        "Qwen3.8-27B-exl3-4.0bpw-V6"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.00", sc=True, head_bits=5) == \
+        "Qwen3.8-27B-exl3-SC-4.0bpw-H5"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.07", sc=True, head_bits=5, vision_bits=6) == \
+        "Qwen3.8-27B-exl3-SC-4.07bpw-H5-V6"
+
+
+def test_sc_slug_demands_head_bits():
+    """Under SC the recipe picks head bits per budget, so the name is
+    incomplete without it and there is nothing sensible to default to."""
+    with pytest.raises(ValueError):
+        cards.exl3_repo_slug("M", "4.00", sc=True)
+
+
+def test_slug_round_trips():
+    for kw in ({}, {"vision_bits": 6}, {"sc": True, "head_bits": 5},
+               {"sc": True, "head_bits": 3, "vision_bits": 3}):
+        slug = cards.exl3_repo_slug("Qwen3.8-27B", "4.07", **kw)
+        got = cards.parse_exl3_slug(slug, "Qwen3.8-27B")
+        assert got["variant"] == "4.07"
+        assert got["sc"] is kw.get("sc", False)
+        assert got["head_bits"] == kw.get("head_bits")
+        assert got["vision_bits"] == kw.get("vision_bits")
+
+
+def test_slug_rx_scoped_to_its_base():
+    """Discovery lists a whole org, so the pattern has to reject another
+    model's quants and anything that merely looks like one."""
+    for bad in ("OtherModel-exl3-4.0bpw", "Qwen3.8-27B-exl3-4.0bpw-extra",
+                "Qwen3.8-27B-exl3-4.0", "Qwen3.8-27B-4.0bpw"):
+        assert cards.parse_exl3_slug(bad, "Qwen3.8-27B") is None
+
+
+def test_two_repos_at_one_bpw_stay_distinct():
+    """A vision-quantized build sits beside the plain one at the same bpw.
+    Rebuilding a repo name from the bpw alone would collapse them."""
+    plain = cards.exl3_repo_slug("M", "4.0")
+    vis = cards.exl3_repo_slug("M", "4.0", vision_bits=6)
+    assert plain != vis
+    assert cards.parse_exl3_slug(plain, "M")["vision_bits"] is None
+    assert cards.parse_exl3_slug(vis, "M")["vision_bits"] == 6
+
+
+def test_variant_keeps_one_decimal_unless_more_says_something():
+    """4 and 4.00 are the same quant and must produce the same name; an SC
+    target really can land on 4.07, so those digits stay."""
+    for inp in (4, "4", "4.0", "4.00"):
+        assert cards.exl3_variant(inp) == "4.0"
+    assert cards.exl3_variant("4.50") == "4.5"
+    assert cards.exl3_variant("4.05") == "4.05"
+    assert cards.exl3_variant("3.14") == "3.14"
+    assert cards.exl3_repo_slug("M", "4.00") == cards.exl3_repo_slug("M", 4)

@@ -21,6 +21,91 @@ export const commands = [
         .setName('prompt')
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('vision')
+        .setDescription('Vision tower handling for multimodal models (default auto)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'auto — 6bpw where the tower is validated, else fp16 (default)', value: 'auto' },
+          { name: 'fp16 — never quantize the tower', value: 'fp16' },
+          { name: '6 — force 6bpw even on an unvalidated tower', value: '6' }
+        )
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('head_bits')
+        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default: 6 (exllamav3)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(16)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('codebook')
+        .setDescription('EXL3 trellis codebook (default auto)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'auto — mul1 for dense, mcg for MoE (default)', value: 'auto' },
+          { name: 'mul1', value: 'mul1' },
+          { name: 'mcg', value: 'mcg' },
+          { name: '3inst', value: '3inst' }
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName('catbench')
+    .setDescription('Ask a model for a cute kitten twice, and look at what comes out')
+    .addStringOption((opt) =>
+      opt
+        .setName('model')
+        .setDescription('A benched model, or a HuggingFace ID to run. Leave empty to list what is benched.')
+        .setRequired(false)
+        .setAutocomplete(true)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('refresh')
+        .setDescription('(Admin) Ignore the stored result and bench it again on a fresh pod')
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('revision')
+        .setDescription('Branch to bench, e.g. 4.00bpw. For repos that keep one quant per branch.')
+        .setRequired(false)
+    )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('contribute')
+        .setDescription('(Admin) Offer this result to the upstream CatBench gallery')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop a running quantization and terminate its pods')
+    .addStringOption((opt) =>
+      opt
+        .setName('job')
+        .setDescription('Job ID from the request card. Leave empty to stop your own running job.')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('config')
+    .setDescription('(Admin) Bot settings')
+    .addSubcommand((sub) =>
+      sub
+        .setName('quanter-role')
+        .setDescription('Role whose members run /quant without approval')
+        .addRoleOption((opt) =>
+          opt
+            .setName('role')
+            .setDescription('The role. Leave empty to clear it and require approval from everyone.')
+            .setRequired(false)
+        )
     ),
 
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),

@@ -10,6 +10,7 @@ node_modules/
 tmp/
 logs/
 data/*.json
+data/catbench/
 *.log
 
 # Python

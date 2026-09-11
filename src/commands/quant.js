@@ -17,7 +17,9 @@ import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
 import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
-import { extractSvg, renderSvgToPng } from '../utils/svg.js';
+import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
+import { claimRunSlot, releaseRunSlot } from '../services/access.js';
+import { stopButtons, stoppedEmbed } from './stop.js';
 
 const log = getLogger('cmd:quant');
 
@@ -80,65 +82,59 @@ export async function handleQuant(interaction) {
   // Optional smoke-test prompt: run on each finished quant so the requester
   // sees a real reply. Capped so it stays a quick check, not a chat session.
   const testPrompt = (interaction.options.getString('prompt') || '').trim().slice(0, 1000) || null;
+  // Trellis codebook. Recorded in the quant itself, so it decides which
+  // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
+  const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
+  // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
+  // tower whole, so the same request gives a different artifact now. fp16 is
+  // the way back.
+  const vision = interaction.options.getString('vision') || 'auto';
+  // Omitted means exllamav3 decides (6), the same way `vision: auto` sends
+  // nothing. Tracking its default beats hardcoding a copy of it here.
+  const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
-  // The request is intentionally just model + bpw. Everything else is a fixed
-  // sensible default; an admin tunes anything exotic out of band.
-  const profile = 'balanced';
+  // The request is intentionally just model + bpw; the rest is exllamav3's own
+  // defaults unless the requester says otherwise.
   const category = 'General';
   const format = 'exl3';
   const provider = 'runpod';
-  const quantOptions = {
-    headBits: config.QUANT_PROFILES[profile].headBits,
-    profile,
-  };
 
   // ── Parse & validate variant list ─────────────────────────────────────────
   let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
   if (variants.length === 0) {
     return interaction.editReply({
-      embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0` or `q4_k_m,q5_k_m`')],
+      embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0`')],
     });
   }
 
-  let bpws;
-  if (format === 'gguf') {
-    const VALID_GGUF_VARIANTS = new Set([
-      'q4_0', 'q4_1', 'q4_k_s', 'q4_k_m',
-      'q5_0', 'q5_1', 'q5_k_s', 'q5_k_m',
-      'q6_k', 'q8_0', 'f16', 'bf16',
-    ]);
-    const invalid = variants.filter((v) => !VALID_GGUF_VARIANTS.has(v.toLowerCase()));
-    if (invalid.length) {
-      return interaction.editReply({
-        embeds: [
-          embeds.error(
-            'Invalid GGUF Variant',
-            `Unknown variant(s): ${invalid.join(', ')}. Valid: ${Array.from(VALID_GGUF_VARIANTS).join(', ')}`
-          ),
-        ],
-      });
-    }
-    variants = variants.map((v) => v.toLowerCase());
-    bpws = [];
-  } else {
-    bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
-    if (bpws.length === 0) {
-      return interaction.editReply({
-        embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
-      });
-    }
-    const invalid = bpws.filter((b) => b < 1 || b > 8);
-    if (invalid.length) {
-      return interaction.editReply({
-        embeds: [
-          embeds.error('BPW Out of Range', `Values must be between 1-8. Got: ${invalid.join(', ')}`),
-        ],
-      });
-    }
-    // Normalize to one-decimal form so repo names are consistent
-    // (3 -> "3.0", matching the -exl3-3.0bpw convention).
-    variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
+  const bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
+  if (bpws.length === 0) {
+    return interaction.editReply({
+      embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
+    });
+  }
+  const invalid = bpws.filter((b) => b < 1 || b > 8);
+  if (invalid.length) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('BPW Out of Range', `Values must be between 1-8. Got: ${invalid.join(', ')}`),
+      ],
+    });
+  }
+  // Normalize to one-decimal form so repo names are consistent
+  // (3 -> "3.0", matching the -exl3-3.0bpw convention).
+  variants = bpws.map((b) => (Number.isInteger(b) ? b.toFixed(1) : String(b)));
+
+  // exllamav3 takes 1-8, or 16 for an unquantized head; 9-15 are not lattice
+  // sizes it has codebooks for. Discord caps the range at 1-16, so only the
+  // hole in the middle needs catching.
+  if (headBits !== null && headBits > 8 && headBits !== 16) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('Invalid head bits', 'Head bits must be 1-8, or 16 to leave the head unquantized.'),
+      ],
+    });
   }
 
   // ── Parse model URL ───────────────────────────────────────────────────────
@@ -197,17 +193,19 @@ export async function handleQuant(interaction) {
         const repoName = exl3RepoName(modelName, bpw);
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
-          profile,
           bpw,
-          quantOptions,
+          quantOptions: { headBits },
         });
         precheckedRepos[String(bpw)] = state;
-        if (state.exists && state.settingsMatch === false && state.reason !== 'manifest_missing') {
+        // config_missing is a repo whose config.json could not be read -- an
+        // upload still in flight, or weights that never landed. That is not a
+        // settings conflict, and blocking on it would leave no way to retry.
+        if (state.exists && state.settingsMatch === false && state.reason !== 'config_missing') {
           return interaction.editReply({
             embeds: [
               embeds.error(
                 'Existing Repo Conflict',
-                `\`${state.repoId}\` already has a manifest with different quant settings (${state.reason ?? 'manifest mismatch'}).`
+                `\`${state.repoId}\` was quantized with different settings (${state.reason ?? 'settings mismatch'}).`
               ),
             ],
           });
@@ -248,52 +246,111 @@ export async function handleQuant(interaction) {
     }
   }
 
-  // ── Persist as a pending request and post it for admin approval ───────────
+  // ── Persist the request, then run it or post it for approval ──────────────
+  // A quanter's job starts here instead of waiting on a button, so the one-job
+  // cap in claimRunSlot is the only thing between one of them and a wallet's
+  // worth of pods.
+  const slot = await claimRunSlot({ userId, member: interaction.member });
+  if (!slot.ok) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error(
+          'One job at a time',
+          slot.running
+            ? `Your \`${slot.running.modelId}\` job is still running. Stop it with \`/stop\`, or wait for it to finish.`
+            : 'Another request of yours is still being submitted.'
+        ),
+      ],
+    });
+  }
+
   const jobId = randomUUID();
-  await db.upsertJob({
-    id: jobId,
-    status: db.JOB_STATUS.pending_approval,
-    createdAt: Date.now(),
-    userId,
-    username: interaction.user.username,
-    modelId,
-    url: urlInput,
-    format,
-    variants,
-    bpws,
-    testPrompt,
-    categories: [category],
-    profile,
-    quantOptions,
-    provider,
-    precheckedRepos,
-    alreadyUploaded,
-    channelId: interaction.channelId,
-    threadId: null,
-    progressMessageId: null,
-    partialResults: [],
-  });
+  try {
+    await db.upsertJob({
+      id: jobId,
+      status: slot.quanter ? db.JOB_STATUS.queued : db.JOB_STATUS.pending_approval,
+      createdAt: Date.now(),
+      userId,
+      username: interaction.user.username,
+      modelId,
+      url: urlInput,
+      format,
+      variants,
+      bpws,
+      testPrompt,
+      codebook,
+      vision,
+      headBits,
+      categories: [category],
+      provider,
+      precheckedRepos,
+      alreadyUploaded,
+      channelId: interaction.channelId,
+      threadId: null,
+      progressMessageId: null,
+      partialResults: [],
+    });
+  } finally {
+    // The scan can see the job from here on, so the claim has done its job.
+    releaseRunSlot(userId);
+  }
 
   const costLine = provider === 'runpod' ? await costPreflightLine(variants.length) : '';
 
   const requestEmbed = embeds.info(
-    'Quantization request · awaiting approval',
+    slot.quanter ? 'Quantization request · starting' : 'Quantization request · awaiting approval',
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      `**Profile:** ${profile}  ·  **Provider:** ${provider}`,
+      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${vision}`,
+      `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
       alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
+      `**Job:** \`${jobId.slice(0, 8)}\``,
       '',
-      'An admin must approve before this runs.',
+      slot.quanter
+        ? 'Starting now — the requester holds the quanter role. Stop it with the button or `/stop`.'
+        : 'An admin must approve before this runs.',
     ].filter(Boolean).join('\n')
   );
 
-  await interaction.channel.send({
+  // The card is posted either way, so a quanter's unapproved job is still
+  // something an admin can see and stop.
+  const card = await interaction.channel.send({
     embeds: [requestEmbed],
-    components: [approvalButtons(jobId)],
+    components: [slot.quanter ? stopButtons(jobId) : approvalButtons(jobId)],
   });
+  await db.patchJob(jobId, { cardMessageId: card.id });
+
+  if (slot.quanter) {
+    await interaction.editReply({
+      embeds: [
+        embeds.success(
+          'Request started',
+          'Your quantization is starting — watch the thread. `/stop` ends it and terminates its pods.'
+        ),
+      ],
+    });
+    const job = (await db.loadJobs())[jobId];
+    try {
+      await runApprovedJob({ interaction, job });
+    } catch (err) {
+      log.error(`Failed to start quanter job ${jobId}`, { error: err.message });
+      await db.patchJob(jobId, {
+        status: db.JOB_STATUS.failed,
+        failedAt: Date.now(),
+        error: sanitizeErrorText(err.message),
+      });
+      await interaction
+        .followUp({
+          content: `Could not start the job: ${toUserMessage(err) || err.message}`,
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => {});
+    }
+    return;
+  }
 
   await interaction.editReply({
     embeds: [
@@ -322,9 +379,11 @@ export async function runApprovedJob({ interaction, job }) {
     variants,
     bpws,
     testPrompt = null,
+    codebook = config.CODEBOOK,
+    vision = 'auto',
+    // Older records predate the option; null keeps exllamav3's default.
+    headBits = null,
     categories,
-    profile,
-    quantOptions,
     provider,
     precheckedRepos = {},
   } = job;
@@ -343,6 +402,7 @@ export async function runApprovedJob({ interaction, job }) {
 
   const progressMsg = await thread.send({
     embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
+    components: [stopButtons(jobId)],
   });
 
   await db.patchJob(jobId, {
@@ -370,7 +430,10 @@ export async function runApprovedJob({ interaction, job }) {
       // Drop any pending throttled progress render so it can't fire after this
       // and overwrite the final "Complete" embed with a stale frame.
       renderParallel?.cancel();
-      await progressMsg.edit({ embeds: [embeds.jobComplete({ url: modelId, userId, results })] });
+      await progressMsg.edit({
+        embeds: [embeds.jobComplete({ url: modelId, userId, results })],
+        components: [],
+      });
       const pushedCount = results.filter((r) => r.pushed).length;
       let completionNote;
       if (pushedCount === results.length && pushedCount > 0) {
@@ -390,7 +453,7 @@ export async function runApprovedJob({ interaction, job }) {
       try {
         const svgFiles = [];
         for (const r of results) {
-          const svg = extractSvg(r.sample);
+          const svg = extractSvg(answerOf(r.sample));
           if (!svg) continue;
           try {
             svgFiles.push({ attachment: renderSvgToPng(svg), name: `sample-${r.bpw}bpw.png` });
@@ -452,7 +515,10 @@ export async function runApprovedJob({ interaction, job }) {
   async function handleError(err) {
     try {
       renderParallel?.cancel();
-      await progressMsg.edit({ embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })] });
+      await progressMsg.edit({
+        embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })],
+        components: [],
+      });
       await thread.send(`<@${userId}> Quantization failed.`);
       await db.patchJob(jobId, {
         status: db.JOB_STATUS.failed,
@@ -471,6 +537,11 @@ export async function runApprovedJob({ interaction, job }) {
   // aggregated into a single embed, one line per bpw.
   if (provider === 'runpod' && format === 'exl3') {
     await db.patchJob(jobId, { status: db.JOB_STATUS.running, startedAt: Date.now() });
+
+    // Pod ids as the controllers announce them. /stop reads them back off the
+    // job: the controller log is the other copy, and that one is only reachable
+    // while the controller record still matches this job.
+    const podIds = new Set(job.podIds ?? []);
 
     const pstate = {};
     variants.forEach((v) => {
@@ -509,9 +580,17 @@ export async function runApprovedJob({ interaction, job }) {
               modelId,
               variants: [v],
               hfOrg: config.HF_ORG,
-              calRows: 250,
               testPrompt,
+              codebook,
+              vision,
+              headBits,
               onProgress: (d) => {
+                if (d.podId && !podIds.has(d.podId)) {
+                  podIds.add(d.podId);
+                  db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
+                    log.debug(`could not record pod ${d.podId}: ${err.message}`)
+                  );
+                }
                 pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
                 renderParallel();
               },
@@ -545,11 +624,22 @@ export async function runApprovedJob({ interaction, job }) {
     } finally {
       clearInterval(heartbeat);
     }
-    await handleComplete(settled.flat());
+    // Killing the controllers fails every variant, so the normal completion
+    // path would write "Complete" over the stop card and patch the status back
+    // to completed. A stopped job is already final.
+    const after = (await db.loadJobs().catch(() => ({})))[jobId];
+    if (after?.status === db.JOB_STATUS.stopped) {
+      renderParallel.cancel();
+      await progressMsg
+        .edit({ embeds: [stoppedEmbed(after)], components: [] })
+        .catch((err) => log.debug(`stopped embed edit failed: ${err.message}`));
+    } else {
+      await handleComplete(settled.flat());
+    }
     return { thread };
   }
 
-  const useApi = format === 'gguf' || (await isApiAvailable());
+  const useApi = await isApiAvailable();
 
   if (useApi) {
     try {
@@ -559,6 +649,7 @@ export async function runApprovedJob({ interaction, job }) {
         variants,
         provider,
         hf_org: config.HF_ORG,
+        codebook,
       });
 
       await db.patchJob(jobId, {
@@ -605,8 +696,7 @@ export async function runApprovedJob({ interaction, job }) {
       url: urlInput,
       bpws,
       categories: [category],
-      profile,
-      quantOptions,
+      quantOptions: { headBits },
       precheckedRepos,
       userId,
       onProgress: (data) => updateEmbed(data),

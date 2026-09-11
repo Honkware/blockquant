@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // runpodCli pulls in config.js, which hard-exits on missing required env vars.
@@ -8,21 +8,29 @@ process.env.CLIENT_ID ??= 'test';
 process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
 
-// Mock the child process so we can drive the close handler directly: emit a
-// "Pod ID:" line, then close with (code, signal) the way Node does on a kill.
-const h = vi.hoisted(() => ({ spawn: vi.fn() }));
-vi.mock('node:child_process', () => ({ spawn: h.spawn }));
+// Mock the launcher, not child_process: the controller is reparented to init
+// and reports through files, so there is no child object to emit events on.
+// Real survival is proved in backend/tests/test_detached.py; this drives the
+// finish handler. `finish` resolves wait() the way a recorded exit status does,
+// after a line has been written to the log the real code tails.
+const h = vi.hoisted(() => ({ logPath: '', finish: null }));
+vi.mock('../src/services/detached.js', () => ({
+  spawnDetached: (opts) => {
+    h.logPath = opts.logPath;
+    return { id: 'test', pid: process.pid, logPath: opts.logPath };
+  },
+  wait: (handle, { onTick } = {}) =>
+    new Promise((resolve) => {
+      h.finish = (code, signal) => {
+        onTick?.();
+        resolve({ code, signal });
+      };
+    }),
+}));
 
 const { runViaCli, isControllerRetryable, runVariantWithRetry } = await import(
   '../src/services/runpodCli.js'
 );
-
-function fakeChild() {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  return child;
-}
 
 describe('isControllerRetryable', () => {
   it('treats a signal kill as terminal even before a pod exists', () => {
@@ -38,18 +46,18 @@ describe('isControllerRetryable', () => {
   });
 });
 
-describe('runViaCli close handler', () => {
-  beforeEach(() => h.spawn.mockReset());
+describe('runViaCli finish handler', () => {
+  beforeEach(() => {
+    h.logPath = '';
+    h.finish = null;
+  });
 
   it('rejects non-retryable when SIGKILLed after a pod was created', async () => {
-    const child = fakeChild();
-    h.spawn.mockReturnValue(child);
-
     const p = runViaCli({ modelId: 'org/model', variants: ['5.0'] });
     // Controller announced its pod, then an operator SIGKILLed it to cancel a
     // broken model (code null, signal set).
-    child.stdout.emit('data', Buffer.from('Pod ID: abc123\n'));
-    child.emit('close', null, 'SIGKILL');
+    fs.writeFileSync(h.logPath, 'Pod ID: abc123\n');
+    h.finish(null, 'SIGKILL');
 
     await expect(p).rejects.toMatchObject({
       retryable: false,
@@ -59,23 +67,17 @@ describe('runViaCli close handler', () => {
   });
 
   it('rejects non-retryable when SIGKILLed during provisioning (no pod id seen yet)', async () => {
-    const child = fakeChild();
-    h.spawn.mockReturnValue(child);
-
     const p = runViaCli({ modelId: 'org/model', variants: ['5.0'] });
     // This is the runaway repro: killed before the "Pod ID:" line. The old
     // guard (retryable = !podId) made this retryable and respawned a pod.
-    child.emit('close', null, 'SIGKILL');
+    h.finish(null, 'SIGKILL');
 
     await expect(p).rejects.toMatchObject({ retryable: false, signal: 'SIGKILL' });
   });
 
   it('keeps a clean launch failure (no pod, no signal) retryable', async () => {
-    const child = fakeChild();
-    h.spawn.mockReturnValue(child);
-
     const p = runViaCli({ modelId: 'org/model', variants: ['5.0'] });
-    child.emit('close', 1, null); // a genuine stock/launch failure before any pod
+    h.finish(1, null); // a genuine stock/launch failure before any pod
 
     await expect(p).rejects.toMatchObject({ retryable: true });
   });

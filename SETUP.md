@@ -144,6 +144,30 @@ node self-test.mjs
    python run_runpod_job.py --model <model_id> --variants 4.5 --gpu "NVIDIA H100 80GB"
    ```
 
+## Deploying a change
+
+A `/quant` run takes hours and a `/catbench` run takes 20 minutes, both on paid
+GPUs, so check before you restart:
+
+```bash
+npm run --silent status && pm2 restart blockquant
+```
+
+`npm run status` lists every controller still running and exits non-zero if
+there is one, so the `&&` holds the restart back. Restarting anyway is safe for
+the work itself — controllers are reparented to init and pm2's tree kill cannot
+reach them (`src/services/detached.js`) — but it is not safe for the Discord
+side of it:
+
+- the progress embed for a running job stops updating and never completes;
+- for `/quant`, the repo cards and the collection are written by the bot after
+  the upload, so they are skipped. Re-run them by hand once the quant lands:
+  `backend/venv/bin/python backend/scripts/publish_quant.py --base <model_id>`;
+- for `/catbench`, the result JSON is left in `backend/logs/` and nothing posts it.
+
+The bot logs both cases on the next boot ("controller survived the restart",
+"finished while the bot was down") with the log file to watch.
+
 ## Troubleshooting
 
 ### "ExLlamaV3 convert.py not found"

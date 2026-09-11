@@ -8,26 +8,18 @@ import { routeCommand } from './commands/router.js';
 import { getJobStatus, pollJob } from './services/api-client.js';
 import * as embeds from './utils/embeds.js';
 import { listPods, terminatePod } from './services/runpod.js';
+import { reapOrphans as reap } from './services/reaper.js';
+import { sweep as sweepControllers } from './services/detached.js';
+import { registerChat } from './chat/index.js';
 
 const log = getLogger('bot');
 
-// Safety net: every RunPod controller names its pod `bq-<pid>-...`. If that
-// controller process is gone, the pod is orphaned (no one will terminate it).
-// Sweep periodically and kill any such pod so a dead/crashed controller can
-// never leave a pod billing. Only ever touches `bq-`-prefixed pods.
-function controllerAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+// Safety net: every controller names its pod `bq-<pid>-<ts%100000>-<ts>`. If
+// that controller is gone, nobody will terminate the pod. Lives in
+// services/reaper.js so it is testable; see backend/scripts/pod_watchdog.py for
+// the same checks applied to pods this one does not match.
 async function reapOrphans() {
-  let pods;
-  try { pods = await listPods(); } catch { return; }
-  for (const p of pods) {
-    const m = (p.name || '').match(/^bq-(\d+)-/);
-    if (!m) continue;
-    if (controllerAlive(Number(m[1]))) continue;
-    const ok = await terminatePod(p.id);
-    log.warn(`Reaped orphan pod ${p.id} (dead controller pid ${m[1]}): ${ok ? 'terminated' : 'FAILED'}`);
-  }
+  return reap({ listPods, terminatePod });
 }
 
 function trimPresence(text, max = 128) {
@@ -72,6 +64,10 @@ const client = new Client({
 // ── Command Handling ────────────────────────────────────────────────────────
 
 client.on('interactionCreate', routeCommand);
+
+// Optional Kimi chat module — no-op unless CHAT_ENABLED + KIMI_API_KEY are set.
+// Delete this line + src/chat/ to remove the feature entirely.
+registerChat(client);
 
 // ── Ready ───────────────────────────────────────────────────────────────────
 
@@ -174,16 +170,35 @@ async function start() {
   // 2. Init job queue
   jobQueue.setPresenceUpdater((payload) => applyPresence(client, payload));
   jobQueue.init();
-  // Do NOT auto-re-run persisted jobs on restart. RunPod runs are driven by
-  // separate controller processes that don't survive a bot restart, and the old
-  // recover path re-enqueued them to the LOCAL quantizer (a 70GB download on the
-  // host). Just mark any leftover non-terminal job interrupted; the operator
-  // re-fires what they want.
+  // Controllers outlive the bot now (services/detached.js), so a restart no
+  // longer kills the work. What it does lose is the Discord half: the progress
+  // embed stops moving and nothing bot-side runs at the end. Say so, with the
+  // log to watch, because otherwise nobody finds out.
+  const { live, finished } = sweepControllers();
+  for (const c of live) {
+    const what = `${c.kind} ${c.meta?.modelId || c.id}`;
+    log.warn(`${what} controller survived the restart (pid ${c.pid}); its embed is dead. Watch ${c.logPath}`);
+  }
+  if (live.some((c) => c.kind === 'quant')) {
+    log.warn('Cards and the collection are written bot-side: run backend/scripts/publish_quant.py --base <model> once those land');
+  }
+  for (const c of finished) {
+    const out = c.meta?.resultPath ? `, result ${c.meta.resultPath}` : '';
+    log.warn(`${c.kind} ${c.meta?.modelId || c.id} finished while the bot was down: ${c.logPath}${out}`);
+  }
+  const liveModels = new Set(live.map((c) => c.meta?.modelId).filter(Boolean));
+
+  // Do NOT auto-re-run persisted jobs on restart: the old recover path
+  // re-enqueued them to the LOCAL quantizer (a 70GB download on the host). Mark
+  // any leftover non-terminal job interrupted; the operator re-fires what they
+  // want, or lets a surviving controller finish it.
   const stale = await db.listRecoverableJobs();
   for (const job of stale) {
     await db.patchJob(job.id, {
       status: db.JOB_STATUS.failed,
-      error: 'interrupted by bot restart',
+      error: liveModels.has(job.modelId)
+        ? 'bot restarted; controller still running, quant will upload without the bot'
+        : 'interrupted by bot restart',
       failedAt: Date.now(),
     });
   }

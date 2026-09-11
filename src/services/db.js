@@ -55,7 +55,7 @@ async function save(filename, data) {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-const FILES = { users: 'users.json', models: 'models.json' };
+const FILES = { users: 'users.json', models: 'models.json', settings: 'settings.json' };
 const JOB_STATUS = Object.freeze({
   pending_approval: 'pending_approval',
   queued: 'queued',
@@ -64,6 +64,9 @@ const JOB_STATUS = Object.freeze({
   failed: 'failed',
   completed: 'completed',
   rejected: 'rejected',
+  // Terminal, and deliberately not in listRecoverableJobs: someone killed this
+  // job's pods on purpose, so a restart must not treat it as work to pick up.
+  stopped: 'stopped',
 });
 
 export async function loadModels() {
@@ -71,6 +74,23 @@ export async function loadModels() {
 }
 export async function saveModels(d) {
   return save(FILES.models, d);
+}
+
+/**
+ * Runtime settings an admin changes from Discord (currently just the quanter
+ * role). Same shape as the rest of this store: one small JSON object, written
+ * through the atomic tmp+rename above.
+ */
+export async function loadSettings() {
+  return load(FILES.settings);
+}
+
+export async function patchSettings(patch) {
+  return enqueue(async () => {
+    const next = { ...(await load(FILES.settings)), ...patch };
+    await saveRaw(FILES.settings, next);
+    return next;
+  });
 }
 
 export async function loadJobs() {

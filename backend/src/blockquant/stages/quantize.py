@@ -154,6 +154,7 @@ def run(config: QuantConfig, workspace: Path, progress_callback=None) -> dict:
                 head_bits=config.head_bits,
                 cal_rows=config.cal_rows,
                 cal_cols=config.cal_cols,
+                codebook=config.codebook,
                 parallel_mode=config.parallel_mode,
                 high_quality=variant in config.high_quality_bpws,
                 head_bits_8=variant in config.head_bits_8_bpws,
@@ -169,23 +170,6 @@ def run(config: QuantConfig, workspace: Path, progress_callback=None) -> dict:
                         variant=variant,
                         format=QuantFormat.EXL3,
                         output_path=str(out_dir),
-                        file_size_mb=size_mb,
-                    )
-                )
-
-    elif config.format == QuantFormat.GGUF:
-        f16_path = workspace / "model.f16.gguf"
-        for variant in config.variants:
-            out_path = workspace / f"model-{variant}.gguf"
-
-            ok = _run_gguf_quantize(f16_path, out_path, variant, config.use_imatrix)
-            if ok:
-                size_mb = out_path.stat().st_size / (1024 * 1024)
-                outputs.append(
-                    QuantOutput(
-                        variant=variant,
-                        format=QuantFormat.GGUF,
-                        output_path=str(out_path),
                         file_size_mb=size_mb,
                     )
                 )
@@ -206,6 +190,7 @@ def _run_exl3_quantize(
     head_bits,
     cal_rows,
     cal_cols,
+    codebook: str = "mul1",
     parallel_mode: bool = False,
     high_quality: bool = False,
     head_bits_8: bool = False,
@@ -242,6 +227,7 @@ def _run_exl3_quantize(
             "-w", str(work_dir),
             "-b", str(bpw),
             "--head_bits", str(head_bits),
+            "--codebook", codebook,
         ]
 
     if cal_rows:
@@ -273,24 +259,3 @@ def _run_exl3_quantize(
     return True
 
 
-def _run_gguf_quantize(f16_path: Path, out_path: Path, variant: str, use_imatrix: bool):
-    """Run llama.cpp llama-quantize."""
-    quant_bin = Path("llama.cpp/llama-quantize")
-    if not quant_bin.exists():
-        raise FileNotFoundError("llama.cpp/llama-quantize not found. Build llama.cpp first.")
-
-    cmd = [str(quant_bin)]
-    if use_imatrix:
-        imatrix = f16_path.parent / "imatrix.dat"
-        if imatrix.exists():
-            cmd += ["--imatrix", str(imatrix)]
-    cmd += [str(f16_path), str(out_path), variant]
-
-    logger.info(f"Running llama-quantize: {variant}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log_file = out_path.parent / f"llama-quantize-{variant}-error.log"
-        log_file.write_text(result.stderr, encoding="utf-8")
-        logger.error(f"llama-quantize failed (see {log_file}): {result.stderr[:400]}")
-        return False
-    return True

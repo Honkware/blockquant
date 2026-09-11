@@ -1,12 +1,11 @@
-"""6-stage pipeline.
+"""5-stage pipeline.
 
 Stages mirror the existing Node.js flow:
   1. download   → snapshot_download from HF Hub
-  2. convert    → FP16 for GGUF; no-op for EXL3 (uses HF directly)
-  3. quantize   → ExLlamaV3 convert.py OR llama.cpp quantize
-  4. verify     → load test + sample generation
-  5. report     → perplexity + model card generation
-  6. upload     → huggingface-cli upload
+  2. quantize   → ExLlamaV3 convert.py
+  3. verify     → load test + sample generation
+  4. report     → perplexity + model card generation
+  5. upload     → huggingface-cli upload
 
 The output shape matches what the existing queue.js expects.
 """
@@ -30,7 +29,7 @@ from blockquant.receipts import (
     update_receipt_remote,
     update_receipt_stage,
 )
-from blockquant.stages import download, convert, quantize, verify, report, upload, quality
+from blockquant.stages import download, quantize, verify, report, upload, quality
 from blockquant.providers import get_provider
 from blockquant.poll import poll_remote
 from blockquant.monitoring import record_job_start, record_job_complete
@@ -57,21 +56,21 @@ def _run_remote_pipeline(
         provider_kwargs["api_key"] = config.runpod_api_key
         provider_kwargs["gpu_type"] = config.runpod_gpu_type
         provider_kwargs["cloud_type"] = config.runpod_cloud_type.value
-        provider_kwargs["container_disk_gb"] = config.runpod_container_disk_gb
-        # Size the /workspace VOLUME (where the model, work dir, and all outputs
-        # live) so the final safetensors write can't ENOSPC. Never below the
-        # configured value, so an explicit larger setting still wins.
+        # Everything (model, cache, work, outputs) lives on the local NVMe
+        # container disk now (remote/quant.py); the /workspace volume is a stub.
+        # Size the container for the bounded serial peak, never below configured.
         from blockquant.providers.runpod.provider import RunPodProvider as _RP
-        _recommended_vol = _RP.recommend_volume_gb(
+        _rec_container = _RP.recommend_container_gb(
             config.model_id, config.variants, config.hf_token
         )
-        _vol = max(config.runpod_volume_gb, _recommended_vol)
-        if _vol != config.runpod_volume_gb:
+        _container = max(config.runpod_container_disk_gb, _rec_container)
+        if _container != config.runpod_container_disk_gb:
             logger.info(
-                f"Volume disk: {_vol} GB "
-                f"(configured {config.runpod_volume_gb}, model needs ~{_recommended_vol})"
+                f"Container disk: {_container} GB "
+                f"(configured {config.runpod_container_disk_gb}, model needs ~{_rec_container})"
             )
-        provider_kwargs["volume_gb"] = _vol
+        provider_kwargs["container_disk_gb"] = _container
+        provider_kwargs["volume_gb"] = 10
         provider_kwargs["ssh_key_path"] = config.runpod_ssh_key_path
 
     provider = None
@@ -121,6 +120,7 @@ def _run_remote_pipeline(
             hf_org=config.hf_org,
             head_bits=config.head_bits,
             use_imatrix=config.use_imatrix,
+            codebook=config.codebook,
         )
 
         # Poll until the remote process exits, bounded so a hung pod cannot
@@ -244,17 +244,7 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     if not stages[-1].success:
         return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
-    # Stage 2: Convert (GGUF only)
-    if config.format == QuantFormat.GGUF:
-        _report("convert", 18)
-        stages.append(_run_receipted_stage(receipt_path, "convert", convert.run, config, workspace))
-        _report("convert", 22)
-        if not stages[-1].success:
-            return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
-    else:
-        update_receipt_stage(receipt_path, "convert", "skipped")
-
-    # Stage 3: Quantize
+    # Stage 2: Quantize
     _report("quantize", 25, "starting quantization")
     update_receipt_stage(receipt_path, "quantize", "running")
     q_result = quantize.run(config, workspace, _report)
@@ -275,12 +265,12 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
         update_receipt_stage(receipt_path, "quantize", "failed")
         return _finalize(job_id, config, stages, outputs, t0, receipt_path=receipt_path)
 
-    # Stage 4: Verify
+    # Stage 3: Verify
     _report("verify", 90, "verifying outputs")
     stages.append(_run_receipted_stage(receipt_path, "verify", verify.run, config, workspace, outputs))
     update_receipt_outputs(receipt_path, outputs)
 
-    # Stage 4b: Quality (KL + PPL) — optional
+    # Stage 3b: Quality (KL + PPL) — optional
     if config.verify_quality and config.format == QuantFormat.EXL3 and outputs:
         _report("quality", 91, "running quality metrics (KL + PPL)")
         stages.append(_run_receipted_stage(receipt_path, "quality", _run_quality_stage, config, workspace, outputs))
@@ -289,11 +279,11 @@ def run_pipeline(config: QuantConfig, progress_callback=None) -> PipelineResult:
     else:
         update_receipt_stage(receipt_path, "quality", "skipped")
 
-    # Stage 5: Report (model card)
+    # Stage 4: Report (model card)
     _report("report", 95, "generating model cards")
     stages.append(_run_receipted_stage(receipt_path, "report", report.run, config, workspace, outputs))
 
-    # Stage 6: Upload
+    # Stage 5: Upload
     _report("upload", 97, "uploading to HuggingFace")
     stages.append(_run_receipted_stage(receipt_path, "upload", upload.run, config, workspace, outputs))
     update_receipt_outputs(receipt_path, outputs)

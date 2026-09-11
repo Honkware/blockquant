@@ -79,7 +79,6 @@ def main():
                          "the model download plus its bpw output.")
     ap.add_argument("--cal-rows", type=int, default=250)
     ap.add_argument("--cloud", default="COMMUNITY")
-    ap.add_argument("--profile", default="balanced")
     ap.add_argument("--log-dir", default="/tmp/blockquant-parallel")
     ap.add_argument("--dashboard-dir", default=str(REPO_ROOT / "backend" / "logs"),
                     help="Where to write complete (header + stream) logs for log_dashboard.py.")
@@ -104,7 +103,7 @@ def main():
         cmd = [
             sys.executable, str(RUN_JOB),
             "--model", args.model, "--variants", v,
-            "--profile", args.profile, "--skip-local-exllama",
+            "--skip-local-exllama",
             "--cal-rows", str(args.cal_rows), "--cloud", args.cloud,
             "--gpu", args.gpu, "--min-vram", str(args.min_vram),
             "--container-disk", str(args.container_disk),

@@ -11,6 +11,7 @@ Example:
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -34,10 +35,12 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
-# Blackwell-class GPUs (sm_100/sm_120) need CUDA 12.8+ / torch >= 2.7; our
-# torch 2.6 + cu124 has no kernels for them. Matched as substrings of the
-# RunPod GPU id (e.g. "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090").
-_BLACKWELL_EXCLUDE = ("Blackwell", "B200", "B300", "RTX 5090", "RTX 5080", "RTX 5070")
+# Datacenter Blackwell (sm_100). The image compiles for 8.0/8.6/8.9/9.0/12.0,
+# so consumer and pro Blackwell (sm_120: RTX 5090, RTX PRO Blackwell) run, but
+# sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
+# TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
+# RunPod GPU id.
+_BLACKWELL_EXCLUDE = ("B200", "B300")
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
@@ -50,28 +53,70 @@ _WEAK_FOR_QUANT = {"NVIDIA L4"}
 # as substrings of the RunPod GPU id.
 _NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
 
-# exllamav3 version is chosen by architecture. The stable release (0.0.37, what
-# the bootstrap path installs) handles the proven models incl. Qwen3.6. The
-# master build (0.0.38) adds newer archs like LFM2 but REGRESSES others
-# (Qwen3.6 segfaults loading the first layer), so we only reach for the master
-# image when the model's architecture actually needs it.
-_MASTER_IMAGE = os.environ.get("RUNPOD_MASTER_IMAGE", "ghcr.io/honkware/blockquant:v0.1.3")
-_MASTER_ONLY_ARCH_MARKERS = ("lfm2",)
+# --- arch-support registry (the committed single source of truth) -------------
+# The pre-flight gate reads backend/arch_support.json (generated from exllamav3
+# by gen_arch_support.py). One image carries every architecture exllamav3
+# supports, so nothing here picks an image any more -- the registry only answers
+# "can exllamav3 read this arch at all", which is worth knowing before a pod is
+# rented and 70GB is pulled.
 
 
-def _arch_needs_master(model_id: str, token: str) -> bool:
-    """True if the model's architecture is only supported on exllamav3 master."""
+def _load_arch_support() -> set:
+    """Lowercased arch strings from arch_support.json, or an empty set if absent."""
+    import json as _json
+    p = Path(__file__).parent.parent / "arch_support.json"
+    try:
+        d = _json.loads(p.read_text())
+        return {a.lower() for a in d.get("architectures", [])}
+    except Exception:
+        return set()
+
+
+def _default_codebook(model_id: str, token: str) -> str:
+    """mul1 for dense, mcg for MoE.
+
+    mul1 sums 4 bytes per weight where mcg sums 2, which is a closer fit to the
+    Gaussian the trellis assumes. But exl3_moe.cu only had a fused kernel for
+    mcg, so a mul1 MoE silently dropped to the general expert path: right
+    answer, slower inference, paid by everyone who downloads it. Dense models
+    have no such kernel and take mul1 free.
+
+    exllamav3 1.4 widened the MoE fused path to mul1 as well (block_sparse_mlp
+    accepts either codebook, as long as gate/up/down agree), so this rule is no
+    longer forced -- but mcg is fused on every version we might run, including
+    an image rolled back to 0.0.38, so it stays the MoE default until a mul1 MoE
+    has been measured. Unreadable config gets mcg, the one nothing penalises.
+    """
     try:
         import json as _json
         from huggingface_hub import hf_hub_download
-        p = hf_hub_download(model_id, "config.json", token=token or None)
-        with open(p) as f:
-            cfg = _json.load(f)
-        archs = " ".join(cfg.get("architectures") or [])
-        hay = f"{archs} {cfg.get('model_type', '')}".lower()
-        return any(m in hay for m in _MASTER_ONLY_ARCH_MARKERS)
+        cfg = _json.loads(Path(hf_hub_download(model_id, "config.json", token=token or None)).read_text())
     except Exception:
-        return False
+        return "mcg"
+    # Multimodal repos put the LM's geometry under text_config.
+    for scope in (cfg, cfg.get("text_config") or {}):
+        if any(scope.get(k) for k in ("num_local_experts", "num_experts", "n_routed_experts")):
+            return "mcg"
+    return "mul1"
+
+
+def _resolve_arch(model_id: str, token: str, revision: str = ""):
+    """(arch, supported, config_read_ok). arch is the first declared architecture
+    exllamav3 knows, else whatever the config declares first."""
+    import json as _json
+    from huggingface_hub import hf_hub_download
+    try:
+        p = hf_hub_download(model_id, "config.json", token=token or None,
+                            revision=revision or None)
+        cfg = _json.loads(Path(p).read_text())
+    except Exception:
+        return "", False, False
+    reg = _load_arch_support()
+    for a in (cfg.get("architectures") or []):
+        if a.lower() in reg:
+            return a, True, True
+    archs = cfg.get("architectures") or []
+    return (archs[0] if archs else cfg.get("model_type", "?")), False, True
 
 
 def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
@@ -81,12 +126,14 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     have succeeded even though the controller lost contact."""
     try:
         from huggingface_hub import HfApi
+
+        from blockquant import cards
         api = HfApi(token=token or None)
         base = model_id.split("/")[-1]
         org = hf_org or (api.whoami() or {}).get("name", "")
         for v in variants:
             try:
-                info = api.model_info(f"{org}/{base}-exl3-{v}bpw")
+                info = api.model_info(cards.exl3_repo_id(org, base, v))
                 if "config.json" in {s.rfilename for s in (info.siblings or [])}:
                     return True
             except Exception:
@@ -96,11 +143,74 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
     return False
 
 
+_FRAME = ("Traceback", "  File ", "During handling", "The above exception")
+
+
+def _last_exception(lines: list[str]) -> str:
+    """Final exception line plus its continuation.
+
+    HfHubHTTPError puts a request id on the first line and the server's actual
+    message on the ones after it, so the single line that matches "Error" is the
+    half that says nothing. Keep the continuation, drop the request id.
+    """
+    idx = next((i for i in range(len(lines) - 1, -1, -1)
+                if lines[i][:1].isalpha() and ":" in lines[i]
+                and ("Error" in lines[i] or "Exception" in lines[i])), None)
+    if idx is None:
+        return ""
+    parts = [lines[idx].strip()]
+    for ln in lines[idx + 1:]:
+        s = ln.strip()
+        if not s or ln.startswith(_FRAME) or s.startswith("["):
+            break
+        parts.append(s)
+        if sum(map(len, parts)) > 600:
+            break
+    msg = re.sub(r"\(Request ID: [^)]*\)\s*", "", " ".join(parts)).strip()
+    return msg[:600] if msg else " ".join(parts)[:600]
+
+
+def _drain_failure(provider, instance_id, outcome: str) -> str:
+    """Distill a one-line reason from the remote log for a non-done outcome, so a
+    failure surfaces as the real cause instead of a bare exit code."""
+    try:
+        tail = provider.get_progress(instance_id, lines=500, raw=True) or ""
+    except Exception:
+        tail = ""
+    lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+    exc = _last_exception(lines)
+    if outcome == "failed":
+        return f"remote quant crashed: {exc or (lines[-1] if lines else 'see controller log')}"
+    if outcome == "no_result":
+        # The remote process ended on its own but left no bq-result.json, so it
+        # never reached its own except handler: a signal kill, not an exception.
+        # The last log line is where it stopped, which is the whole diagnosis.
+        return ("pod exited without a result file and nothing reached HF; remote log ends at: "
+                + (exc or (lines[-1][-200:] if lines else 'no output at all')))
+    return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
+
+
+# Cards worth renting, best first. --gpu/--gpu-fallback override this; without
+# them the launcher walks the list on a stock-out. Cloud defaults to ALL so both
+# the community and secure pools are searched -- stock blips per pool and half
+# the fleet is invisible if you pin one.
+_PREFERRED_GPUS = [
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 NVL",
+    "NVIDIA H100 PCIe",
+    "NVIDIA A100-SXM4-80GB",
+]
+
+
 def _recommend_max_price(base_gb: float | None) -> float:
-    """Price cap scaled to model size. The quant is compute-bound, so a big
-    model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
-    while a small model is plenty fast on the cheap tier. Tiers by HF download
-    GB (35B ~= 72 GB, 8B ~= 17 GB)."""
+    """Price cap scaled to model size, PER GPU-HOUR. The quant is compute-bound,
+    so a big model finishes ~3x faster on an A100/H100 for roughly the same
+    TOTAL cost, while a small model is plenty fast on the cheap tier. Tiers by
+    HF download GB (35B ~= 72 GB, 8B ~= 17 GB).
+
+    The caller multiplies by the pod's GPU count, since --max-price caps the
+    pod, not the card.
+    """
     if not base_gb:
         return 1.5
     if base_gb <= 20:
@@ -110,6 +220,21 @@ def _recommend_max_price(base_gb: float | None) -> float:
     if base_gb <= 100:
         return 1.80   # ~25-50B: A100 tier (worth it, ~3x faster)
     return 2.80       # 50B+: A100 80GB / H100
+
+
+def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
+    """Resolve --max-price into a ceiling on the POD's $/hr.
+
+    RunPod bills per card, so the cap is compared against the card's rate times
+    gpu_count. 'auto' scales its per-card recommendation by the same count:
+    asking for four cards does not make each one less appropriate for the model,
+    and a cap left at the one-GPU figure would reject every candidate and burn
+    the whole launch sweep. A pinned number is taken at face value -- it already
+    names the pod, so 8 GPUs under --max-price 2 means eight cards at 25c.
+    """
+    if str(max_price).strip().lower() == "auto":
+        return _recommend_max_price(base_gb) * gpu_count
+    return float(max_price)
 
 
 def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
@@ -156,6 +281,49 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
     big = bool(base_gb and base_gb > 25)
     cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
     return [gid for _, gid in cards]
+
+
+_GHCR_ACCEPT = ",".join((
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+))
+
+
+def _image_missing(image: str) -> bool:
+    """True only when GHCR is certain the tag was never pushed.
+
+    A tag that is not there costs one pod per card in the sweep: RunPod takes
+    the create, fails the pull, and EXITs the pod inside five seconds, which
+    reads up here as "pod never came up" on every card in turn. The build
+    workflow tags sha-<HEAD of the dispatched ref>, not the commit that touched
+    the Dockerfile, so pinning a tag that does not exist is easy to do and
+    expensive to diagnose. One HEAD against the registry rules it out.
+
+    Anything unverifiable -- another registry, a private repo, a network blip --
+    answers False, so this can only ever stop a launch that was already doomed.
+    """
+    import json
+    import urllib.error
+    import urllib.request as u
+    if not image.startswith("ghcr.io/"):
+        return False
+    repo, _, tag = image[len("ghcr.io/"):].partition(":")
+    if not tag or "@" in image:
+        return False
+    try:
+        tok = json.load(u.urlopen(
+            f"https://ghcr.io/token?scope=repository:{repo}:pull&service=ghcr.io",
+            timeout=15))["token"]
+        u.urlopen(u.Request(
+            f"https://ghcr.io/v2/{repo}/manifests/{tag}", method="HEAD",
+            headers={"Authorization": f"Bearer {tok}", "Accept": _GHCR_ACCEPT}), timeout=15)
+    except urllib.error.HTTPError as e:
+        return e.code == 404
+    except Exception:
+        return False
+    return False
 
 
 def _terminate_stray_pods(api_key: str, prefix: str, keep_id: str = "") -> list[str]:
@@ -208,16 +376,26 @@ def main():
         help="Comma-separated GPU types to try if --gpu is out of stock. Ignored when --gpu auto.",
     )
     parser.add_argument(
+        "--gpu-count", type=int, default=1,
+        help="GPUs per pod (default 1). RunPod bills per card, so an N-GPU pod "
+             "burns N x the card's hourly rate -- --max-price caps the POD, and "
+             "is compared against that product. Multi-GPU stock is much thinner "
+             "than single: if none is free the run fails rather than quietly "
+             "renting fewer cards than asked for.",
+    )
+    parser.add_argument(
         "--min-vram", type=int, default=24,
         help="With --gpu auto, only consider cards with at least this many GB of VRAM "
              "(quant is layer-by-layer and peaks ~4GB, so small cards are fine).",
     )
     parser.add_argument(
         "--max-price", default="auto",
-        help="With --gpu auto, skip any card over this $/hr. 'auto' scales the "
-             "cap to the model size (small models -> cheap cards; a big model -> "
-             "A100/H100 since it's compute-bound and ~3x faster for ~the same "
-             "total cost). A number pins it; 0 disables the cap.",
+        help="Ceiling on the POD's $/hr -- the card's rate times --gpu-count, "
+             "which is what RunPod actually bills. With --gpu auto, any card "
+             "whose pod would cost more is skipped. 'auto' scales the cap to the "
+             "model size (small models -> cheap cards; a big model -> A100/H100 "
+             "since it's compute-bound and ~3x faster for ~the same total cost) "
+             "and then by --gpu-count. A number pins it; 0 disables the cap.",
     )
     parser.add_argument(
         "--container-disk", default="auto",
@@ -241,7 +419,8 @@ def main():
         "--launch-retry-delay", type=int, default=30,
         help="Seconds to wait between GPU sweeps when everything was out of stock.",
     )
-    parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
+    parser.add_argument("--cloud", default="ALL",
+                        help="ALL (both pools, default), COMMUNITY or SECURE")
     parser.add_argument(
         "--image",
         default="",
@@ -254,7 +433,20 @@ def main():
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
-    parser.add_argument("--head-bits", type=int, default=8, help="Head bits for quantization")
+    parser.add_argument("--head-bits", type=int, default=None,
+                        help="Head bits (1-8, or 16 unquantized). Omitted: exllamav3's default of 6")
+    parser.add_argument(
+        "--codebook", choices=["auto", "mcg", "mul1", "3inst"],
+        default=os.environ.get("BLOCKQUANT_CODEBOOK", "auto"),
+        help="EXL3 trellis codebook. auto (default) picks mul1 for dense and mcg "
+             "for MoE, which keeps the fused MoE kernel. ExLlamaV3's own default is mcg.",
+    )
+    parser.add_argument(
+        "--vision-bits", type=int, default=None,
+        help="Bits for a multimodal model's vision tower: 1-8, or 16 to copy it "
+             "unquantized. Omitted lets exllamav3 choose (6 where the tower is "
+             "validated, else 16).",
+    )
     parser.add_argument(
         "--local-exllama",
         type=Path,
@@ -279,15 +471,6 @@ def main():
     )
     # Speedup tuning surface
     parser.add_argument(
-        "--profile",
-        choices=["fast", "balanced", "quality"],
-        default="balanced",
-        help=(
-            "Speedup preset. Sets cloud + cal_rows + GPU preference. "
-            "Per-knob flags below override the preset."
-        ),
-    )
-    parser.add_argument(
         "--cal-rows", type=int, default=None,
         help="Override calibration rows (preset: fast=128 / balanced=250 / quality=512).",
     )
@@ -309,27 +492,27 @@ def main():
     )
     args = parser.parse_args()
 
-    # ---- Resolve --profile + per-knob overrides -------------------------
-    # Only apply preset's cloud/GPU when the user didn't pass theirs.
+    # Resolve the codebook before anything reads it: the summary, the [job]
+    # header and the provider all want a concrete value, not "auto".
+    if args.codebook == "auto":
+        args.codebook = _default_codebook(args.model, args.hf_token)
+
+    # Only apply the built-in preferences when the user didn't pass their own.
     cli_passed_cloud = "--cloud" in sys.argv
     cli_passed_gpu = "--gpu" in sys.argv
     cli_passed_fallback = "--gpu-fallback" in sys.argv
 
-    profile_cfg = RunPodProvider.resolve_profile(
-        args.profile,
-        cal_rows=args.cal_rows,
-        cal_cols=args.cal_cols,
-    )
-    cal_rows = profile_cfg["cal_rows"]
-    cal_cols = profile_cfg["cal_cols"]
-    if not cli_passed_cloud:
-        args.cloud = profile_cfg["cloud_type"]
+    # Unset means the converter is never given --cal_rows/--cal_cols, so it
+    # uses its own 250x2048 rather than a copy of those numbers pinned here.
+    cal_rows = args.cal_rows
+    cal_cols = args.cal_cols
     if not cli_passed_gpu and not cli_passed_fallback:
-        # Promote the profile's GPU list into --gpu + --gpu-fallback.
-        prefs = profile_cfg["gpu_preference"]
-        args.gpu = prefs[0]
-        args.gpu_fallback = ",".join(prefs[1:])
+        args.gpu = _PREFERRED_GPUS[0]
+        args.gpu_fallback = ",".join(_PREFERRED_GPUS[1:])
 
+    if args.gpu_count < 1:
+        print(f"ERROR: --gpu-count must be at least 1 (got {args.gpu_count})")
+        sys.exit(1)
     if not args.hf_token:
         print("ERROR: HF_TOKEN required (set env var or pass --hf-token)")
         sys.exit(1)
@@ -337,10 +520,11 @@ def main():
         print("ERROR: RUNPOD_API_KEY required (set env var or pass --runpod-api-key)")
         sys.exit(1)
 
-    # Disk split: the VOLUME (/workspace) holds the unquantized model + HF cache;
-    # the CONTAINER disk (/quant) holds the quantized outputs + work dir. Each
-    # auto-sizes from the model + requested variants when set to "auto"; a number
-    # pins it.
+    # Model, cache, work, and outputs ALL live on the LOCAL container disk now --
+    # RunPod's /workspace volume is network-backed (mfs) in some DCs and throws
+    # IO errors under big-model load. recommend_container_gb sizes the bounded
+    # serial peak (model + one output + one work + one kl-stage); the volume is
+    # a small unused stub.
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
         args.container_disk = RunPodProvider.recommend_container_gb(
@@ -348,34 +532,41 @@ def main():
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
-        args.volume_disk = RunPodProvider.recommend_volume_gb(
-            args.model, _variants, args.hf_token)
+        args.volume_disk = 10
     else:
         args.volume_disk = int(args.volume_disk)
-    print(f"[disk] model+cache -> /workspace volume {args.volume_disk} GB | "
-          f"outputs+work -> container {args.container_disk} GB", flush=True)
+    print(f"[disk] all on local NVMe container -> /quant ({args.container_disk} GB) | "
+          f"/workspace volume {args.volume_disk} GB stub", flush=True)
 
     # Model size (HF download GB) drives the price cap AND the card ordering:
     # big models go to a capable card (compute-bound, ~3x faster for ~same total
     # cost), small ones stay cheap. Computed once, reused for both.
     _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
-    if str(args.max_price).strip().lower() == "auto":
-        args.max_price = _recommend_max_price(_base_gb)
-    else:
-        args.max_price = float(args.max_price)
-    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}, "
+    # A ceiling on the POD, not the card: it is compared against
+    # get_cost_per_hour(), which is the card's rate times --gpu-count.
+    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count)
+    print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
+          f"({args.gpu_count} GPU), "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
 
-    # Pick exllamav3 by architecture (unless an image was pinned explicitly).
-    # Stable 0.0.37 (the bootstrap path) for the proven models incl. Qwen3.6;
-    # the master image only for archs that need it (e.g. LFM2), since master
-    # regresses Qwen3.6.
+    # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
+    # is rented and the weights are pulled. The image is whatever the bot pinned
+    # (RUNPOD_IMAGE); it carries every supported arch, so there is nothing to
+    # route. An unreadable config falls through -- the pod reports the real error.
+    _reg = _load_arch_support()
+    if _reg:
+        _arch, _supported, _ok = _resolve_arch(args.model, args.hf_token)
+        if _ok and not _supported:
+            print(f"[joberror] unsupported architecture '{_arch}' -- not in the exllamav3 "
+                  f"{len(_reg)}-arch support set. Refusing before launch (no pod, no download).",
+                  flush=True)
+            sys.exit(2)
     if not args.image:
-        if _arch_needs_master(args.model, args.hf_token):
-            args.image = _MASTER_IMAGE
-            print(f"[image] {args.model} needs exllamav3 master; using {args.image}", flush=True)
-        else:
-            print("[image] bootstrap path (exllamav3 0.0.37, stable)", flush=True)
+        print("[image] bootstrap path (exllamav3 from PyPI, installed in-pod)", flush=True)
+    elif _image_missing(args.image):
+        print(f"[joberror] image tag is not in the registry: {args.image}. "
+              f"Nothing can boot from it; fix the pin before renting a card.", flush=True)
+        sys.exit(2)
 
     # ---- --tune: read-only diagnostic ---------------------------------
     if args.tune:
@@ -384,6 +575,7 @@ def main():
             tune_provider = RunPodProvider(
                 api_key=args.runpod_api_key,
                 gpu_type=args.gpu,
+                gpu_count=args.gpu_count,
                 cloud_type=args.cloud,
             )
             rate = tune_provider.get_cost_per_hour()
@@ -393,19 +585,22 @@ def main():
         # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
         # NVL with cal_rows=250 — use that as the baseline.
         baseline_h = 3.7
-        wt_factor = RunPodProvider.PROFILES[args.profile]["_walltime_factor"]
+        # Not scaled by --gpu-count: the baseline is a single-card measurement
+        # and nobody has timed a multi-GPU convert yet, so the band reads
+        # pessimistic on a multi-GPU pod rather than promising a speedup.
         # If user picked SXM, knock another ~10% off; SECURE adds ~5% more
         # consistency (fewer slowdowns) so net wash with COMMUNITY+SXM.
         gpu_speedup = 0.9 if "HBM3" in args.gpu else 1.0
-        eta_low_h = baseline_h * wt_factor * gpu_speedup * 0.85
-        eta_high_h = baseline_h * wt_factor * gpu_speedup * 1.10
+        eta_low_h = baseline_h * gpu_speedup * 0.85
+        eta_high_h = baseline_h * gpu_speedup * 1.10
         cost_low = eta_low_h * rate
         cost_high = eta_high_h * rate
 
         print()
-        print(f"  PROFILE: {args.profile}  ({RunPodProvider.PROFILES[args.profile]['_summary']})")
-        print(f"  GPU:     {args.gpu}   ${rate:.2f}/hr ({args.cloud.lower()})")
+        gpus = f"{args.gpu}{f' x{args.gpu_count}' if args.gpu_count > 1 else ''}"
+        print(f"  GPU:     {gpus}   ${rate:.2f}/hr per pod ({args.cloud.lower()})")
         print(f"  CAL:     {cal_rows} rows × {cal_cols} cols")
+        print(f"  BOOK:    {args.codebook} codebook")
         if args.network_volume_id:
             print(f"  VOL:     {args.network_volume_id} (DC: {args.data_center_id or 'unset!'})")
         else:
@@ -421,12 +616,17 @@ def main():
     # Header line consumed by log_dashboard.py's parser. Skip the hf_org
     # field entirely when unset so the dashboard doesn't render the literal
     # placeholder "(personal)" as if it were a real account name.
-    header = (
-        f"[job] model={args.model} variants={args.variants} format=exl3 "
-        f"head_bits={args.head_bits}"
-    )
+    # codebook goes last: the parser's hf_org group has to sit directly after
+    # head_bits, so anything new belongs past the end of what it reads.
+    header = f"[job] model={args.model} variants={args.variants} format=exl3"
+    # Both optional fields are omitted rather than printed empty; the parser's
+    # groups are optional, so a missing one reads as "not pinned" instead of
+    # the dashboard showing the word None as if it were a setting.
+    if args.head_bits is not None:
+        header += f" head_bits={args.head_bits}"
     if args.hf_org:
         header += f" hf_org={args.hf_org}"
+    header += f" codebook={args.codebook}"
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
@@ -460,12 +660,17 @@ def main():
     ssh = None
     last_err = None
     _price_cache: dict = {}
+    _maxgpu_cache: dict = {}
+    # Only worth printing when it isn't the usual single card; log_dashboard
+    # parses the GPU id out of these lines and " x1" would just ride along.
+    n_tag = f" x{args.gpu_count}" if args.gpu_count > 1 else ""
     sweeps = max(1, args.launch_retries)
     for sweep in range(1, sweeps + 1):
         for candidate, cloud in candidate_pairs:
             attempt = RunPodProvider(
                 api_key=args.runpod_api_key,
                 gpu_type=candidate,
+                gpu_count=args.gpu_count,
                 cloud_type=cloud,
                 container_disk_gb=args.container_disk,
                 volume_gb=args.volume_disk,
@@ -475,9 +680,23 @@ def main():
                 data_center_id=args.data_center_id,
                 name_prefix=run_tag,
             )
-            # Price cap (cached per gpu+cloud so retries stay fast). Skip cards
-            # over --max-price so a stock-out can't push us onto an idle
-            # H100/A100 at several times the cost of a capable cheap card.
+            # Plenty of listed cards are only ever sold one to a pod. RunPod
+            # takes the create anyway and fails it, so without this every sweep
+            # spends a slot per such card. Asked once per card, and only in the
+            # multi-GPU path so single-GPU jobs make no extra API calls.
+            if args.gpu_count > 1:
+                if candidate not in _maxgpu_cache:
+                    _maxgpu_cache[candidate] = attempt.max_gpu_count()
+                per_pod = _maxgpu_cache[candidate]
+                if per_pod is not None and per_pod < args.gpu_count:
+                    print(f"      {candidate} tops out at {per_pod} GPU/pod, "
+                          f"need {args.gpu_count}, skipping", flush=True)
+                    continue
+            # Price cap (cached per gpu+cloud so retries stay fast). The rate is
+            # the POD's -- card rate x --gpu-count -- so the cap means the same
+            # thing whatever the count. Skip cards over --max-price so a
+            # stock-out can't push us onto an idle H100/A100 at several times
+            # the cost of a capable cheap card.
             ckey = (candidate, cloud)
             rate = _price_cache.get(ckey)
             if rate is None:
@@ -487,10 +706,10 @@ def main():
                     rate = 0.0
                 _price_cache[ckey] = rate
             if args.max_price and rate and rate > args.max_price:
-                print(f"      {candidate} ({cloud}) ${rate:.2f}/hr over cap "
+                print(f"      {candidate}{n_tag} ({cloud}) ${rate:.2f}/hr over cap "
                       f"${args.max_price:.2f}, skipping", flush=True)
                 continue
-            print(f"[1/6] Trying {candidate}  (~${rate:.2f}/hr {cloud})...", flush=True)
+            print(f"[1/6] Trying {candidate}{n_tag}  (~${rate:.2f}/hr {cloud})...", flush=True)
             try:
                 instance_id = attempt.launch({})
             except Exception as e:
@@ -517,7 +736,8 @@ def main():
             # and fall through to the next card. So one bad host can't kill the
             # run while other stock is free, and the launch budget covers dead
             # hosts as well as stock-outs.
-            print(f"      Pod ID: {instance_id}  (GPU: {candidate}, {cloud}, ~${rate:.2f}/hr)", flush=True)
+            print(f"      Pod ID: {instance_id}  (GPU: {candidate}{n_tag}, "
+                  f"{cloud}, ~${rate:.2f}/hr)", flush=True)
             print("[2/6] Waiting for SSH (up to 10 min)...", flush=True)
             try:
                 active = attempt.wait_for_active(instance_id)
@@ -525,8 +745,8 @@ def main():
                 active = {"status": "error", "error": str(e)}
             if active.get("status") != "active":
                 print(f"      pod {instance_id} did not become active "
-                      f"({active.get('status')}); terminating and trying the next card",
-                      flush=True)
+                      f"({active.get('error') or active.get('status')}); "
+                      f"terminating and trying the next card", flush=True)
                 try:
                     attempt.terminate(instance_id)
                 except Exception:  # noqa: BLE001
@@ -555,6 +775,15 @@ def main():
 
     if provider is None or instance_id is None:
         _terminate_stray_pods(args.runpod_api_key, run_tag)
+        if args.gpu_count > 1:
+            # The count is never reduced to whatever is free. A job asks for N
+            # cards because it needs N, and a pod silently handed one would run
+            # the whole thing on a single GPU (or OOM) while billing as though
+            # nothing was wrong. Fail, say why, let the caller decide.
+            print(f"[joberror] no {args.gpu_count}-GPU pod was free on any candidate card after "
+                  f"{sweeps} sweeps; multi-GPU stock is far thinner than single-GPU. The GPU "
+                  f"count is not reduced automatically -- re-run with a lower --gpu-count to "
+                  f"take what is available.", flush=True)
         print(f"ERROR: all GPU candidates out of stock after {sweeps} sweeps. "
               f"Last error: {last_err}")
         sys.exit(1)
@@ -594,13 +823,15 @@ def main():
             hf_token=args.hf_token,
             hf_org=args.hf_org,
             head_bits=args.head_bits,
+            codebook=args.codebook,
+            vision_bits=args.vision_bits,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
             test_prompt=args.test_prompt,
         )
         if launch_result.get("status") != "started":
-            print(f"ERROR: run_pipeline failed: {launch_result}")
+            print(f"[joberror] remote pipeline never started: {launch_result}", flush=True)
             sys.exit(1)
         print(f"      Remote script started")
 
@@ -622,10 +853,8 @@ def main():
             on_progress=_print_new,
         )
         if outcome != "done":
-            print(
-                f"\n[watchdog] remote run hit the '{outcome}' limit; terminating pod.",
-                flush=True,
-            )
+            print(f"\n[joberror] {_drain_failure(provider, instance_id, outcome)}; terminating pod.",
+                  flush=True)
             sys.exit(3)  # finally still terminates the pod
 
         # One deep final drain (last ~500 lines) so the local log captures
@@ -662,7 +891,7 @@ def main():
                 print("      result unreadable over SSH, but the variant is on HF "
                       "-> treating as complete", flush=True)
                 sys.exit(0)
-            print("ERROR: no result file on pod and nothing on HF — check log tail above")
+            print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result')}", flush=True)
             sys.exit(1)
         status = result.get("status", "unknown")
         print(f"      Status: {status}")
@@ -673,7 +902,8 @@ def main():
             print(f"      Remote time: {result.get('total_time', 0):.0f}s")
             print(f"      Total time (incl. pod lifecycle): {elapsed:.0f}s  ≈  ${cost:.2f}")
         else:
-            print(f"      Error: {result.get('error', 'unknown')}")
+            print(f"[joberror] remote quant reported {status}: "
+                  f"{result.get('error', 'unknown')}", flush=True)
             sys.exit(1)
 
     finally:

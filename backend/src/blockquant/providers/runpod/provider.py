@@ -30,7 +30,7 @@ from pathlib import Path
 from blockquant.providers.base import Provider
 from blockquant.providers.runpod.constants import BOOTSTRAP_MARKER, REMOTE_LOG, REMOTE_RESULT, REMOTE_SCRIPT
 from blockquant.providers.runpod.deps import _ensure_paramiko, _ensure_runpod
-from blockquant.providers.runpod.pricing import lookup_live_price, static_price
+from blockquant.providers.runpod.pricing import lookup_live_price, lookup_max_gpu_count, static_price
 from blockquant.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,78 +47,14 @@ class RunPodProvider(Provider):
 
     DEFAULT_SSH_KEY = Path.home() / ".ssh" / "id_rsa"
 
-    # ----- Speedup profiles ----------------------------------------------
-    # Curated sets of (cloud, GPU preference, calibration depth) that the
-    # CLI exposes via --profile. Each preset is a default; any explicit
-    # CLI flag from the user overrides the matching preset value.
-    #
-    # Wall-time / cost columns are rough multipliers vs `balanced` for a
-    # 35B-class MoE — adjust expectations linearly for other model sizes.
-    PROFILES: dict[str, dict] = {
-        "fast": {
-            "cloud_type": "COMMUNITY",
-            "gpu_preference": [
-                "NVIDIA H100 80GB HBM3",
-                "NVIDIA H100 NVL",
-                "NVIDIA H100 PCIe",
-                "NVIDIA A100-SXM4-80GB",
-            ],
-            "cal_rows": 128,
-            "cal_cols": 2048,
-            "_walltime_factor": 0.6,
-            "_cost_factor": 0.7,
-            "_summary": "fewer cal rows, community cloud — quickest cheap run",
-        },
-        "balanced": {
-            "cloud_type": "COMMUNITY",
-            "gpu_preference": [
-                "NVIDIA H100 80GB HBM3",
-                "NVIDIA H100 NVL",
-                "NVIDIA H100 PCIe",
-                "NVIDIA A100-SXM4-80GB",
-            ],
-            "cal_rows": 250,
-            "cal_cols": 2048,
-            "_walltime_factor": 1.0,
-            "_cost_factor": 1.0,
-            "_summary": "default — ExLlamaV3's standard calibration",
-        },
-        "quality": {
-            "cloud_type": "SECURE",
-            "gpu_preference": ["NVIDIA H100 80GB HBM3"],
-            "cal_rows": 512,
-            "cal_cols": 2048,
-            "_walltime_factor": 1.4,
-            "_cost_factor": 1.4,
-            "_summary": "secure cloud + deeper calibration — for the public-facing run you cite as canonical",
-        },
-    }
-
-    @classmethod
-    def resolve_profile(cls, profile: str, **overrides) -> dict:
-        """Merge a named profile with explicit per-knob overrides.
-
-        Returns a dict containing `cloud_type`, `gpu_preference` (list),
-        `cal_rows`, `cal_cols`. Any kwarg in ``overrides`` whose value is
-        not None replaces the profile's value. Unknown profile names
-        raise ``KeyError``.
-        """
-        if profile not in cls.PROFILES:
-            raise KeyError(
-                f"Unknown profile {profile!r}. Available: {', '.join(cls.PROFILES)}"
-            )
-        base = {k: v for k, v in cls.PROFILES[profile].items() if not k.startswith("_")}
-        for k, v in overrides.items():
-            if v is not None and v != "":
-                base[k] = v
-        return base
 
 
     def __init__(
         self,
         api_key: str = "",
         gpu_type: str = "NVIDIA H100 80GB HBM3",
-        cloud_type: str = "COMMUNITY",
+        gpu_count: int = 1,
+        cloud_type: str = "ALL",
         container_disk_gb: int = 150,
         volume_gb: int = 100,
         ssh_key_path: str = "",
@@ -136,6 +72,12 @@ class RunPodProvider(Provider):
             )
         self.api_key = api_key
         self.gpu_type = gpu_type
+        if int(gpu_count) < 1:
+            raise ValueError(f"gpu_count must be at least 1, got {gpu_count}")
+        # RunPod bills per card, so an N-GPU pod burns N x the card's listed
+        # rate. get_cost_per_hour() reports the pod total for that reason and
+        # everything that compares against a cap uses that number.
+        self.gpu_count = int(gpu_count)
         self.cloud_type = cloud_type
         self.container_disk_gb = container_disk_gb
         self.volume_gb = volume_gb
@@ -179,7 +121,6 @@ class RunPodProvider(Provider):
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     @staticmethod
-    @staticmethod
     def _base_download_gb(model_id: str, token: str = "") -> float | None:
         """Total HF download size of the base model in GB, or None on lookup
         failure."""
@@ -192,50 +133,53 @@ class RunPodProvider(Provider):
         return base_gb if base_gb > 0 else None
 
     @staticmethod
-    def recommend_volume_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 60
-    ) -> int:
-        """Size the /workspace VOLUME, which now holds ONLY the unquantized model
-        plus its HF download cache (the quantized outputs + work dir live on the
-        container disk; see recommend_container_gb and remote/quant.py).
-
-        Sized as base_download x1.4 (model + any cache duplication during
-        download) + a margin. Falls back generously if the HF size lookup fails,
-        and never drops below floor_gb.
-        """
-        import math
-        base_gb = RunPodProvider._base_download_gb(model_id, token)
-        if base_gb is None:
-            return max(floor_gb, 250)
-        needed = base_gb * 1.4 + 20.0
-        return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
+    def _base_vocab(model_id: str, token: str = "") -> int | None:
+        """vocab_size from the model's config.json, or None on lookup failure.
+        Drives the KL-stage term in recommend_container_gb."""
+        import json
+        from pathlib import Path
+        try:
+            from huggingface_hub import hf_hub_download
+            p = hf_hub_download(model_id, "config.json", token=token or None)
+            cfg = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        v = cfg.get("vocab_size") or (cfg.get("text_config") or {}).get("vocab_size")
+        return int(v) if v else None
 
     @staticmethod
     def recommend_container_gb(
         model_id: str, variants, token: str = "", floor_gb: int = 120
     ) -> int:
-        """Size the CONTAINER disk, which holds the OS + deps plus the quantized
-        outputs and the conversion work dir (remote/quant.py writes outputs +
-        work to /quant on the container disk).
+        """Size the local-NVMe container disk for the SERIAL pipeline. remote/
+        quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
+        before the next, and everything (model, cache, work, outputs) lives on
+        the container disk -- the /workspace volume is a stub. So the peak is
+        bounded to one variant, NOT the sum:
 
-        remote/quant.py quantizes every requested variant before uploading, so
-        their outputs accumulate; size for the SUM of all outputs + one work dir
-        + an OS/deps margin. Never drops below floor_gb (the image + caches need
-        headroom regardless).
+            base_gb                       fp16 download, ~1x on disk via local_dir
+          + base_gb * max_bpw/16          largest single output
+          + base_gb * max_bpw/16          largest single work dir (~one output)
+          + kl_rows*seq_len*vocab*2        fp16 logits staged for the KL eval
+          + 30                             OS + torch/deps + scratch
+
+        Falls back generously when the HF lookups fail; never below floor_gb.
         """
         import math
         base_gb = RunPodProvider._base_download_gb(model_id, token)
         if base_gb is None:
-            return max(floor_gb, 160)
+            return max(floor_gb, 200)
         bpws = []
         for v in variants:
             try:
                 bpws.append(float(v))
             except (TypeError, ValueError):
-                bpws.append(8.0)  # non-numeric (e.g. GGUF): worst case
-        outputs = sum(base_gb * b / 16.0 for b in bpws)
-        work = base_gb * (max(bpws) if bpws else 8.0) / 16.0
-        needed = outputs + work + 40.0  # +40 for OS + torch/deps + scratch
+                bpws.append(8.0)  # non-numeric: worst case
+        max_bpw = max(bpws) if bpws else 8.0
+        out = work = base_gb * max_bpw / 16.0
+        vocab = RunPodProvider._base_vocab(model_id, token) or 200000
+        kl = 32 * 2048 * vocab * 2 / 1024**3
+        needed = base_gb + out + work + kl + 30.0
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------
@@ -245,7 +189,7 @@ class RunPodProvider(Provider):
     def launch(self, config: dict) -> str:
         rp = _ensure_runpod()
         rp.api_key = self.api_key
-        logger.info(f"Creating RunPod pod with GPU: {self.gpu_type}")
+        logger.info(f"Creating RunPod pod with GPU: {self.gpu_type} x{self.gpu_count}")
 
         # Image priority:
         #   1. Explicit override (constructor arg or BLOCKQUANT_RUNPOD_IMAGE env)
@@ -263,6 +207,9 @@ class RunPodProvider(Provider):
             name=f"{self.name_prefix}-{int(time.time())}",
             image_name=image,
             gpu_type_id=self.gpu_type,
+            # Never passed before: the SDK defaults it to 1, which is why
+            # every pod this launcher rented came back single-GPU.
+            gpu_count=self.gpu_count,
             cloud_type=self.cloud_type,
             container_disk_in_gb=self.container_disk_gb,
             volume_in_gb=self.volume_gb,
@@ -617,10 +564,12 @@ class RunPodProvider(Provider):
             lambda sftp: sftp.put(str(local_path), remote_path),
         )
 
-    def _upload_bytes(self, instance_id: str, data: bytes, remote_path: str):
+    def _upload_bytes(self, instance_id: str, data: bytes, remote_path: str, mode: int | None = None):
         def _put(sftp):
             with sftp.file(remote_path, "wb") as f:
                 f.write(data)
+            if mode is not None:
+                sftp.chmod(remote_path, mode)
         self._sftp_put_with_retry(instance_id, _put)
 
     def _upload_directory(self, instance_id: str, local_dir: Path, remote_dir: str):
@@ -738,8 +687,13 @@ class RunPodProvider(Provider):
             # signal) rather than rejecting a working image.
             mn = _MIN_EXLLAMAV3
             health_code = (
-                "import torch, exllamav3, sys\n"
+                "import torch, sys\n"
                 "print('[gpu]', torch.cuda.get_device_name(0))\n"
+                "try:\n"
+                "    import triton; print('[triton]', triton.__version__)\n"
+                "except Exception as e:\n"
+                "    print('[triton] ERR', repr(e))\n"
+                "import exllamav3\n"
                 "v = ''\n"
                 "try:\n"
                 "    from importlib.metadata import version as _ver\n"
@@ -763,7 +717,7 @@ class RunPodProvider(Provider):
             if health["code"] != 0:
                 logger.error(
                     f"Pre-baked health check failed (code {health['code']}):\n"
-                    f"{health['stdout'].strip()}\n{health['stderr'][:1500]}"
+                    f"{health['stdout'].strip()}\n...\n{health['stderr'][-2500:]}"
                 )
                 return False
             logger.info(f"Health check output:\n{health['stdout'].strip()}")
@@ -1006,17 +960,19 @@ class RunPodProvider(Provider):
         variants: list[str],
         hf_token: str = "",
         hf_org: str = "",
-        head_bits: int = 8,
-        use_imatrix: bool = True,
+        head_bits: int | None = None,
+        vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
         keep_pod: bool = False,
         test_prompt: str | None = None,
+        codebook: str = "mul1",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
         ``cal_rows``/``cal_cols`` override ExLlamaV3's calibration defaults
-        (250 × 2048). Lower values trade quality for speed; see PROFILES.
+        (250 × 2048). Lower values trade quality for speed.
+        ``codebook`` is the EXL3 trellis codebook (mcg, mul1 or 3inst).
         """
         # Reset any cached result from a prior call.
         self._last_result = None
@@ -1042,12 +998,18 @@ class RunPodProvider(Provider):
             "hf_token": hf_token,
             "hf_org": hf_org,
             "head_bits": head_bits,
+            "vision_bits": vision_bits,
+            "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
             "keep_pod": bool(keep_pod),
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
+            # Carried for the remote side, which does not read it yet:
+            # exllamav3's convert defaults to --devices 0, so the extra cards on
+            # a multi-GPU pod sit idle until quant.py passes this through.
+            "gpu_count": self.gpu_count,
         }
         if cal_rows is not None:
             cfg["cal_rows"] = int(cal_rows)
@@ -1055,7 +1017,8 @@ class RunPodProvider(Provider):
             cfg["cal_cols"] = int(cal_cols)
         if test_prompt:
             cfg["test_prompt"] = str(test_prompt)
-        self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json")
+        # 0600 + quant.py unlinks it right after parse: it holds the HF token + key.
+        self._upload_bytes(instance_id, json.dumps(cfg).encode("utf-8"), "/root/bq-config.json", mode=0o600)
 
         # 2. Locate the remote quant script. On pre-baked images it lives
         # at /opt/blockquant/quant.py; otherwise we SFTP the canonical
@@ -1131,9 +1094,26 @@ class RunPodProvider(Provider):
 
     def is_pipeline_running(self, instance_id: str) -> bool:
         """True while the remote quant.py process is alive."""
+        # Match BOTH launch paths. run_pipeline runs the baked copy at
+        # /opt/blockquant/quant.py whenever the image has one (which every
+        # current image does) and only falls back to REMOTE_SCRIPT on a
+        # bootstrap pod, so probing REMOTE_SCRIPT alone never matched a real
+        # run. That was invisible while the pattern self-matched its own probe
+        # and always said "running"; once the self-match was fixed it inverted
+        # into "done" on the first two polls, so the controller declared every
+        # baked run finished ~30s in, found no result file, and killed the pod.
+        #
+        # Bracketing the first char is what stops the self-match: as a regex
+        # "[/]opt/..." matches "/opt/..." but not the literal "[/]opt/..." in
+        # the probe's own bash -c command line.
+        pats = "|".join(f"[{p[0]}]{p[1:]}" for p in (self._BAKED_REMOTE_QUANT, REMOTE_SCRIPT))
+        # No pgrep (a lean image without procps) must not read as "finished":
+        # fail closed to running and let stall_timeout/max_runtime bound the run,
+        # the same way poll_remote treats an SSH error.
         result = self.run(
             instance_id,
-            f"pgrep -f '{REMOTE_SCRIPT}' >/dev/null && echo running || echo done",
+            f"command -v pgrep >/dev/null 2>&1 || {{ echo running; exit 0; }}; "
+            f"pgrep -f '{pats}' >/dev/null && echo running || echo done",
         )
         return result["stdout"].strip() == "running"
 
@@ -1182,7 +1162,20 @@ class RunPodProvider(Provider):
         return None
 
     def get_cost_per_hour(self) -> float:
+        """$/hr for the whole pod, i.e. the card's rate times gpu_count. The
+        price lookups are all per-card; handing that figure to a cost estimate
+        or a price cap would understate a multi-GPU pod by exactly gpu_count,
+        which is how you rent an 8x H100 while believing you capped at one."""
         live = self._lookup_live_price()
-        if live is not None:
-            return live
-        return static_price(self.gpu_type)
+        rate = live if live is not None else static_price(self.gpu_type)
+        return rate * self.gpu_count
+
+    def max_gpu_count(self) -> int | None:
+        """How many of self.gpu_type RunPod will put in one pod, or None if the
+        lookup fails (caller should then just try the create)."""
+        rp = _ensure_runpod()
+        try:
+            return lookup_max_gpu_count(rp, self.api_key, self.gpu_type)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"maxGpuCount lookup failed ({e}); letting the create decide")
+            return None

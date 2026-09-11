@@ -10,6 +10,35 @@ function isAdmin(userId) {
   return config.ADMIN_IDS.includes(userId);
 }
 
+/**
+ * /config quanter-role [role] — set the role that skips approval, or clear it
+ * by leaving the option off. Stored in the settings file rather than .env
+ * because it has to take effect without a restart.
+ */
+export async function handleConfig(interaction) {
+  if (!isAdmin(interaction.user.id)) {
+    return interaction.reply({
+      embeds: [embeds.error('🚫 Forbidden', 'Admin only.')],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const role = interaction.options.getRole('role');
+  await db.patchSettings({ quanterRoleId: role ? role.id : null });
+
+  return interaction.reply({
+    embeds: [
+      role
+        ? embeds.success(
+            'Quanter role set',
+            `Members of <@&${role.id}> can run \`/quant\` without approval, one job at a time, and \`/stop\` their own.`
+          )
+        : embeds.warning('Quanter role cleared', 'Every request needs admin approval again.'),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 export async function handlePause(interaction) {
   if (!isAdmin(interaction.user.id)) {
     return interaction.reply({

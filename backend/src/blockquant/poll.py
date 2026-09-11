@@ -17,6 +17,20 @@ DEFAULT_MAX_RUNTIME_S = 8 * 3600
 DEFAULT_STALL_TIMEOUT_S = 60 * 60
 
 
+def _final_outcome(provider, instance_id) -> str:
+    """The remote process is gone -- decide a clean finish from a crash by the
+    raw log, so a layer-0 convert crash reports "failed", not "done"."""
+    try:
+        tail = provider.get_progress(instance_id, lines=300, raw=True) or ""
+    except Exception:
+        return "done"  # can't read; the caller's result-file read is authoritative
+    if "[done]" in tail:
+        return "done"
+    if "Traceback (most recent call last)" in tail:
+        return "failed"
+    return "done"
+
+
 def poll_remote(
     provider,
     instance_id,
@@ -30,10 +44,10 @@ def poll_remote(
 ) -> str:
     """Poll until the remote process exits or a bound trips.
 
-    Returns "done" on a normal exit, "max_runtime" when the run passes
-    max_runtime, or "stalled" when no new log output arrives within
-    stall_timeout. The caller is responsible for terminating the pod in
-    every case.
+    Returns "done" on a normal exit, "failed" when the process is gone but the
+    log shows a crash (no [done], a Traceback), "max_runtime" when the run passes
+    max_runtime, or "stalled" when no new log output arrives within stall_timeout.
+    The caller is responsible for terminating the pod in every case.
 
     ``_now`` and ``_sleep`` are injectable for tests.
     """
@@ -70,7 +84,7 @@ def poll_remote(
         if not running:
             not_running += 1
             if not_running >= 2:
-                return "done"
+                return _final_outcome(provider, instance_id)
         else:
             not_running = 0
         _sleep(poll_interval)

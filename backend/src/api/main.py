@@ -11,10 +11,12 @@ import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 from blockquant.models import (
+    DEFAULT_CODEBOOK,
     JobStatusResponse,
     ProviderName,
     QuantFormat,
     RunPodCloudType,
+    validate_codebook,
     validate_hf_org,
     validate_model_id,
     validate_variants,
@@ -44,6 +46,7 @@ class QuantRequest(BaseModel):
     high_quality_bpws: list[str] = Field(default_factory=list)
     head_bits_8_bpws: list[str] = Field(default_factory=list)
     verify_quality: bool = True
+    codebook: str = DEFAULT_CODEBOOK
     # RunPod settings
     runpod_api_key: str = ""
     runpod_gpu_type: str = "NVIDIA H100 80GB HBM3"
@@ -61,6 +64,11 @@ class QuantRequest(BaseModel):
     @classmethod
     def _validate_hf_org(cls, value: str) -> str:
         return validate_hf_org(value)
+
+    @field_validator("codebook")
+    @classmethod
+    def _validate_codebook(cls, value: str) -> str:
+        return validate_codebook(value)
 
     @field_validator("runpod_container_disk_gb", "runpod_volume_gb")
     @classmethod

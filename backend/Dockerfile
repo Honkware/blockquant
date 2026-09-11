@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml requirements.txt ./
 COPY src ./src
 
-RUN pip install --no-cache-dir -e ".[dev,gguf]"
+RUN pip install --no-cache-dir -e ".[dev]"
 
 ENV PYTHONPATH=/app/src
 

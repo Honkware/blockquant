@@ -94,10 +94,10 @@ Main options from `src/commands/definitions.js`:
 | Option | Required | Notes |
 |---|---:|---|
 | `url` | yes | HuggingFace model ID or URL, for example `meta-llama/Llama-3.1-8B-Instruct` |
-| `bpw` | yes | Comma-separated EXL3 bpw values such as `4.0,4.5,5.0`; GGUF uses names such as `q4_k_m` |
+| `bpw` | yes | Comma-separated EXL3 bpw values such as `4.0,4.5,5.0` |
 | `profile` | no | `fast`, `balanced`, or `quality` |
 | `head_bits` | no | Admin override for EXL3 head bits |
-| `format` | no | `exl3` by default; `gguf` is also accepted by the API |
+| `vision` | no | Vision tower on multimodal models: `auto` (default), `fp16` to copy it unquantized, or `6` |
 | `category` | no | Used for bot metadata/history |
 | `provider` | no | `local` or `runpod`; defaults to local in the command UI |
 

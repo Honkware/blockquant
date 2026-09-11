@@ -1,6 +1,7 @@
 import { EmbedBuilder } from 'discord.js';
 import { progressBar, truncate } from './format.js';
 import { sanitizeErrorText } from '../errors/taxonomy.js';
+import { answerOf } from './svg.js';
 
 const COLORS = {
   info: 0x5865f2, // blurple
@@ -18,7 +19,7 @@ export function jobQueued({ url, bpws, categories, userId }) {
     .setColor(COLORS.info)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'BPW', value: bpws.map((b) => `\`${b}\``).join('  '), inline: true },
       { name: 'Categories', value: categories.join(', ') || 'None', inline: true }
     )
@@ -47,7 +48,7 @@ export function jobProgress({
     .setColor(COLORS.pending)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Stage', value: stage ?? 'Working…', inline: true },
       { name: 'Current', value: bpwText, inline: true },
       { name: 'Progress', value: bar, inline: false },
@@ -84,7 +85,7 @@ export function jobProgressParallel({ url, userId, variants, state }) {
     .setColor(color)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Variants', value: lines.join('\n') || 'starting...', inline: false }
     )
     .setTimestamp();
@@ -108,11 +109,17 @@ export function jobComplete({ url, userId, results }) {
     // Optional smoke-test reply: an SVG is rendered + attached separately, so
     // just flag it; otherwise quote a one-line text preview under the variant.
     if (r.sample) {
-      if (/<svg[\s\S]*?<\/svg>/i.test(r.sample)) {
+      // Reasoning models spend the budget inside <think> before answering, so
+      // preview what they answered. No answer at all means they never got out
+      // of it, which is worth saying instead of quoting the monologue.
+      const answer = answerOf(r.sample);
+      if (/<svg[\s\S]*?<\/svg>/i.test(answer)) {
         line += `\n> 🎨 SVG rendered below`;
-      } else {
-        const preview = truncate(r.sample.replace(/\s*\n+\s*/g, ' ').trim(), 280);
+      } else if (answer) {
+        const preview = truncate(answer.replace(/\s*\n+\s*/g, ' ').trim(), 280);
         if (preview) line += `\n> 💬 ${preview}`;
+      } else {
+        line += `\n> \u{1F4AD} reasoning only \u2014 no answer within the token budget`;
       }
     }
     return line;
@@ -122,7 +129,7 @@ export function jobComplete({ url, userId, results }) {
     .setTitle('✅ Quantization Complete')
     .setColor(COLORS.success)
     .setDescription(`Requested by <@${userId}>`)
-    .addFields({ name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false });
+    .addFields({ name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false });
 
   // Chunk result lines into fields of ≤1024 characters each
   const FIELD_LIMIT = 1024;
@@ -152,7 +159,7 @@ export function jobFailed({ url, userId, error }) {
     .setColor(COLORS.error)
     .setDescription(`Requested by <@${userId}>`)
     .addFields(
-      { name: 'Model', value: `\`${truncate(url, 80)}\``, inline: false },
+      { name: 'Model', value: `[\`${truncate(url, 80)}\`](https://huggingface.co/${url})`, inline: false },
       { name: 'Error', value: `\`\`\`${truncate(safeError, 500)}\`\`\``, inline: false }
     )
     .setTimestamp();

@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
+import { spawnDetached, wait } from './detached.js';
 
 const log = getLogger('runpod-cli');
 
@@ -9,6 +11,7 @@ const ROOT = config.ROOT_DIR;
 const SCRIPT = path.join(ROOT, 'backend', 'scripts', 'run_runpod_job.py');
 const PUBLISH = path.join(ROOT, 'backend', 'scripts', 'publish_quant.py');
 const PYTHON = config.PYTHON_BIN || path.join(ROOT, 'backend', 'venv', 'bin', 'python');
+const LOG_DIR = path.join(ROOT, 'backend', 'logs');
 
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
@@ -25,6 +28,9 @@ const RE = {
   // The `b64` sentinel avoids matching the "[sample] N generating..." status line:
   // "[sample] 4.0 b64 <base64>"
   sample: /\[sample\]\s*([0-9.]+)\s+b64\s+([A-Za-z0-9+/=]+)/,
+  // The controller's one-line reason for a run that produced nothing. Without
+  // this the user gets "exited 1 with no uploads", which says nothing.
+  jobError: /\[joberror\]\s*(.+)/,
 };
 
 /**
@@ -86,14 +92,32 @@ export async function runVariantWithRetry(
  * (so the embed shows the variant actually running, not just the first) and
  * resolves with one result row per variant.
  */
-export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt = null, onProgress }) {
+export function runViaCli({
+  modelId,
+  variants,
+  hfOrg,
+  calRows = null,
+  testPrompt = null,
+  codebook = config.CODEBOOK,
+  vision = 'auto',
+  headBits = null,
+  gpuCount = null,
+  onProgress,
+}) {
   return new Promise((resolve, reject) => {
     const args = [
       SCRIPT,
       '--model', modelId,
       '--variants', variants.join(','),
       '--skip-local-exllama',
-      '--cal-rows', String(calRows),
+      // EXL3 trellis codebook. The CLI validates it against the same three
+      // values the converter takes, so a bad one dies here, not on a pod.
+      '--codebook', String(codebook),
+      // Vision tower. 'auto' sends nothing, so exllamav3 decides -- which is
+      // what changed at 1.4.9, where a validated tower drops to 6 bpw instead
+      // of being copied whole. fp16 is the way back to the old artifact.
+      ...(vision === 'fp16' ? ['--vision-bits', '16']
+        : vision && vision !== 'auto' ? ['--vision-bits', String(vision)] : []),
       // Cheapest card that fits, walking up on stock-outs. Without this the
       // CLI uses the profile's H100/A100 list and dies fast when those are
       // unavailable. Disk is auto-sized by the CLI (default).
@@ -113,6 +137,18 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
       // a genuinely dead pod, so give the stall watchdog a wide 3h window.
       '--stall-timeout', '10800',
     ];
+    // Head bits. Omitted means exllamav3 decides (6). This flag was missing
+    // entirely, so every quant came out at run_runpod_job.py's own default of
+    // 8 while the bot recorded whatever the profile table said.
+    if (headBits != null) args.push('--head-bits', String(headBits));
+    // GPUs per pod. Omitted means one, which is every quant job today. The CLI
+    // caps the POD price, not the card, so more GPUs raise the bill and the cap
+    // together rather than sneaking past it.
+    if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
+    // Unset lets the profile decide, and 'balanced' leaves it to exllamav3
+    // (250 rows x 2048 cols). This used to pass 250 unconditionally, which is
+    // the same number but pinned it against both.
+    if (calRows != null) args.push('--cal-rows', String(calRows));
     if (hfOrg) args.push('--hf-org', hfOrg);
     // Optional pre-baked image (config.RUNPOD_IMAGE). Empty = bootstrap path.
     // The controller health-checks a baked image's ExLlamaV3 version and fails
@@ -120,14 +156,30 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     if (config.RUNPOD_IMAGE) args.push('--image', config.RUNPOD_IMAGE);
     if (testPrompt) args.push('--test-prompt', testPrompt);
 
-    log.info(`spawn: ${PYTHON} ${args.join(' ')}`);
-    // PYTHONUNBUFFERED so the child's stdout (which drives the progress embed)
-    // streams line-by-line instead of block-buffering ~8KB when piped, which
-    // freezes the embed through the quiet bootstrap/download phases.
-    const child = spawn(PYTHON, args, {
-      cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-    });
+    // Reparented to init, stdout+stderr to a log file (see services/detached.js).
+    // A bot restart or crash then leaves the controller running: it finishes the
+    // quant, uploads, and self-terminates its pod normally — instead of dying and
+    // having its pod reaped (the pod name encodes this controller's pid). The bot
+    // tails the log file for progress while it is alive. PYTHONUNBUFFERED keeps
+    // the log line-buffered so the tail isn't ~8KB behind.
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const slug = modelId.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const logPath = path.join(LOG_DIR, `ctrl-${slug}-${variants.join('-')}-${Date.now()}.log`);
+    log.info(`spawn (reparented): ${PYTHON} ${args.join(' ')} -> ${logPath}`);
+    let handle;
+    try {
+      handle = spawnDetached({
+        command: PYTHON,
+        args,
+        cwd: ROOT,
+        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        logPath,
+        kind: 'quant',
+        meta: { modelId, variants },
+      });
+    } catch (err) {
+      return reject(err);
+    }
 
     const total = variants.length;
     const results = new Map(); // bpw -> url
@@ -138,6 +190,7 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
     let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
+    let jobError = '';       // last [joberror] line, reported instead of the exit code
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
     // bar climbs smoothly the whole run (download 4->25, quantize 25->90), and
@@ -168,6 +221,10 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
 
     function handleLine(line) {
       let m;
+      if ((m = RE.jobError.exec(line))) {
+        jobError = m[1].trim().slice(0, 300);
+        return;
+      }
       if ((m = RE.uploadDone.exec(line))) {
         results.set(m[1], m[2]);
         stage = 'Uploading';
@@ -220,22 +277,32 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
       }
     }
 
+    // Tail the log file (the controller writes to it, not to a pipe) and feed
+    // whole lines to the same parser. Polling is fine — progress lines arrive
+    // every few seconds at most.
     let buf = '';
-    child.stdout.on('data', (chunk) => {
-      buf += chunk.toString();
+    let readOffset = 0;
+    const drain = () => {
+      let stat;
+      try { stat = fs.statSync(logPath); } catch { return; }
+      if (stat.size <= readOffset) return;
+      const fd = fs.openSync(logPath, 'r');
+      const b = Buffer.alloc(stat.size - readOffset);
+      try { fs.readSync(fd, b, 0, b.length, readOffset); } finally { fs.closeSync(fd); }
+      readOffset = stat.size;
+      buf += b.toString('utf8');
       const lines = buf.split('\n');
       buf = lines.pop();
       for (const line of lines) {
         if (process.env.BQ_DEBUG_RAW) log.info(`[raw] ${line.slice(0, 140)}`);
         try { handleLine(line); } catch (e) { log.debug(`parse: ${e.message}`); }
       }
-    });
-    child.stderr.on('data', (c) => log.debug(`[cli] ${c.toString().trim().slice(0, 200)}`));
-
-    child.on('error', reject);
-    // close passes (code, signal): on a signal kill (operator cancel, bot
-    // shutdown) code is null and signal is the name, e.g. 'SIGKILL'.
-    child.on('close', (code, signal) => {
+    };
+    // The controller is not our child any more, so there is no exit event. Poll
+    // its pid and its recorded exit status instead, draining the log each time
+    // (the last drain flushes the final lines, esp. the last [upload] done). On
+    // a deliberate kill, signal is set; a real error always exits with a code.
+    wait(handle, { onTick: drain }).then(({ code, signal }) => {
       const out = variants.map((v) => {
         const url = results.get(v) || null;
         return {
@@ -260,9 +327,10 @@ export function runViaCli({ modelId, variants, hfOrg, calRows = 250, testPrompt 
         resolve(out); // full or partial success
       } else {
         const err = new Error(
-          signal
-            ? `run_runpod_job.py killed by ${signal} with no uploads`
-            : `run_runpod_job.py exited ${code} with no uploads`
+          jobError ||
+            (signal
+              ? `run_runpod_job.py killed by ${signal} with no uploads`
+              : `run_runpod_job.py exited ${code} with no uploads`)
         );
         err.signal = signal || null;
         err.podCreated = !!podId;

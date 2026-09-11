@@ -25,7 +25,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "black", "ruff"]
-gguf = ["llama-cpp-python>=0.3.0"]
 
 [project.scripts]
 bq-pipeline = "blockquant.__main__:main"
+[tool.pytest.ini_options]
+# src layout: the package is not installed when running the suite from a
+# checkout, and without this every test that imports blockquant fails on
+# collection while the ones that don't quietly pass.
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["slow: needs a GPU, a network fetch, or minutes of wall clock"]

@@ -18,13 +18,72 @@ from pathlib import Path
 # estimates (which would have to guess KV-cache geometry per architecture).
 
 
-def exl3_repo_slug(base_name: str, variant: str) -> str:
-    """Canonical repo name for an EXL3 variant: ``{model}-exl3-{bpw}bpw``."""
-    return f"{base_name}-exl3-{variant}bpw"
+def exl3_variant(bpw) -> str:
+    """The bpw as it appears in a repo name: one decimal, more only if they
+    carry something.
+
+    4 and 4.00 are both 4.0; an SC target of 4.07 keeps both digits because
+    sc_optimize really can land there. Trailing zeros are noise -- every repo
+    we have published is one decimal, and "4.00bpw" next to "4.0bpw" reads as
+    two different quants.
+    """
+    s = f"{float(bpw):.6f}".rstrip("0")
+    return s + "0" if s.endswith(".") else s
 
 
-def exl3_repo_id(owner: str, base_name: str, variant: str) -> str:
-    slug = exl3_repo_slug(base_name, variant)
+def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
+                   head_bits: int | None = None, vision_bits: int | None = None) -> str:
+    """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
+
+    Self-calibrated builds take ``-SC-{bpw}bpw-H{n}``. Head bits is required
+    there and has no default on purpose: under SC the recipe chooses it per
+    budget (turboderp publishes H3 through H6 for one model), so the name is
+    incomplete without it. A plain ``-exl3-{bpw}bpw`` already means bundled
+    calibration, and one name must not describe two different artifacts.
+
+    ``-V{n}`` is appended when the vision tower was quantized. Its absence
+    means the tower was copied at fp16 -- that is how exllamav3 records it
+    too, where quantization_config carries vision_bits only when the tower
+    was quantized.
+    """
+    if sc and head_bits is None:
+        raise ValueError("A self-calibrated quant must name its head bits")
+    v = exl3_variant(variant)
+    core = f"SC-{v}bpw-H{int(head_bits)}" if sc else f"{v}bpw"
+    vis = f"-V{int(vision_bits)}" if vision_bits else ""
+    return f"{base_name}-exl3-{core}{vis}"
+
+
+def exl3_slug_rx(base_name: str) -> re.Pattern:
+    """Matches every shape exl3_repo_slug emits, for one base model.
+
+    Discovery sites used to hand-roll ``-exl3-([0-9.]+)bpw$`` each, which meant
+    any name growing a component would quietly match nothing: publish_quant
+    would find zero variants and wipe the cross-links out of every card in the
+    family. Keep this next to the builder so the two move together.
+    """
+    return re.compile(
+        rf"^{re.escape(base_name)}-exl3-(?P<sc>SC-)?(?P<variant>[0-9.]+)bpw"
+        rf"(?:-H(?P<head_bits>\d+))?(?:-V(?P<vision_bits>\d+))?$"
+    )
+
+
+def parse_exl3_slug(slug: str, base_name: str) -> dict | None:
+    """The facts a slug encodes, or None when it is not one of ours."""
+    m = exl3_slug_rx(base_name).match(slug)
+    if not m:
+        return None
+    return {
+        "slug": slug,
+        "variant": m.group("variant"),
+        "sc": bool(m.group("sc")),
+        "head_bits": int(m.group("head_bits")) if m.group("head_bits") else None,
+        "vision_bits": int(m.group("vision_bits")) if m.group("vision_bits") else None,
+    }
+
+
+def exl3_repo_id(owner: str, base_name: str, variant: str, **kw) -> str:
+    slug = exl3_repo_slug(base_name, variant, **kw)
     return f"{owner}/{slug}" if owner else slug
 
 
@@ -83,6 +142,16 @@ def _params_b_from_name(model_name: str, default: float = 35.0) -> float:
     return float(m.group(1)) if m else default
 
 
+def _arch_family(archs: list) -> str:
+    """Architecture family from a HF ``architectures`` entry, dropping the task
+    suffix: MistralForCausalLM -> Mistral, Qwen3MoeForCausalLM -> Qwen3Moe,
+    Gemma3ForConditionalGeneration -> Gemma3. Empty when the config lists none."""
+    if not archs:
+        return ""
+    a = archs[0]
+    return re.sub(r"(For[A-Z]\w*|LMHeadModel|Model)$", "", a) or a
+
+
 def derive_model_facts(config: dict, model_name: str = "") -> dict:
     """Pull architecture facts out of a HuggingFace ``config.json`` dict."""
     archs = config.get("architectures") or []
@@ -112,8 +181,12 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
         arch_line = "Dense"
 
     kind = "MoE" if is_moe else "Dense"
+    # The badge names the architecture family (Mistral, Qwen3Moe, ...); the
+    # dense/MoE split already lives in arch_line. Fall back to the split when the
+    # config carries no architectures entry.
     size = _size_tokens(model_name)
-    badge_text = f"{kind}_{size}" if size else kind
+    badge_label = _arch_family(archs) or kind
+    badge_text = f"{badge_label}_{size}" if size else badge_label
     # shields.io: literal hyphens must be doubled.
     arch_badge = badge_text.replace("-", "--")
 
@@ -123,6 +196,7 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
     return {
         "arch_line": arch_line,
         "arch_badge": arch_badge,
+        "cal_source": "exllamav3 bundled mix (`c4`, `code`, `multilingual`, `technical`, `tiny`, `wiki`)",
         "extra_tags": "\n".join(extra_tags),
         "parallel_line": parallel_line,
         "architecture": archs[0] if archs else "",
@@ -140,17 +214,17 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
 def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0) -> str:
     """Render the Quants table.
 
-    Each row: ``{"variant": str, "head_bits": int, "cal_rows": int,
-    "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
+    Each row: ``{"variant": str, "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
     not-yet-published (shows an estimate + "queued").
     """
     has_kl = any(r.get("kl_div") is not None for r in rows)
+    # Head bits and calibration rows are the same down every row and the recipe
+    # table below states them for this repo, so the columns only added width.
     header = (
-        "| BPW &nbsp; | &nbsp; Head bits &nbsp; | "
-        "&nbsp; Calibration rows &nbsp; | &nbsp; Size &nbsp; |"
+        "| BPW &nbsp; | &nbsp; Size &nbsp; |"
         + (" &nbsp; KL&nbsp;&divide;&nbsp;fp16 &nbsp; |" if has_kl else "")
         + " &nbsp; Status |\n"
-        "| :---: | :---: | :---: | ---: |"
+        "| :---: | ---: |"
         + (" :---: |" if has_kl else "")
         + " :--- |"
     )
@@ -178,16 +252,11 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
             if is_current and kl is not None:
                 kl_str = f"**{kl_str}**"
             kl_cell = f" {kl_str} |"
-        body.append(
-            f"| {bpw_cell} | {row.get('head_bits', 8)} | "
-            f"{row.get('cal_rows', 250)} | {size_str} |{kl_cell} {status} |"
-        )
-    table = header + "\n" + "\n".join(body)
-    if has_kl:
-        table += ("\n\n<sub>KL&nbsp;&divide;&nbsp;fp16: mean KL-divergence from the "
-                  "fp16 source over wikitext rows &mdash; lower is closer to the "
-                  "original.</sub>")
-    return table
+        body.append(f"| {bpw_cell} | {size_str} |{kl_cell} {status} |")
+    # No footnote: the column speaks for itself. How the number was measured
+    # lives in each quant's bq_quality.json (kl_method), which is where a reader
+    # who cares about the corpus should be looking anyway.
+    return header + "\n" + "\n".join(body)
 
 
 def _render(template: str, ctx: dict) -> str:
@@ -202,7 +271,7 @@ def render_exl3_card(
     base_repo: str,
     repo_id: str,
     variant: str,
-    head_bits: int,
+    head_bits: int | None,
     cal_rows: int,
     size_gb: float | None,
     model_config: dict,
@@ -210,6 +279,7 @@ def render_exl3_card(
     collection_url: str,
     license_id: str = "other",
     quantized_by: str,
+    codebook: str = "mul1",
     title_override: str | None = None,
 ) -> str:
     """Render the full polished card for one EXL3 variant."""
@@ -228,12 +298,17 @@ def render_exl3_card(
         "TITLE": pretty_title(base_name, title_override),
         "ARCH_LINE": facts["arch_line"],
         "ARCH_BADGE": facts["arch_badge"],
+        "CAL_SOURCE": facts["cal_source"],
         "PARALLEL_LINE": facts["parallel_line"],
         "BPW": variant,
         "SIZE_GB": size_str,
         "SIZE_GB_BADGE": size_str,
-        "HEAD_BITS": str(head_bits),
+        # Callers read this off the quant's own config.json. None only happens
+        # when that read failed, and a card saying "None" is worse than one
+        # that omits a number it does not have.
+        "HEAD_BITS": str(head_bits) if head_bits is not None else "unrecorded",
         "CAL_ROWS": str(cal_rows),
+        "CODEBOOK": (codebook or "mcg").lower(),
         "REPO_ID": repo_id,
         "SHORT_NAME": repo_id.split("/")[-1],
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),

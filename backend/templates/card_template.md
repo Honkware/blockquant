@@ -11,6 +11,7 @@ tags:
   - quantized
 {{EXTRA_TAGS}}
 quantization_format: exl3
+inference: false
 bits_per_weight: {{BPW}}
 ---
 
@@ -25,6 +26,7 @@ bits_per_weight: {{BPW}}
 [![format](https://img.shields.io/badge/format-EXL3-c63010?style=for-the-badge&labelColor=14120e)](https://github.com/turboderp-org/exllamav3)
 [![bpw](https://img.shields.io/badge/bpw-{{BPW}}-6b8a76?style=for-the-badge&labelColor=14120e)](#quants)
 [![size](https://img.shields.io/badge/size-{{SIZE_GB_BADGE}}_GB-6b8a76?style=for-the-badge&labelColor=14120e)](#quants)
+![codebook](https://img.shields.io/badge/codebook-{{CODEBOOK}}-6b8a76?style=for-the-badge&labelColor=14120e)
 [![arch](https://img.shields.io/badge/arch-{{ARCH_BADGE}}-c63010?style=for-the-badge&labelColor=14120e)](https://huggingface.co/{{BASE_REPO}})
 
 [![base model](https://img.shields.io/badge/Base-{{BASE_BADGE}}-2a2620?style=flat-square&logo=huggingface&logoColor=white)](https://huggingface.co/{{BASE_REPO}})
@@ -92,11 +94,10 @@ hf download \
 | Bits per weight | `{{BPW}}` |
 | Head bits | `{{HEAD_BITS}}` |
 | Calibration rows | `{{CAL_ROWS}}` |
-| Codebook | `MCG` |
+| Calibration data | {{CAL_SOURCE}} |
+| Codebook | `{{CODEBOOK}}` |
 | Out&#8209;scales | `always` |
 | Parallel mode | {{PARALLEL_LINE}} |
-
-Loaded automatically by every ExLlamaV3 loader; reproduced here for searchability.
 
 </details>
 

@@ -30,7 +30,6 @@ def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> Non
         if output.format == QuantFormat.EXL3:
             repo_id = cards.exl3_repo_id(owner, model_name, output.variant)
         else:
-            slug = f"{model_name}-{output.variant}-GGUF"
             repo_id = f"{owner}/{slug}" if owner else slug
 
         # Create repo
@@ -50,7 +49,6 @@ def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> Non
                         token=hf_token,
                     )
         else:
-            # Upload single GGUF file
             api.upload_file(
                 path_or_fd=output.output_path,
                 path_in_repo=Path(output.output_path).name,

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import inspect
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -106,7 +107,7 @@ def test_launch_injects_public_key(mock_ensure, mock_ssh_key, fake_pod):
     assert instance_id == "pod-abc123"
     _, kwargs = mock_rp.create_pod.call_args
     assert kwargs["gpu_type_id"] == "NVIDIA RTX A4000"
-    assert kwargs["cloud_type"] == "COMMUNITY"
+    assert kwargs["cloud_type"] == "ALL"
     assert kwargs["container_disk_in_gb"] == 150
     assert kwargs["volume_in_gb"] == 100
     assert kwargs["start_ssh"] is True
@@ -448,7 +449,8 @@ def test_run_pipeline_is_non_blocking(mock_ensure_rp, mock_ensure_pk, mock_ssh_k
     assert launched, "expected a nohup-based launch command"
 
 
-def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_key,
+                                       gpu_count: int = 1):
     """Helper: wire SSH + SFTP mocks and return (provider, mock_client)."""
     mock_rp = MagicMock()
     mock_rp.get_pod.return_value = _running_pod_with_ssh()
@@ -460,20 +462,22 @@ def _make_pipeline_provider_and_client(mock_ensure_rp, mock_ensure_pk, mock_ssh_
     mock_sftp.file.return_value.__enter__ = MagicMock(return_value=mock_file)
     mock_sftp.file.return_value.__exit__ = MagicMock(return_value=False)
     mock_client.open_sftp.return_value = mock_sftp
-    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key),
+                              gpu_count=gpu_count)
     return provider, mock_client
 
 
 @patch("blockquant.providers.runpod.provider._ensure_paramiko")
 @patch("blockquant.providers.runpod.provider._ensure_runpod")
 def test_run_pipeline_config_contains_pod_and_key(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
-    """Config JSON must include pod_id, runpod_api_key, and keep_pod."""
+    """Config JSON carries pod_id, keep_pod, and the key the pod needs to
+    self-terminate (uploaded 0600 and shredded by quant.py after reading)."""
     provider, _ = _make_pipeline_provider_and_client(
         mock_ensure_rp, mock_ensure_pk, mock_ssh_key
     )
     uploaded: dict[str, bytes] = {}
 
-    def _capture(instance_id, data, remote_path):
+    def _capture(instance_id, data, remote_path, mode=None):
         uploaded[remote_path] = data
 
     with patch.object(provider, "_upload_bytes", side_effect=_capture):
@@ -502,7 +506,7 @@ def test_run_pipeline_keep_pod_true_honored(mock_ensure_rp, mock_ensure_pk, mock
     )
     uploaded: dict[str, bytes] = {}
 
-    def _capture(instance_id, data, remote_path):
+    def _capture(instance_id, data, remote_path, mode=None):
         uploaded[remote_path] = data
 
     with patch.object(provider, "_upload_bytes", side_effect=_capture):
@@ -679,45 +683,47 @@ def test_get_cost_per_hour_static_fallback_on_error(mock_ensure, mock_ssh_key):
 
 
 # ---------------------------------------------------------------------------
-# resolve_profile — preset + override merging
+# calibration and cloud defaults
 # ---------------------------------------------------------------------------
 
-def test_resolve_profile_known_presets_have_required_keys():
-    for name in ("fast", "balanced", "quality"):
-        cfg = RunPodProvider.resolve_profile(name)
-        assert "cloud_type" in cfg
-        assert "gpu_preference" in cfg and isinstance(cfg["gpu_preference"], list)
-        assert "cal_rows" in cfg and isinstance(cfg["cal_rows"], int)
-        assert "cal_cols" in cfg and isinstance(cfg["cal_cols"], int)
+def _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key, gpu_count: int = 1,
+                  **kwargs) -> dict:
+    provider, _ = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key, gpu_count=gpu_count
+    )
+    uploaded: dict[str, bytes] = {}
+    with patch.object(provider, "_upload_bytes",
+                      side_effect=lambda i, d, path, mode=None: uploaded.__setitem__(path, d)):
+        provider.run_pipeline(instance_id="pod-abc123", model_id="foo/bar",
+                              format="exl3", variants=["4.5"], hf_token="tok", **kwargs)
+    return json.loads(uploaded["/root/bq-config.json"])
 
 
-def test_resolve_profile_unknown_raises():
-    with pytest.raises(KeyError, match="Unknown profile"):
-        RunPodProvider.resolve_profile("ludicrous")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cfg_omits_calibration_when_unset(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """No cal_rows/cal_cols in the cfg means the converter uses its own
+    250x2048. The profile presets used to carry a copy of those numbers, which
+    pinned every job against whatever exllamav3 does."""
+    cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key)
+    assert "cal_rows" not in cfg
+    assert "cal_cols" not in cfg
+    assert "head_bits" not in cfg or cfg["head_bits"] is None
 
 
-def test_resolve_profile_explicit_override_wins():
-    cfg = RunPodProvider.resolve_profile("fast", cal_rows=512)
-    assert cfg["cal_rows"] == 512  # override
-    assert cfg["cal_cols"] == 2048  # preset
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cfg_carries_calibration_when_asked(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key,
+                        cal_rows=512, cal_cols=4096)
+    assert cfg["cal_rows"] == 512
+    assert cfg["cal_cols"] == 4096
 
 
-def test_resolve_profile_none_override_keeps_preset():
-    cfg = RunPodProvider.resolve_profile("balanced", cal_rows=None, cal_cols=None)
-    assert cfg["cal_rows"] == 250
-    assert cfg["cal_cols"] == 2048
-
-
-def test_resolve_profile_quality_uses_secure_cloud():
-    cfg = RunPodProvider.resolve_profile("quality")
-    assert cfg["cloud_type"] == "SECURE"
-    assert cfg["cal_rows"] >= 250  # always meets-or-exceeds balanced
-
-
-def test_resolve_profile_internal_keys_excluded():
-    """Profile metadata keys (_walltime_factor etc) shouldn't leak."""
-    cfg = RunPodProvider.resolve_profile("balanced")
-    assert all(not k.startswith("_") for k in cfg)
+def test_default_cloud_searches_both_pools():
+    """Stock blips per pool, so pinning one hides half the fleet."""
+    default = inspect.signature(RunPodProvider.__init__).parameters["cloud_type"].default
+    assert default == "ALL"
 
 
 @patch("blockquant.providers.runpod.provider._ensure_runpod")
@@ -732,3 +738,157 @@ def test_get_cost_per_hour_unknown_gpu(mock_ensure, mock_ssh_key):
         ssh_key_path=str(mock_ssh_key),
     )
     assert provider.get_cost_per_hour() == 2.00
+
+
+# ---------------------------------------------------------------------------
+# is_pipeline_running — pgrep self-match
+# ---------------------------------------------------------------------------
+
+def test_is_pipeline_running_pattern_cannot_self_match(mock_ssh_key):
+    """The pgrep pattern must match a real quant.py cmdline but never the probe
+    command that carries it (the bash -c wrapper's own cmdline contains the
+    pattern text; a self-match reports dead quants as running forever)."""
+    import re
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "done"})
+    assert provider.is_pipeline_running("pod-1") is False
+    cmd = provider.run.call_args[0][1]
+    m = re.search(r"pgrep -f '([^']+)'", cmd)
+    assert m, cmd
+    pat = m.group(1)
+    assert re.search(pat, "python /root/quant.py"), pat
+    assert not re.search(pat, cmd), f"pattern self-matches its own probe: {cmd}"
+
+
+def test_is_pipeline_running_matches_the_baked_script_path(mock_ssh_key):
+    """run_pipeline launches the baked /opt/blockquant/quant.py whenever the
+    image has one, which is every current image. Probing only REMOTE_SCRIPT read
+    "done" on the first poll of every baked run, so the controller killed the pod
+    ~30s in and no job could finish."""
+    import re
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "running"})
+    assert provider.is_pipeline_running("pod-1") is True
+    pat = re.search(r"pgrep -f '([^']+)'", provider.run.call_args[0][1]).group(1)
+    assert re.search(pat, f"/usr/bin/python {RunPodProvider._BAKED_REMOTE_QUANT}"), pat
+
+
+def test_is_pipeline_running_fails_closed_without_pgrep(mock_ssh_key):
+    """A pod whose image ships no procps must not read as finished: the probe
+    answers "running" and the stall/max-runtime bounds end the run instead."""
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.run = MagicMock(return_value={"stdout": "running"})
+    provider.is_pipeline_running("pod-1")
+    cmd = provider.run.call_args[0][1]
+    assert "command -v pgrep" in cmd and "echo running" in cmd, cmd
+
+
+# ---------------------------------------------------------------------------
+# GPU count — one pod, N cards
+# ---------------------------------------------------------------------------
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_launch_defaults_to_one_gpu(mock_ensure, mock_ssh_key, fake_pod):
+    """Every existing job asks for nothing and must keep getting one card."""
+    mock_rp = MagicMock()
+    mock_rp.create_pod.return_value = fake_pod
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    provider.launch({})
+
+    _, kwargs = mock_rp.create_pod.call_args
+    assert kwargs["gpu_count"] == 1
+    assert inspect.signature(RunPodProvider.__init__).parameters["gpu_count"].default == 1
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_launch_passes_gpu_count(mock_ensure, mock_ssh_key, fake_pod):
+    """The SDK defaults gpu_count to 1, so leaving it out of create_pod is how
+    every pod came back single-GPU regardless of what was asked for."""
+    mock_rp = MagicMock()
+    mock_rp.create_pod.return_value = fake_pod
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", gpu_count=4,
+                              ssh_key_path=str(mock_ssh_key))
+    provider.launch({})
+
+    _, kwargs = mock_rp.create_pod.call_args
+    assert kwargs["gpu_count"] == 4
+
+
+def test_gpu_count_below_one_is_rejected(mock_ssh_key):
+    with pytest.raises(ValueError, match="gpu_count must be at least 1"):
+        RunPodProvider(api_key="fake-key", gpu_count=0, ssh_key_path=str(mock_ssh_key))
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cost_per_hour_covers_every_card_in_the_pod(mock_ensure, mock_ssh_key):
+    """The catalogue prices one card. Reporting that as the pod's rate would
+    understate a 4-GPU pod by 4x — and --max-price is checked against it, so the
+    cap would wave through a pod costing four times what it allows."""
+    mock_rp = MagicMock()
+    mock_rp.get_gpu.return_value = {"securePrice": 1.85, "communityPrice": 1.60}
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(
+        api_key="fake-key",
+        gpu_type="NVIDIA H100 80GB HBM3",
+        gpu_count=4,
+        cloud_type="SECURE",
+        ssh_key_path=str(mock_ssh_key),
+    )
+    assert provider.get_cost_per_hour() == pytest.approx(4 * 1.85)
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cost_per_hour_static_fallback_also_covers_the_pod(mock_ensure, mock_ssh_key):
+    """A price-lookup hiccup falls back to the static table, which is per-card
+    too — the multiplier has to survive that path or the cap fails open on
+    exactly the runs where the live price was unavailable."""
+    mock_rp = MagicMock()
+    mock_rp.get_gpu.side_effect = RuntimeError("boom")
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(
+        api_key="fake-key",
+        gpu_type="NVIDIA H100 80GB HBM3",
+        gpu_count=2,
+        ssh_key_path=str(mock_ssh_key),
+    )
+    assert provider.get_cost_per_hour() == pytest.approx(2 * 1.99)
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_max_gpu_count_reads_the_catalogue(mock_ensure, mock_ssh_key):
+    mock_rp = MagicMock()
+    mock_rp.get_gpu.return_value = {"maxGpuCount": 8, "securePrice": 1.85}
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", gpu_type="NVIDIA H100 80GB HBM3",
+                              ssh_key_path=str(mock_ssh_key))
+    assert provider.max_gpu_count() == 8
+
+
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_max_gpu_count_unknown_on_lookup_failure(mock_ensure, mock_ssh_key):
+    """None means "no idea", and the launcher then just tries the create. It
+    must never read as zero, which would skip every card in the sweep."""
+    mock_rp = MagicMock()
+    mock_rp.get_gpu.side_effect = RuntimeError("graphql timeout")
+    mock_ensure.return_value = mock_rp
+
+    provider = RunPodProvider(api_key="fake-key", ssh_key_path=str(mock_ssh_key))
+    assert provider.max_gpu_count() is None
+
+
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cfg_carries_gpu_count(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """quant.py does not read it yet, but exllamav3's convert defaults to
+    --devices 0, so the remote side needs to know how many cards it was given
+    before it can use more than the first one."""
+    assert _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key)["gpu_count"] == 1
+    cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key, gpu_count=4)
+    assert cfg["gpu_count"] == 4

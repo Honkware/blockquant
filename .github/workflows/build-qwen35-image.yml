@@ -1,0 +1,67 @@
+name: build-qwen35-image
+
+# Build + push the BlockQuant Qwen3.5 RunPod image (exllamav3 0.0.43 +
+# flash-linear-attention, torch 2.8/cu129) to GHCR.
+#
+# Manual only — this image is routed ONLY to qwen3_5 / qwen3_5_moe archs by
+# run_runpod_job.py; the proven 0.0.38 image (build-runpod-image.yml) is
+# untouched. The Dockerfile's build-time check hard-asserts torch stayed 2.8
+# and that fla imports, so a broken build never pushes.
+#
+# Image lands at: ghcr.io/honkware/blockquant:qwen35-exl3-0.0.43-py312
+on:
+  # Auto-rebuild when the Qwen3.5 Dockerfile (or this workflow) changes on the
+  # working branch — lets us iterate without the workflow_dispatch-needs-default-
+  # branch dance. workflow_dispatch also works once this lands on master.
+  push:
+    branches: ["feat/gpu-autoselect"]
+    paths:
+      - "docker/Dockerfile.runpod-qwen35"
+      - ".github/workflows/build-qwen35-image.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag"
+        required: false
+        default: "qwen35-exl3-0.0.43-py312"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.runpod-qwen35
+          push: true
+          tags: ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43-py312' }}
+          # No gha layer cache: exporting a ~10GB image to it thrashes (slower than
+          # a clean full build). The Dockerfile is stable, so full builds are fine.
+
+      - name: Image summary
+        run: |
+          echo "## Built Qwen3.5 image" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: \`ghcr.io/honkware/blockquant:${{ github.event.inputs.tag || 'qwen35-exl3-0.0.43-py312' }}\`" >> $GITHUB_STEP_SUMMARY

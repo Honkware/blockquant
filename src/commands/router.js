@@ -1,15 +1,20 @@
 import { getLogger } from '../logger.js';
 import { MessageFlags } from 'discord.js';
 import { handleQuant } from './quant.js';
+import { handleCatbench, autocompleteCatbench } from './catbench.js';
 import { handleApproval } from './approval.js';
+import { handleStop, handleStopButton } from './stop.js';
 import { handleHealth, handleHistory, handleQueueStatus } from './info.js';
-import { handleCache, handleDiag, handlePause, handleResume } from './admin.js';
+import { handleCache, handleConfig, handleDiag, handlePause, handleResume } from './admin.js';
 import { toUserMessage } from '../errors/taxonomy.js';
 
 const log = getLogger('commands');
 
 const handlers = {
   quant: handleQuant,
+  stop: handleStop,
+  config: handleConfig,
+  catbench: handleCatbench,
   queue: handleQueueStatus,
   health: handleHealth,
   history: handleHistory,
@@ -24,10 +29,11 @@ const handlers = {
  * Catches all errors so the bot never crashes from a command.
  */
 export async function routeCommand(interaction) {
-  // Approve / Deny buttons on pending quant requests.
+  // Approve / Deny / Stop buttons on quant requests.
   if (interaction.isButton()) {
     try {
-      await handleApproval(interaction);
+      if (interaction.customId.startsWith('bq:stop:')) await handleStopButton(interaction);
+      else await handleApproval(interaction);
     } catch (err) {
       log.error('Error handling button', { error: err.message, stack: err.stack });
       try {
@@ -37,6 +43,19 @@ export async function routeCommand(interaction) {
       } catch {
         // interaction expired
       }
+    }
+    return;
+  }
+
+  // Autocomplete on /catbench's model option. Must answer within 3s and can
+  // never reply with anything but choices, so it gets its own short path.
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName !== 'catbench') return;
+    try {
+      await autocompleteCatbench(interaction);
+    } catch (err) {
+      log.debug(`autocomplete failed: ${err.message}`);
+      await interaction.respond([]).catch(() => {});
     }
     return;
   }

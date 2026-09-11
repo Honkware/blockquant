@@ -57,8 +57,8 @@ class Provider(ABC):
         variants: list[str],
         hf_token: str = "",
         hf_org: str = "",
-        head_bits: int = 8,
-        use_imatrix: bool = True,
+        head_bits: int | None = None,
+        codebook: str = "mul1",
     ) -> dict:
         """Kick off the remote quantization. Default: not supported."""
         raise NotImplementedError(
@@ -90,5 +90,6 @@ class Provider(ABC):
         return None
 
     def get_cost_per_hour(self) -> float:
-        """Hourly USD rate for billing / cost estimates. Default: 0.0."""
+        """Hourly USD rate for the WHOLE instance — every GPU attached to it,
+        not one card's list price. Billing / cost estimates. Default: 0.0."""
         return 0.0

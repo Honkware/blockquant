@@ -2,7 +2,6 @@
 
 Usage:
     bq-pipeline --model mistralai/Mistral-7B --format exl3 --variants 4.0,5.0
-    bq-pipeline --model Qwen/Qwen2.5-7B --format gguf --variants q4_k_m,q5_k_m
 """
 import argparse
 import json
@@ -21,11 +20,9 @@ def main():
         epilog="""
 Examples:
   bq-pipeline --model mistralai/Mistral-7B --format exl3 --variants 4.0
-  bq-pipeline --model Qwen/Qwen2.5-7B --format gguf --variants q4_k_m,q5_k_m
         """,
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--format", choices=["gguf", "exl3"], default="exl3")
     parser.add_argument("--variants", default="4.0")
     parser.add_argument("--provider", default="local")
     parser.add_argument("--hf-org", default=os.environ.get("HF_ORG", ""))
