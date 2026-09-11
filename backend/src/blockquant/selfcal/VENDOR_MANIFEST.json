@@ -1,0 +1,40 @@
+{
+  "_about": "Upstream scripts vendored into blockquant, not our work. sc_*.py are turboderp's self-calibration pipeline; they live at the root of the exllamav3 repo and are not part of the pip package, so they cannot be imported from the installed exllamav3 and have to be copied in. The streaming patch on sc_measure.py is UnstableLlama's (ezexl3). Licensing follows the upstreams: exllamav3 is MIT, ezexl3 is MIT.",
+  "_ref": "5be886578ec80324c2c715269387be2058724b6e",
+  "_ref_note": "The exllamav3 commit docker/Dockerfile.runpod pins in ARG EXLLAMAV3_REF (v1.4.9). Vendored scripts and the installed exllamav3 must move together -- they reach into exllamav3.modules.* internals -- so re-vendor whenever that ARG is bumped.",
+  "_hashing": "sha256 is of the pristine upstream file. Each vendored copy carries a short '#' header we prepend at vendoring time; backend/tests/test_selfcal_vendor.py strips that leading comment block before hashing, so an unmodified file hashes to the upstream sha256. A patched file records local_sha256 (the bytes on disk, header stripped) and local_patch (what changed and why); sha256 stays pristine so the drift check against GitHub keeps working.",
+  "files": {
+    "sc_trace.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_trace.py",
+      "ref": "5be886578ec80324c2c715269387be2058724b6e",
+      "sha256": "2e53d53217611200bf02d704231c4e48639224b29cd5aad41c71e4804cd9182a",
+      "note": "Unmodified. Generates a self-sampled calibration trace (safetensors) that sc_measure.py can eval on. Imports `eval.qbench_prompts`, which is not in the exllamav3 wheel, so that module is vendored alongside it; run the script by path (python .../selfcal/sc_trace.py) so its own directory lands on sys.path."
+    },
+    "sc_rfn_probe.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_rfn_probe.py",
+      "ref": "5be886578ec80324c2c715269387be2058724b6e",
+      "sha256": "008dc10c0ec67e579d618cd9589f34a350d5798eb0541c62d4fde892d27e9ae4",
+      "note": "Unmodified. Measures the real weight-space rfn of an existing EXL3 quant, to calibrate the noise levels sc_measure.py injects."
+    },
+    "sc_measure.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_measure.py",
+      "ref": "5be886578ec80324c2c715269387be2058724b6e",
+      "sha256": "6d9b79c62b7d1099e6ab1b7fa90aeb04a57f5e0c1b924d796e8842ed9306c513",
+      "local_sha256": "8180a689a780e08f8211f9741b709ba499fa2673a64344e5c1a78d456e60e151",
+      "local_patch": "Added, verbatim from ezexl3: ModuleRunner (load one top-level module, run every row through it, unload), estimate_resident_bytes (checkpoint-header VRAM preflight), row_kld, streaming branches in forward_rows / ref_pass / advance_capture / the perturbation loop, shaping factors kept on CPU while streaming, the fp16-inner assert moved to where weights are actually resident, and --load-mode auto|resident|streaming with --streaming / --no-streaming aliases. Also ezexl3's memory hygiene around it: pop each captured Hessian as it is finalized, clear shape_lin before empty_cache, and unload the model / close the checkpoint at the end. NOT taken: --worker-index / --worker-count / --resume-from and assign_measurement_modules. Those shard one measurement across N GPUs for ezexl3's coordinator, and they change the output JSON (a 'worker' key) for a feature we have no caller for; we rent single-GPU pods today and multi-GPU is someone else's work in progress. Sharding can be lifted later from the same fork. Caveats, both upstreams' own words, not softened: neither upstream has validated this script on MoE models, and streaming 'still requires the largest module and workspace to fit in VRAM' and 'adds weight-loading overhead' -- it lowers the VRAM floor, it does not remove it. Nothing in blockquant calls any of this yet, and it has never been run here: the controller has no GPU, so the only verification behind this vendoring is a byte-level diff against both upstreams plus py_compile.",
+      "note": "Per-tensor sensitivity measurement by weight-space noise injection. Vendored from the pinned ref, then patched with the layer-streaming half of UnstableLlama's fork (https://raw.githubusercontent.com/UnstableLlama/ezexl3/main/ezexl3/vendor/sc_measure.py). ezexl3 forked this file at the same content we pin (its manifest records upstream sha256 6d9b79c6..., which matches), so the fork diffs cleanly against our copy: +283/-29 lines over 21 hunks, of which the streaming half is +207 and the rest is worker sharding."
+    },
+    "sc_optimize.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_optimize.py",
+      "ref": "5be886578ec80324c2c715269387be2058724b6e",
+      "sha256": "9702b68ad7df8dfd9c287f80d811740269a262b831900a356424bc172a5acdfe",
+      "note": "Unmodified. Turns an sc_measure.py sensitivity JSON into a per-tensor bitrate recipe. Pure stdlib."
+    },
+    "eval/qbench_prompts.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/eval/qbench_prompts.py",
+      "ref": "5be886578ec80324c2c715269387be2058724b6e",
+      "sha256": "9863dcd0f03d0ab7a3a6409e15db06d210a87c07c52a9a0b3fa5353df8013014",
+      "note": "Unmodified. Only here because sc_trace.py imports it; exllamav3 ships it under eval/ at the repo root and the wheel does not carry it."
+    }
+  }
+}

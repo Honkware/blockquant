@@ -158,6 +158,19 @@ COPY backend/templates/card_template.md /opt/blockquant/card_template.md
 COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
 RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
 
+# ---- Vendored self-calibration scripts -----------------------------------
+# turboderp's sc_*.py live at the root of the exllamav3 repo and are not part of
+# the wheel, so the installed exllamav3 above does not carry them. Copied in at
+# the same ref the wheel is pinned to (they import exllamav3.modules internals);
+# backend/tests/test_selfcal_vendor.py fails if the two drift apart.
+#
+# Nothing in the pipeline calls these yet. They are here so a pod that already
+# has the model on disk can run a sensitivity measurement without a second image.
+# No new pip deps: sc_measure wants datasets, sc_trace wants safetensors, both
+# are installed above; sc_optimize is stdlib only.
+COPY backend/src/blockquant/selfcal /opt/blockquant/selfcal
+RUN python -m compileall -q /opt/blockquant/selfcal
+
 # ---- Image metadata ------------------------------------------------------
 LABEL org.opencontainers.image.title="BlockQuant RunPod" \
       org.opencontainers.image.description="Pre-baked ExLlamaV3 quantization environment for RunPod pods." \
