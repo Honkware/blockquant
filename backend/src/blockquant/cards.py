@@ -18,6 +18,19 @@ from pathlib import Path
 # estimates (which would have to guess KV-cache geometry per architecture).
 
 
+def exl3_variant(bpw) -> str:
+    """The bpw as it appears in a repo name: one decimal, more only if they
+    carry something.
+
+    4 and 4.00 are both 4.0; an SC target of 4.07 keeps both digits because
+    sc_optimize really can land there. Trailing zeros are noise -- every repo
+    we have published is one decimal, and "4.00bpw" next to "4.0bpw" reads as
+    two different quants.
+    """
+    s = f"{float(bpw):.6f}".rstrip("0")
+    return s + "0" if s.endswith(".") else s
+
+
 def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
                    head_bits: int | None = None, vision_bits: int | None = None) -> str:
     """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
@@ -35,7 +48,8 @@ def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
     """
     if sc and head_bits is None:
         raise ValueError("A self-calibrated quant must name its head bits")
-    core = f"SC-{variant}bpw-H{int(head_bits)}" if sc else f"{variant}bpw"
+    v = exl3_variant(variant)
+    core = f"SC-{v}bpw-H{int(head_bits)}" if sc else f"{v}bpw"
     vis = f"-V{int(vision_bits)}" if vision_bits else ""
     return f"{base_name}-exl3-{core}{vis}"
 

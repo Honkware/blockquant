@@ -41,6 +41,15 @@ describe('exl3RepoName', () => {
     );
   });
 
+  it('keeps one decimal unless more of them say something', () => {
+    // 4 and '4.00' are the same quant, so they must not produce two names.
+    // A fractional SC target really can land on 4.07, so those digits stay.
+    expect(exl3RepoName('M', '4.00')).toBe(exl3RepoName('M', 4));
+    expect(exl3RepoName('M', '4.50')).toBe('M-exl3-4.5bpw');
+    expect(exl3RepoName('M', '4.05')).toBe('M-exl3-4.05bpw');
+    expect(exl3RepoName('M', '3.14')).toBe('M-exl3-3.14bpw');
+  });
+
   it('refuses an SC name with no head bits', () => {
     // A plain -exl3-4.0bpw already means bundled calibration, so an SC build
     // cannot fall back to it: one name would then describe two artifacts.

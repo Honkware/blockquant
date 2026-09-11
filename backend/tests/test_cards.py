@@ -141,9 +141,9 @@ def test_slug_shapes():
     assert cards.exl3_repo_slug("Qwen3.8-27B", "4.0", vision_bits=6) == \
         "Qwen3.8-27B-exl3-4.0bpw-V6"
     assert cards.exl3_repo_slug("Qwen3.8-27B", "4.00", sc=True, head_bits=5) == \
-        "Qwen3.8-27B-exl3-SC-4.00bpw-H5"
-    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.00", sc=True, head_bits=5, vision_bits=6) == \
-        "Qwen3.8-27B-exl3-SC-4.00bpw-H5-V6"
+        "Qwen3.8-27B-exl3-SC-4.0bpw-H5"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.07", sc=True, head_bits=5, vision_bits=6) == \
+        "Qwen3.8-27B-exl3-SC-4.07bpw-H5-V6"
 
 
 def test_sc_slug_demands_head_bits():
@@ -156,9 +156,9 @@ def test_sc_slug_demands_head_bits():
 def test_slug_round_trips():
     for kw in ({}, {"vision_bits": 6}, {"sc": True, "head_bits": 5},
                {"sc": True, "head_bits": 3, "vision_bits": 3}):
-        slug = cards.exl3_repo_slug("Qwen3.8-27B", "4.00", **kw)
+        slug = cards.exl3_repo_slug("Qwen3.8-27B", "4.07", **kw)
         got = cards.parse_exl3_slug(slug, "Qwen3.8-27B")
-        assert got["variant"] == "4.00"
+        assert got["variant"] == "4.07"
         assert got["sc"] is kw.get("sc", False)
         assert got["head_bits"] == kw.get("head_bits")
         assert got["vision_bits"] == kw.get("vision_bits")
@@ -180,3 +180,14 @@ def test_two_repos_at_one_bpw_stay_distinct():
     assert plain != vis
     assert cards.parse_exl3_slug(plain, "M")["vision_bits"] is None
     assert cards.parse_exl3_slug(vis, "M")["vision_bits"] == 6
+
+
+def test_variant_keeps_one_decimal_unless_more_says_something():
+    """4 and 4.00 are the same quant and must produce the same name; an SC
+    target really can land on 4.07, so those digits stay."""
+    for inp in (4, "4", "4.0", "4.00"):
+        assert cards.exl3_variant(inp) == "4.0"
+    assert cards.exl3_variant("4.50") == "4.5"
+    assert cards.exl3_variant("4.05") == "4.05"
+    assert cards.exl3_variant("3.14") == "3.14"
+    assert cards.exl3_repo_slug("M", "4.00") == cards.exl3_repo_slug("M", 4)
