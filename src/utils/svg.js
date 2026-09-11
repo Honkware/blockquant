@@ -1,6 +1,27 @@
 import { Resvg } from '@resvg/resvg-js';
 
 const SVG_RE = /<svg[\s\S]*?<\/svg>/i;
+const THINK_RE = /<(think|thinking|reasoning)>[\s\S]*?<\/\1>/gi;
+const OPEN_THINK_RE = /<(think|thinking|reasoning)>[\s\S]*$/i;
+
+/**
+ * The answer, with any reasoning block removed.
+ *
+ * A reasoning model replies with <think>...</think> and then the answer, so
+ * everything downstream wants what comes after. Two things go wrong without it.
+ * The preview quotes the model's monologue instead of its reply, which is what
+ * shipped in the MiniCPM5 embed. And extractSvg takes the FIRST complete <svg>
+ * in the text, so a model that sketches a draft while thinking gets the draft
+ * rendered instead of the drawing it settled on.
+ *
+ * An unterminated block means the model never finished reasoning inside the
+ * token budget, so there is no answer. Returning '' says that; returning the
+ * text would claim the monologue was the reply.
+ */
+export function answerOf(text) {
+  if (!text) return '';
+  return String(text).replace(THINK_RE, '').replace(OPEN_THINK_RE, '').trim();
+}
 
 /** Pull the first complete <svg>...</svg> out of a model reply, or null. */
 export function extractSvg(text) {

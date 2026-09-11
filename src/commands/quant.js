@@ -17,7 +17,7 @@ import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
 import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
-import { extractSvg, renderSvgToPng } from '../utils/svg.js';
+import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 
 const log = getLogger('cmd:quant');
 
@@ -373,7 +373,7 @@ export async function runApprovedJob({ interaction, job }) {
       try {
         const svgFiles = [];
         for (const r of results) {
-          const svg = extractSvg(r.sample);
+          const svg = extractSvg(answerOf(r.sample));
           if (!svg) continue;
           try {
             svgFiles.push({ attachment: renderSvgToPng(svg), name: `sample-${r.bpw}bpw.png` });
