@@ -96,7 +96,7 @@ export function runViaCli({
   modelId,
   variants,
   hfOrg,
-  calRows = 250,
+  calRows = null,
   testPrompt = null,
   codebook = config.CODEBOOK,
   vision = 'auto',
@@ -109,7 +109,6 @@ export function runViaCli({
       '--model', modelId,
       '--variants', variants.join(','),
       '--skip-local-exllama',
-      '--cal-rows', String(calRows),
       // EXL3 trellis codebook. The CLI validates it against the same three
       // values the converter takes, so a bad one dies here, not on a pod.
       '--codebook', String(codebook),
@@ -141,6 +140,10 @@ export function runViaCli({
     // entirely, so every quant came out at run_runpod_job.py's own default of
     // 8 while the bot recorded whatever the profile table said.
     if (headBits != null) args.push('--head-bits', String(headBits));
+    // Unset lets the profile decide, and 'balanced' leaves it to exllamav3
+    // (250 rows x 2048 cols). This used to pass 250 unconditionally, which is
+    // the same number but pinned it against both.
+    if (calRows != null) args.push('--cal-rows', String(calRows));
     if (hfOrg) args.push('--hf-org', hfOrg);
     // Optional pre-baked image (config.RUNPOD_IMAGE). Empty = bootstrap path.
     // The controller health-checks a baked image's ExLlamaV3 version and fails

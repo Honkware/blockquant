@@ -44,10 +44,11 @@ export const commands = [
     .addStringOption((opt) =>
       opt
         .setName('codebook')
-        .setDescription('EXL3 trellis codebook (default mul1)')
+        .setDescription('EXL3 trellis codebook (default auto)')
         .setRequired(false)
         .addChoices(
-          { name: 'mul1 (default)', value: 'mul1' },
+          { name: 'auto — mul1 for dense, mcg for MoE (default)', value: 'auto' },
+          { name: 'mul1', value: 'mul1' },
           { name: 'mcg', value: 'mcg' },
           { name: '3inst', value: '3inst' }
         )

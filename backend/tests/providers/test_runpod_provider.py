@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import inspect
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -106,7 +107,7 @@ def test_launch_injects_public_key(mock_ensure, mock_ssh_key, fake_pod):
     assert instance_id == "pod-abc123"
     _, kwargs = mock_rp.create_pod.call_args
     assert kwargs["gpu_type_id"] == "NVIDIA RTX A4000"
-    assert kwargs["cloud_type"] == "COMMUNITY"
+    assert kwargs["cloud_type"] == "ALL"
     assert kwargs["container_disk_in_gb"] == 150
     assert kwargs["volume_in_gb"] == 100
     assert kwargs["start_ssh"] is True
@@ -680,45 +681,46 @@ def test_get_cost_per_hour_static_fallback_on_error(mock_ensure, mock_ssh_key):
 
 
 # ---------------------------------------------------------------------------
-# resolve_profile — preset + override merging
+# calibration and cloud defaults
 # ---------------------------------------------------------------------------
 
-def test_resolve_profile_known_presets_have_required_keys():
-    for name in ("fast", "balanced", "quality"):
-        cfg = RunPodProvider.resolve_profile(name)
-        assert "cloud_type" in cfg
-        assert "gpu_preference" in cfg and isinstance(cfg["gpu_preference"], list)
-        assert "cal_rows" in cfg and isinstance(cfg["cal_rows"], int)
-        assert "cal_cols" in cfg and isinstance(cfg["cal_cols"], int)
+def _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key, **kwargs) -> dict:
+    provider, _ = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key
+    )
+    uploaded: dict[str, bytes] = {}
+    with patch.object(provider, "_upload_bytes",
+                      side_effect=lambda i, d, path, mode=None: uploaded.__setitem__(path, d)):
+        provider.run_pipeline(instance_id="pod-abc123", model_id="foo/bar",
+                              format="exl3", variants=["4.5"], hf_token="tok", **kwargs)
+    return json.loads(uploaded["/root/bq-config.json"])
 
 
-def test_resolve_profile_unknown_raises():
-    with pytest.raises(KeyError, match="Unknown profile"):
-        RunPodProvider.resolve_profile("ludicrous")
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cfg_omits_calibration_when_unset(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    """No cal_rows/cal_cols in the cfg means the converter uses its own
+    250x2048. The profile presets used to carry a copy of those numbers, which
+    pinned every job against whatever exllamav3 does."""
+    cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key)
+    assert "cal_rows" not in cfg
+    assert "cal_cols" not in cfg
+    assert "head_bits" not in cfg or cfg["head_bits"] is None
 
 
-def test_resolve_profile_explicit_override_wins():
-    cfg = RunPodProvider.resolve_profile("fast", cal_rows=512)
-    assert cfg["cal_rows"] == 512  # override
-    assert cfg["cal_cols"] == 2048  # preset
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_cfg_carries_calibration_when_asked(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
+    cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key,
+                        cal_rows=512, cal_cols=4096)
+    assert cfg["cal_rows"] == 512
+    assert cfg["cal_cols"] == 4096
 
 
-def test_resolve_profile_none_override_keeps_preset():
-    cfg = RunPodProvider.resolve_profile("balanced", cal_rows=None, cal_cols=None)
-    assert cfg["cal_rows"] == 250
-    assert cfg["cal_cols"] == 2048
-
-
-def test_resolve_profile_quality_uses_secure_cloud():
-    cfg = RunPodProvider.resolve_profile("quality")
-    assert cfg["cloud_type"] == "SECURE"
-    assert cfg["cal_rows"] >= 250  # always meets-or-exceeds balanced
-
-
-def test_resolve_profile_internal_keys_excluded():
-    """Profile metadata keys (_walltime_factor etc) shouldn't leak."""
-    cfg = RunPodProvider.resolve_profile("balanced")
-    assert all(not k.startswith("_") for k in cfg)
+def test_default_cloud_searches_both_pools():
+    """Stock blips per pool, so pinning one hides half the fleet."""
+    default = inspect.signature(RunPodProvider.__init__).parameters["cloud_type"].default
+    assert default == "ALL"
 
 
 @patch("blockquant.providers.runpod.provider._ensure_runpod")

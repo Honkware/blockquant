@@ -506,7 +506,6 @@ export async function runApprovedJob({ interaction, job }) {
               modelId,
               variants: [v],
               hfOrg: config.HF_ORG,
-              calRows: 250,
               testPrompt,
               codebook,
               vision,

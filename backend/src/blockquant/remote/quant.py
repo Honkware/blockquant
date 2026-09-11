@@ -598,18 +598,19 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
         time.sleep(wait)
 
 
-def _written_head_bits(out_dir, fallback: int | None = None) -> int | None:
-    """Head bits the converter actually used, from the config.json it wrote.
+def _written_quant_config(out_dir) -> dict:
+    """quantization_config the converter just wrote, or {} if unreadable.
 
-    The request may not have pinned it, in which case exllamav3 chose (6 today).
-    Cards state this number, so read it rather than repeating the default here
-    and diverging the day upstream moves it.
+    Head bits, codebook and calibration size are all optional on the request
+    now -- unset means exllamav3 picks. Cards state those numbers, so read what
+    was actually produced instead of repeating upstream's defaults here and
+    diverging the day one of them moves.
     """
     try:
-        qcfg = json.loads((Path(out_dir) / "config.json").read_text(encoding="utf-8"))
-        return int((qcfg.get("quantization_config") or {})["head_bits"])
+        cfg = json.loads((Path(out_dir) / "config.json").read_text(encoding="utf-8"))
+        return cfg.get("quantization_config") or {}
     except Exception:
-        return fallback
+        return {}
 
 
 def _repo_quant_config(repo_id: str, hf_token: str) -> dict:
@@ -641,7 +642,6 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     from huggingface_hub import HfApi
 
     api = HfApi(token=hf_token)
-    rows_cal = int(cal_rows) if cal_rows else 250
     try:
         model_config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     except Exception:
@@ -649,7 +649,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
 
     quant_rows = [{
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
-        "cal_rows": rows_cal,
+        "cal_rows": o.get("_cal_rows", cal_rows),
         "size_gb": o.get("_size_gb"),
         "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
         "kl_div": o.get("kl_div"),
@@ -663,11 +663,12 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
-            head_bits=o.get("_head_bits", head_bits), cal_rows=rows_cal,
+            head_bits=o.get("_head_bits", head_bits),
+            cal_rows=o.get("_cal_rows", cal_rows),
             size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
-            quantized_by=owner, codebook=codebook,
+            quantized_by=owner, codebook=o.get("_codebook", codebook),
         )
         api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                         repo_id=repo_id, repo_type="model")
@@ -971,7 +972,10 @@ def main() -> int:
             # sum over all variants. rmtree only AFTER a confirmed upload -- on
             # failure the dirs stay for rescue_upload.py.
             rec["_size_gb"] = _dir_size_gb(out_dir)
-            rec["_head_bits"] = _written_head_bits(out_dir, head_bits)
+            _qc = _written_quant_config(out_dir)
+            rec["_head_bits"] = _qc.get("head_bits", head_bits)
+            rec["_codebook"] = _qc.get("codebook", codebook)
+            rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
             if not hf_token:
                 return
             repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"

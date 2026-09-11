@@ -78,7 +78,7 @@ function boolEnv(key, fallback) {
 }
 
 // Codebooks ExLlamaV3's convert_model.py accepts.
-const CODEBOOKS = Object.freeze(['mcg', 'mul1', '3inst']);
+const CODEBOOKS = Object.freeze(['auto', 'mcg', 'mul1', '3inst']);
 
 function required(key) {
   const val = process.env[key];
@@ -192,12 +192,14 @@ const config = Object.freeze({
   // Local-path head bits. null omits --head_bits so exllamav3 picks its own
   // default; the RunPod path takes it per job off /quant instead.
   HEAD_BITS: process.env.HEAD_BITS ? intEnv('HEAD_BITS', 6) : null,
-  // EXL3 trellis codebook for new quants. ExLlamaV3's own default is mcg; we
-  // default to mul1. /quant overrides it per job; this sets what that defaults
-  // to. Anything outside CODEBOOKS falls back rather than reaching a pod.
+  // EXL3 trellis codebook. 'auto' hands the choice to the controller's
+  // _default_codebook: mul1 (which is also exllamav3's own default now) for
+  // dense, mcg for MoE. Pinning 'mul1' here meant that rule never ran, so a
+  // MoE never got the mcg its fused kernel wanted on an older image.
+  // Anything outside CODEBOOKS falls back rather than reaching a pod.
   CODEBOOK: CODEBOOKS.includes((process.env.CODEBOOK || '').trim().toLowerCase())
     ? process.env.CODEBOOK.trim().toLowerCase()
-    : 'mul1',
+    : 'auto',
 });
 
 export default config;

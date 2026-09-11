@@ -188,6 +188,18 @@ def _drain_failure(provider, instance_id, outcome: str) -> str:
     return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
 
 
+# Cards worth renting, best first. --gpu/--gpu-fallback override this; without
+# them the launcher walks the list on a stock-out. Cloud defaults to ALL so both
+# the community and secure pools are searched -- stock blips per pool and half
+# the fleet is invisible if you pin one.
+_PREFERRED_GPUS = [
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 NVL",
+    "NVIDIA H100 PCIe",
+    "NVIDIA A100-SXM4-80GB",
+]
+
+
 def _recommend_max_price(base_gb: float | None) -> float:
     """Price cap scaled to model size. The quant is compute-bound, so a big
     model finishes ~3x faster on an A100/H100 for roughly the same TOTAL cost,
@@ -376,7 +388,8 @@ def main():
         "--launch-retry-delay", type=int, default=30,
         help="Seconds to wait between GPU sweeps when everything was out of stock.",
     )
-    parser.add_argument("--cloud", default="COMMUNITY", help="COMMUNITY or SECURE")
+    parser.add_argument("--cloud", default="ALL",
+                        help="ALL (both pools, default), COMMUNITY or SECURE")
     parser.add_argument(
         "--image",
         default="",
@@ -427,15 +440,6 @@ def main():
     )
     # Speedup tuning surface
     parser.add_argument(
-        "--profile",
-        choices=["fast", "balanced", "quality"],
-        default="balanced",
-        help=(
-            "Speedup preset. Sets cloud + cal_rows + GPU preference. "
-            "Per-knob flags below override the preset."
-        ),
-    )
-    parser.add_argument(
         "--cal-rows", type=int, default=None,
         help="Override calibration rows (preset: fast=128 / balanced=250 / quality=512).",
     )
@@ -462,26 +466,18 @@ def main():
     if args.codebook == "auto":
         args.codebook = _default_codebook(args.model, args.hf_token)
 
-    # ---- Resolve --profile + per-knob overrides -------------------------
-    # Only apply preset's cloud/GPU when the user didn't pass theirs.
+    # Only apply the built-in preferences when the user didn't pass their own.
     cli_passed_cloud = "--cloud" in sys.argv
     cli_passed_gpu = "--gpu" in sys.argv
     cli_passed_fallback = "--gpu-fallback" in sys.argv
 
-    profile_cfg = RunPodProvider.resolve_profile(
-        args.profile,
-        cal_rows=args.cal_rows,
-        cal_cols=args.cal_cols,
-    )
-    cal_rows = profile_cfg["cal_rows"]
-    cal_cols = profile_cfg["cal_cols"]
-    if not cli_passed_cloud:
-        args.cloud = profile_cfg["cloud_type"]
+    # Unset means the converter is never given --cal_rows/--cal_cols, so it
+    # uses its own 250x2048 rather than a copy of those numbers pinned here.
+    cal_rows = args.cal_rows
+    cal_cols = args.cal_cols
     if not cli_passed_gpu and not cli_passed_fallback:
-        # Promote the profile's GPU list into --gpu + --gpu-fallback.
-        prefs = profile_cfg["gpu_preference"]
-        args.gpu = prefs[0]
-        args.gpu_fallback = ",".join(prefs[1:])
+        args.gpu = _PREFERRED_GPUS[0]
+        args.gpu_fallback = ",".join(_PREFERRED_GPUS[1:])
 
     if not args.hf_token:
         print("ERROR: HF_TOKEN required (set env var or pass --hf-token)")
@@ -554,17 +550,15 @@ def main():
         # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
         # NVL with cal_rows=250 — use that as the baseline.
         baseline_h = 3.7
-        wt_factor = RunPodProvider.PROFILES[args.profile]["_walltime_factor"]
         # If user picked SXM, knock another ~10% off; SECURE adds ~5% more
         # consistency (fewer slowdowns) so net wash with COMMUNITY+SXM.
         gpu_speedup = 0.9 if "HBM3" in args.gpu else 1.0
-        eta_low_h = baseline_h * wt_factor * gpu_speedup * 0.85
-        eta_high_h = baseline_h * wt_factor * gpu_speedup * 1.10
+        eta_low_h = baseline_h * gpu_speedup * 0.85
+        eta_high_h = baseline_h * gpu_speedup * 1.10
         cost_low = eta_low_h * rate
         cost_high = eta_high_h * rate
 
         print()
-        print(f"  PROFILE: {args.profile}  ({RunPodProvider.PROFILES[args.profile]['_summary']})")
         print(f"  GPU:     {args.gpu}   ${rate:.2f}/hr ({args.cloud.lower()})")
         print(f"  CAL:     {cal_rows} rows × {cal_cols} cols")
         print(f"  BOOK:    {args.codebook} codebook")
