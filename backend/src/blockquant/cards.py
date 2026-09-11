@@ -147,28 +147,6 @@ def derive_model_facts(config: dict, model_name: str = "") -> dict:
     }
 
 
-def _codebook_note(codebook: str, is_moe: bool = False) -> str:
-    """The one thing a downloader needs about the codebook: which loaders read it.
-
-    ExLlamaV3 stores the choice as a tensor next to the weights and loads it with
-    ``optional = True``, so a build that predates the codebook simply doesn't see
-    the marker and decodes every trellis with the plain 3INST codebook: wrong
-    weights, no error. Both mcg and mul1 markers arrived in v0.0.3.
-    """
-    cb = (codebook or "mcg").lower()
-    note = (
-        f"The codebook is recorded in the weights, so loaders pick it up with no "
-        f"configuration. `{cb}` needs **ExLlamaV3 v0.0.3** or newer; an older build "
-        f"ignores the marker and decodes the weights with the wrong codebook."
-    )
-    if cb == "mul1" and is_moe:
-        note += (
-            " ExLlamaV3's fully fused MoE kernel is `mcg`-only, so this model runs "
-            "the general expert path."
-        )
-    return note
-
-
 def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     """Coarse pre-publish size estimate when a real size isn't known yet."""
     return n_params_b * bpw / 8.0 + 1.5
@@ -177,17 +155,17 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
 def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0) -> str:
     """Render the Quants table.
 
-    Each row: ``{"variant": str, "head_bits": int, "cal_rows": int,
-    "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
+    Each row: ``{"variant": str, "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
     not-yet-published (shows an estimate + "queued").
     """
     has_kl = any(r.get("kl_div") is not None for r in rows)
+    # Head bits and calibration rows are the same down every row and the recipe
+    # table below states them for this repo, so the columns only added width.
     header = (
-        "| BPW &nbsp; | &nbsp; Head bits &nbsp; | "
-        "&nbsp; Calibration rows &nbsp; | &nbsp; Size &nbsp; |"
+        "| BPW &nbsp; | &nbsp; Size &nbsp; |"
         + (" &nbsp; KL&nbsp;&divide;&nbsp;fp16 &nbsp; |" if has_kl else "")
         + " &nbsp; Status |\n"
-        "| :---: | :---: | :---: | ---: |"
+        "| :---: | ---: |"
         + (" :---: |" if has_kl else "")
         + " :--- |"
     )
@@ -215,10 +193,7 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
             if is_current and kl is not None:
                 kl_str = f"**{kl_str}**"
             kl_cell = f" {kl_str} |"
-        body.append(
-            f"| {bpw_cell} | {row.get('head_bits', 8)} | "
-            f"{row.get('cal_rows', 250)} | {size_str} |{kl_cell} {status} |"
-        )
+        body.append(f"| {bpw_cell} | {size_str} |{kl_cell} {status} |")
     # No footnote: the column speaks for itself. How the number was measured
     # lives in each quant's bq_quality.json (kl_method), which is where a reader
     # who cares about the corpus should be looking anyway.
@@ -272,7 +247,6 @@ def render_exl3_card(
         "HEAD_BITS": str(head_bits),
         "CAL_ROWS": str(cal_rows),
         "CODEBOOK": (codebook or "mcg").lower(),
-        "CODEBOOK_NOTE": _codebook_note(codebook, facts["is_moe"]),
         "REPO_ID": repo_id,
         "SHORT_NAME": repo_id.split("/")[-1],
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),

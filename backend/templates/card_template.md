@@ -99,10 +99,6 @@ hf download \
 | Out&#8209;scales | `always` |
 | Parallel mode | {{PARALLEL_LINE}} |
 
-{{CODEBOOK_NOTE}}
-
-Loaded automatically by every ExLlamaV3 loader; reproduced here for searchability.
-
 </details>
 
 ## License &amp; use

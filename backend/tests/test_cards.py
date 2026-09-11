@@ -133,13 +133,5 @@ def test_card_states_the_codebook():
     assert not re.search(r"\{\{[A-Z_]+\}\}", card), "unfilled placeholder left in card"
     assert "| Codebook | `mul1` |" in card
     assert "badge/codebook-mul1-" in card
-    # A downloader has to be able to tell which loaders can read this.
-    assert "v0.0.3" in card
-    # Dense model: no fused-MoE caveat.
-    assert "fully fused MoE kernel" not in card
 
 
-def test_card_flags_the_mul1_moe_fallback():
-    note = cards._codebook_note("mul1", is_moe=True)
-    assert "fully fused MoE kernel is `mcg`-only" in note
-    assert "fully fused MoE" not in cards._codebook_note("mcg", is_moe=True)
