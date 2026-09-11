@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-08-14T21:08:30+00:00",
+  "generated_at": "2026-09-11T20:02:41+00:00",
   "exllamav3": {
-    "ref": "5f3c537",
-    "version": "1.4.2"
+    "ref": "5be8865",
+    "version": "1.4.9"
   },
   "architectures": [
     "AfmoeForCausalLM",
@@ -26,14 +26,18 @@
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4ForCausalLM",
     "Glm4MoeForCausalLM",
+    "Glm4MoeLiteForCausalLM",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
+    "GlmMoeDsaForCausalLM",
     "GptOssForCausalLM",
     "HCXVisionV2ForCausalLM",
     "HYV3ForCausalLM",
     "HyperCLOVAXForCausalLM",
     "IQuestCoderForCausalLM",
     "LagunaForCausalLM",
+    "Lfm2ForCausalLM",
     "Lfm2MoeForCausalLM",
     "LlamaForCausalLM",
     "MiMoForCausalLM",
@@ -44,7 +48,6 @@
     "MixtralForCausalLM",
     "MuseGlimmerAssistantModel",
     "MuseGlimmerForConditionalGeneration",
-    "NanoChatForCausalLM",
     "NemotronHForCausalLM",
     "Olmo3ForCausalLM",
     "OlmoHybridForCausalLM",
@@ -60,9 +63,11 @@
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "SeedOssForCausalLM",
     "SmolLM3ForCausalLM",
     "SolarOpenForCausalLM",
+    "Spark2_5ForCausalLM",
     "Step3p5ForCausalLM",
     "Step3p7ForConditionalGeneration"
   ]

@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.4.2 covers all 60 registered
+# One image for every architecture. exllamav3 1.4.9 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake. The old three-image split (stable 0.0.38 +
@@ -14,7 +14,7 @@
 # -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
 # ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
 #
-# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.2 ships
+# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.9 ships
 # Triton attention kernels that lead the dispatch order and handle sliding
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
@@ -52,7 +52,7 @@ RUN python -m pip install \
 RUN python -m pip install \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
-        "transformers>=4.45.0,<5" \
+        "transformers>=4.56.0,<5" \
         "accelerate>=0.34" \
         "tokenizers>=0.21.1" \
         "safetensors>=0.4" \
@@ -73,18 +73,34 @@ RUN python -m pip install \
 # Pinned to a git ref, not a PyPI release, so the image carries architectures
 # merged upstream but not yet released. --no-deps stops pip resolving torch and
 # fla again; both are installed explicitly here.
-# EXLLAMA_NOCOMPILE: install without building the CUDA ext (the GPU-less CI
-# builder can't auto-detect an arch -> _get_cuda_arch_flags IndexError). The
-# ext JIT-builds on the pod's first boot (GPU + ninja present).
+# The CUDA ext is built here, not on the pod. _get_cuda_arch_flags reads
+# TORCH_CUDA_ARCH_LIST before it tries to detect a device, so naming the arches
+# is what lets a GPU-less CI builder compile -- the IndexError that pushed this
+# to a JIT build was the fallback path, not a hard limit. Building once in CI
+# takes the compile off every pod boot, where it was billed GPU time.
+#
+# Arches cover everything the GPU selector can pick at >=24 GB: A100 (8.0),
+# A40/A5000/3090 (8.6), L40S/4090/6000-Ada (8.9), H100 (9.0), 5090 and
+# RTX PRO 6000 Blackwell (12.0). +PTX leaves a JIT path for anything newer.
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX"
+ARG MAX_JOBS=2
+ENV MAX_JOBS=${MAX_JOBS}
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.4.2.
+# providers/runpod/provider.py); this ref reports 1.4.9.
 #
-# v1.4.2. We briefly tracked a dev commit to get MuseGlimmer, which 1.4.1 could
-# not load; 1.4.2 released it two days later, so this is back on a tag. Pinned
-# to the tag's commit rather than the tag name, since a tag can be moved.
-ARG EXLLAMAV3_REF=5f3c537ca9d89893d771256f5c43c93656553fbb
-RUN EXLLAMA_NOCOMPILE=1 python -m pip install --no-cache-dir --no-deps \
+# v1.4.9. Pinned to the tag's commit rather than the tag name, since a tag can
+# be moved.
+#
+# 1.4.2 -> 1.4.9 changes what we ship for vision models. --vision_bits used to
+# default to 16 (tower copied unquantized) and now defaults to auto: a tower the
+# arch declares validated goes to 6 bpw, every other tower stays at 16. Qwen3-VL,
+# Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are validated as of
+# this ref, so the same /quant request now produces a different artifact than it
+# did before the bump. The vision option on the command is what makes that
+# choice visible and reversible.
+ARG EXLLAMAV3_REF=5be886578ec80324c2c715269387be2058724b6e
+RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
 # ---- flash-linear-attention (linear-attention archs) ----------------------
@@ -132,8 +148,7 @@ except RuntimeError as e:
     print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
 # exllamav3's CUDA ext JITs on import (ninja present) -> best-effort GPU-less.
-RUN python -c "import exllamav3; print('exllamav3 import ok')" \
-    || echo "(exllamav3 import deferred to pod -- needs GPU/JIT)"
+RUN python -c "import exllamav3; print('exllamav3 import ok')"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
