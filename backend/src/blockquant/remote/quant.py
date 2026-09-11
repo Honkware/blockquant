@@ -836,6 +836,9 @@ def main() -> int:
         # rather than guessing, which is what _written_head_bits is for.
         head_bits: int | None = int(_hb) if _hb is not None else None
         vision_bits = cfg.get("vision_bits")
+        # How many cards the launcher rented. convert's -d defaults to "0", so
+        # without this an N-GPU pod quantizes on one card and bills for N.
+        gpu_count: int = max(1, int(cfg.get("gpu_count", 1) or 1))
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -858,12 +861,19 @@ def main() -> int:
         t0 = time.time()
 
         import torch
-        print(
-            f"[gpu] CUDA: {torch.cuda.is_available()} | "
-            f"{torch.cuda.get_device_name(0)} | "
-            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
-            flush=True,
+        # Every card, not just device 0: a multi-GPU pod that came up with
+        # fewer cards than were rented is worth seeing in the log rather than
+        # discovering from the bill.
+        _n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        _cards = " | ".join(
+            f"{torch.cuda.get_device_name(i)} "
+            f"{torch.cuda.get_device_properties(i).total_memory / 1e9:.0f}GB"
+            for i in range(_n)
         )
+        print(f"[gpu] CUDA: {torch.cuda.is_available()} | {_n} device(s) | {_cards}",
+              flush=True)
+        if _n < gpu_count:
+            print(f"[gpu] WARN rented {gpu_count} GPUs but torch sees {_n}", flush=True)
 
         from huggingface_hub import HfApi, snapshot_download, login as hf_login
 
@@ -1028,6 +1038,8 @@ def main() -> int:
             # tower the arch declares validated to 6 bpw and copies the rest at
             # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
             # tracks the image, and an explicit value is how a request pins it.
+            if gpu_count > 1:
+                argv += ["-d", ",".join(str(i) for i in range(gpu_count))]
             if head_bits is not None:
                 argv += ["--head_bits", str(int(head_bits))]
             if vision_bits is not None:
