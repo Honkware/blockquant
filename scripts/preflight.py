@@ -27,6 +27,30 @@ def supported_archs() -> set:
         return set()
 
 
+# Expert counts, in the spelling each arch family happens to use. A multimodal
+# repo puts the LM's geometry under text_config, so both scopes get checked --
+# same thing run_runpod_job._default_codebook does when it picks mcg for MoE.
+_EXPERT_KEYS = ("num_local_experts", "num_experts", "n_routed_experts")
+
+
+def model_facts(cfg: dict) -> dict:
+    """Vision tower and MoE, straight off config.json.
+
+    Cheap because the caller already downloaded the file for the arch gate.
+    A vision tower means --vision_bits decides whether the tower is quantized
+    or copied at fp16, and that lands in the published repo name, so the
+    request has to say which -- hence surfacing it before the job is approved.
+    """
+    scopes = [cfg, cfg.get("text_config") or {}]
+    experts = next((s[k] for s in scopes for k in _EXPERT_KEYS if s.get(k)), None)
+    return {
+        "hasVision": bool(cfg.get("vision_config")
+                          or (cfg.get("text_config") or {}).get("vision_config")),
+        "isMoe": experts is not None,
+        "numExperts": experts,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--token', default=None, help='HuggingFace API token')
@@ -78,6 +102,7 @@ def main():
                 if arch and supported and arch not in supported:
                     result['error'] = (f"exllamav3 does not support the '{arch}' architecture, "
                                        f"so this model cannot be quantized to EXL3.")
+                result.update(model_facts(cfg))
             except GatedRepoError:
                 result['modelExists'] = True
                 result['accessDenied'] = True
