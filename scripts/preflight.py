@@ -7,31 +7,25 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-# Architectures exllamav3 can quantize, keyed by config.json architectures[0].
-# Mirrors exllamav3/architecture/architectures.py plus the arches our fork image
-# carries (Mellum, LocateAnything). Update when the baked exllamav3 gains one.
-# Lets us reject an unsupported model at /quant time instead of booting a pod
-# that downloads the weights and then fails on an unknown architecture.
-SUPPORTED_ARCHS = {
-    "AfmoeForCausalLM", "ApertusForCausalLM", "ArceeForCausalLM", "Cohere2ForCausalLM",
-    "CohereForCausalLM", "DFlashDraftModel", "DeciLMForCausalLM", "Dots1ForCausalLM",
-    "Ernie4_5_ForCausalLM", "Ernie4_5_MoeForCausalLM", "Exaone4ForCausalLM",
-    "Gemma2ForCausalLM", "Gemma3ForCausalLM", "Gemma3ForConditionalGeneration",
-    "Gemma4ForConditionalGeneration", "Glm4ForCausalLM", "Glm4MoeForCausalLM",
-    "Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration",
-    "HCXVisionV2ForCausalLM", "HyperCLOVAXForCausalLM", "IQuestCoderForCausalLM",
-    "Lfm2MoeForCausalLM", "LlamaForCausalLM", "LocateAnythingForConditionalGeneration",
-    "MellumForCausalLM", "MiMoForCausalLM", "MiniMaxM2ForCausalLM", "Ministral3ForCausalLM",
-    "Mistral3ForConditionalGeneration", "MistralForCausalLM", "MixtralForCausalLM",
-    "NanoChatForCausalLM", "Olmo3ForCausalLM", "OlmoHybridForCausalLM", "Phi3ForCausalLM",
-    "Qwen2ForCausalLM", "Qwen2_5_VLForConditionalGeneration", "Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM", "Qwen3NextForCausalLM", "Qwen3VLForConditionalGeneration",
-    "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration", "SeedOssForCausalLM",
-    "SmolLM3ForCausalLM", "SolarOpenForCausalLM", "Step3p5ForCausalLM",
-    "Step3p7ForConditionalGeneration",
-}
+# Same allowlist the launcher gates on (backend/scripts/run_runpod_job.py), so a
+# model is accepted or refused identically here and at launch. gen_arch_support.py
+# regenerates it from exllamav3 at the ref the image is baked from. The
+# hand-written copy that used to live here had drifted 16 architectures behind,
+# and every one of them was turned away with "exllamav3 does not support it".
+_ARCH_SUPPORT = Path(__file__).resolve().parent.parent / "backend" / "arch_support.json"
+
+
+def supported_archs() -> set:
+    """Arch strings from arch_support.json, or an empty set if it is unreadable.
+    Empty means no gate here; the launcher checks again before renting a pod, so
+    the cost of a missing file is a later error, not a wasted GPU."""
+    try:
+        return set(json.loads(_ARCH_SUPPORT.read_text(encoding="utf-8"))["architectures"])
+    except Exception:
+        return set()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -78,9 +72,10 @@ def main():
                     cfg = json.load(f)
                 archs = cfg.get('architectures') or []
                 arch = archs[0] if archs else None
+                supported = supported_archs()
                 result['architecture'] = arch
-                result['archSupported'] = (arch in SUPPORTED_ARCHS) if arch else None
-                if arch and arch not in SUPPORTED_ARCHS:
+                result['archSupported'] = (arch in supported) if (arch and supported) else None
+                if arch and supported and arch not in supported:
                     result['error'] = (f"exllamav3 does not support the '{arch}' architecture, "
                                        f"so this model cannot be quantized to EXL3.")
             except GatedRepoError:
