@@ -2,7 +2,7 @@
 
 ## What Changed
 
-This release adds a **Python FastAPI + Celery backend** to the existing BlockQuant Discord bot. The bot now supports both **EXL3** (ExLlamaV3) and **GGUF** (llama.cpp) quantization formats, with jobs offloadable to a remote API.
+This release adds a **Python FastAPI + Celery backend** to the existing BlockQuant Discord bot. Jobs are offloadable to a remote API.
 
 ### New Components
 
@@ -17,7 +17,7 @@ This release adds a **Python FastAPI + Celery backend** to the existing BlockQua
 
 | File | Change |
 |------|--------|
-| `src/commands/quant.js` | Added `--format` option (`exl3` / `gguf`); branches to API or local mode |
+| `src/commands/quant.js` | Branches to API or local mode |
 | `src/commands/definitions.js` | Added `format` slash-command option |
 | `.env.example` | Added `BLOCKQUANT_API_URL` |
 
@@ -38,7 +38,7 @@ All existing local quantization code remains intact:
 cd backend
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -e ".[dev,gguf]"
+pip install -e ".[dev]"
 ```
 
 ### 2. Start Redis
@@ -93,17 +93,8 @@ BLOCKQUANT_API_URL=http://localhost:8000
 
 | Mode | `BLOCKQUANT_API_URL` | Behavior |
 |------|----------------------|----------|
-| API + local fallback | Set and reachable | EXL3 jobs can use API; GGUF jobs require API |
+| API + local fallback | Set and reachable | EXL3 jobs can use the API |
 | Local only | Unset or unreachable | Falls back to existing `quantizer.js` / `queue.js` |
-
-### GGUF Support
-
-To quantize to GGUF format, you need `llama.cpp` built:
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp
-cd llama.cpp && make -j$(nproc)
-```
 
 ## Usage
 
@@ -111,7 +102,6 @@ cd llama.cpp && make -j$(nproc)
 
 ```
 /quant url=meta-llama/Llama-3.1-8B-Instruct bpw=4.0 format=exl3
-/quant url=mistralai/Mistral-7B-Instruct bpw=q4_k_m format=gguf
 ```
 
 ### CLI (Python Backend)
@@ -123,8 +113,6 @@ bq-pipeline --model microsoft/Phi-3-mini-4k-instruct --format exl3 --variants 4.
 # Real run
 bq-pipeline --model microsoft/Phi-3-mini-4k-instruct --format exl3 --variants 4.0
 
-# GGUF
-bq-pipeline --model Qwen/Qwen2.5-7B --format gguf --variants q4_k_m,q5_k_m
 ```
 
 ## API Endpoints
