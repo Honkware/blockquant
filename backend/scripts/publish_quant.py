@@ -27,7 +27,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
@@ -89,11 +88,17 @@ def _repo_head_bits(repo_id: str, fallback: int | None) -> int | None:
         return fallback
 
 
-def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[dict]:
-    """Build the Quants-table rows from which sibling repos exist on HF."""
+def _quant_rows(api, repos, cal_rows, head_bits) -> list[dict]:
+    """Build the Quants-table rows from the sibling repos that exist on HF.
+
+    Takes parsed repo records, not bpw strings: the repo id has to travel with
+    the row rather than being rebuilt from the number, or a family holding two
+    repos at one bpw (vision tower quantized or not) would point both rows at
+    whichever name the old format string happened to produce.
+    """
     rows = []
-    for v in variants:
-        repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
+    for r in repos:
+        v, repo_id = r["variant"], r["repo_id"]
         kl = None
         try:
             from huggingface_hub import hf_hub_download
@@ -103,7 +108,9 @@ def _quant_rows(api, base_name, hf_org, variants, cal_rows, head_bits) -> list[d
         except Exception:
             pass  # older quants predate the file; the column just stays empty
         rows.append({
-            "variant": v, "head_bits": _repo_head_bits(repo_id, head_bits),
+            "variant": v, "head_bits": r.get("head_bits") or _repo_head_bits(repo_id, head_bits),
+            "sc": r.get("sc", False), "vision_bits": r.get("vision_bits"),
+            "repo_id": repo_id,
             "cal_rows": cal_rows, "kl_div": kl,
             "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
@@ -130,23 +137,28 @@ def _push_card(repo_id: str, base_repo: str, bpw: str, card_text: str) -> None:
         os.unlink(tmp_path)
 
 
-def _discover_variants(api, base_name: str, hf_org: str) -> list[str]:
-    """Every bpw we actually published for this base, found by listing the org's
-    repos. Scoped to ``{hf_org}/{base_name}-exl3-<bpw>bpw`` so it only ever picks
-    up our own quants of THIS model (never another model or someone else's repo).
+def _discover_repos(api, base_name: str, hf_org: str) -> list[dict]:
+    """Every quant we published for this base, by listing the org's repos.
+
+    Returns the parsed slug rather than a bare bpw string, because a family can
+    hold two repos at the same bpw (one with a quantized vision tower) and
+    rebuilding the name from the number alone would collapse them onto one.
+    Scoped to this org and this base so it never picks up another model.
     """
-    pat = re.compile(rf"^{re.escape(hf_org)}/{re.escape(base_name)}-exl3-([0-9.]+)bpw$")
     found = []
     try:
         for m in api.list_models(author=hf_org, limit=1000):
             rid = getattr(m, "id", None) or getattr(m, "modelId", "") or ""
-            mm = pat.match(rid)
-            if mm:
-                found.append(mm.group(1))
+            owner, _, slug = rid.partition("/")
+            if owner != hf_org:
+                continue
+            parsed = cards.parse_exl3_slug(slug, base_name)
+            if parsed:
+                found.append(dict(parsed, repo_id=rid))
     except Exception as e:
         print(f"[publish] discovery failed ({e}); falling back to --variants", flush=True)
         return []
-    return sorted(set(found), key=lambda x: float(x))
+    return sorted(found, key=lambda r: (float(r["variant"]), r["sc"], r["slug"]))
 
 
 def main():
@@ -188,12 +200,20 @@ def main():
         print("ERROR: could not resolve HF org (pass --hf-org)"); sys.exit(1)
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    if not variants:
-        variants = _discover_variants(api, base_name, hf_org)
-        print(f"[publish] discovered our variants on HF: {', '.join(variants) or 'none'}", flush=True)
+    if variants:
+        # --variants names plain builds; anything with an SC or vision
+        # component has to be discovered, since the flag carries only a number.
+        repos = [{"variant": v, "sc": False, "head_bits": None, "vision_bits": None,
+                  "slug": cards.exl3_repo_slug(base_name, v),
+                  "repo_id": cards.exl3_repo_id(hf_org, base_name, v)}
+                 for v in variants]
+    else:
+        repos = _discover_repos(api, base_name, hf_org)
+        print(f"[publish] discovered on HF: "
+              f"{', '.join(r['slug'] for r in repos) or 'none'}", flush=True)
     model_config = _load_base_config(args.base, token)
     license_id = cards.fetch_license(args.base, token)
-    quant_rows = _quant_rows(api, base_name, hf_org, variants, args.cal_rows, args.head_bits)
+    quant_rows = _quant_rows(api, repos, args.cal_rows, args.head_bits)
 
     # Resolve the collection slug once, up front. Splitting create from add keeps
     # parallel finalizes concurrency-safe (each adds its own repo to one slug).
@@ -205,20 +225,19 @@ def main():
         slug = args.collection
     coll_url = cards.collection_url(slug) or f"https://huggingface.co/{hf_org}"
 
-    published = [r["variant"] for r in quant_rows if r["size_gb"] is not None]
+    published = [r for r in quant_rows if r["size_gb"] is not None]
     if not published:
         print("[publish] no uploaded variants found on HF for this model yet.")
         sys.exit(1)
-    print(f"[publish] finalizing cards for: {', '.join(published)}", flush=True)
+    print(f"[publish] finalizing cards for: "
+          f"{', '.join(r['repo_id'].split('/')[-1] for r in published)}", flush=True)
 
-    rows_by_variant = {r["variant"]: r for r in quant_rows}
-    for v in published:
-        repo_id = f"{hf_org}/{base_name}-exl3-{v}bpw"
-        size_gb = _real_size_gb(api, repo_id)
+    for row in published:
+        repo_id, v = row["repo_id"], row["variant"]
         rendered = cards.render_exl3_card(
             base_repo=args.base, repo_id=repo_id, variant=v,
-            head_bits=rows_by_variant[v]["head_bits"],
-            cal_rows=args.cal_rows, size_gb=size_gb,
+            head_bits=row["head_bits"],
+            cal_rows=args.cal_rows, size_gb=row["size_gb"],
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
             quantized_by=hf_org, codebook=args.codebook, title_override=args.title,

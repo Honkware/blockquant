@@ -686,14 +686,13 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     collection so the Quants table carries KL for all bpws. Fully best-effort:
     the finished quant has already uploaded by the time this runs.
     """
-    import re as _re
     import shutil
     import cards
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.utils import EntryNotFoundError
 
     api = HfApi(token=hf_token)
-    rx = _re.compile(rf"^{_re.escape(model_name)}-exl3-([0-9.]+)bpw$")
+    rx = cards.exl3_slug_rx(model_name)
     new_variants = {o["variant"] for o in outputs}
 
     def _repo_size_gb(repo_id: str):
@@ -721,8 +720,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
     siblings = []
     for m in found:
         mm = rx.match(m.id.split("/")[-1])
-        if mm and mm.group(1) not in new_variants:
-            siblings.append((mm.group(1), m.id))
+        if mm and mm.group("variant") not in new_variants:
+            siblings.append((mm.group("variant"), m.id))
 
     if not siblings:
         print("[backfill] no existing siblings to fill", flush=True)

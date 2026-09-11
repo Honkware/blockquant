@@ -3,6 +3,8 @@ import re
 import sys
 import types
 
+import pytest
+
 from blockquant import cards
 
 
@@ -134,4 +136,47 @@ def test_card_states_the_codebook():
     assert "| Codebook | `mul1` |" in card
     assert "badge/codebook-mul1-" in card
 
+def test_slug_shapes():
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.0") == "Qwen3.8-27B-exl3-4.0bpw"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.0", vision_bits=6) == \
+        "Qwen3.8-27B-exl3-4.0bpw-V6"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.00", sc=True, head_bits=5) == \
+        "Qwen3.8-27B-exl3-SC-4.00bpw-H5"
+    assert cards.exl3_repo_slug("Qwen3.8-27B", "4.00", sc=True, head_bits=5, vision_bits=6) == \
+        "Qwen3.8-27B-exl3-SC-4.00bpw-H5-V6"
 
+
+def test_sc_slug_demands_head_bits():
+    """Under SC the recipe picks head bits per budget, so the name is
+    incomplete without it and there is nothing sensible to default to."""
+    with pytest.raises(ValueError):
+        cards.exl3_repo_slug("M", "4.00", sc=True)
+
+
+def test_slug_round_trips():
+    for kw in ({}, {"vision_bits": 6}, {"sc": True, "head_bits": 5},
+               {"sc": True, "head_bits": 3, "vision_bits": 3}):
+        slug = cards.exl3_repo_slug("Qwen3.8-27B", "4.00", **kw)
+        got = cards.parse_exl3_slug(slug, "Qwen3.8-27B")
+        assert got["variant"] == "4.00"
+        assert got["sc"] is kw.get("sc", False)
+        assert got["head_bits"] == kw.get("head_bits")
+        assert got["vision_bits"] == kw.get("vision_bits")
+
+
+def test_slug_rx_scoped_to_its_base():
+    """Discovery lists a whole org, so the pattern has to reject another
+    model's quants and anything that merely looks like one."""
+    for bad in ("OtherModel-exl3-4.0bpw", "Qwen3.8-27B-exl3-4.0bpw-extra",
+                "Qwen3.8-27B-exl3-4.0", "Qwen3.8-27B-4.0bpw"):
+        assert cards.parse_exl3_slug(bad, "Qwen3.8-27B") is None
+
+
+def test_two_repos_at_one_bpw_stay_distinct():
+    """A vision-quantized build sits beside the plain one at the same bpw.
+    Rebuilding a repo name from the bpw alone would collapse them."""
+    plain = cards.exl3_repo_slug("M", "4.0")
+    vis = cards.exl3_repo_slug("M", "4.0", vision_bits=6)
+    assert plain != vis
+    assert cards.parse_exl3_slug(plain, "M")["vision_bits"] is None
+    assert cards.parse_exl3_slug(vis, "M")["vision_bits"] == 6

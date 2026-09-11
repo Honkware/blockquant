@@ -18,13 +18,58 @@ from pathlib import Path
 # estimates (which would have to guess KV-cache geometry per architecture).
 
 
-def exl3_repo_slug(base_name: str, variant: str) -> str:
-    """Canonical repo name for an EXL3 variant: ``{model}-exl3-{bpw}bpw``."""
-    return f"{base_name}-exl3-{variant}bpw"
+def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
+                   head_bits: int | None = None, vision_bits: int | None = None) -> str:
+    """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
+
+    Self-calibrated builds take ``-SC-{bpw}bpw-H{n}``. Head bits is required
+    there and has no default on purpose: under SC the recipe chooses it per
+    budget (turboderp publishes H3 through H6 for one model), so the name is
+    incomplete without it. A plain ``-exl3-{bpw}bpw`` already means bundled
+    calibration, and one name must not describe two different artifacts.
+
+    ``-V{n}`` is appended when the vision tower was quantized. Its absence
+    means the tower was copied at fp16 -- that is how exllamav3 records it
+    too, where quantization_config carries vision_bits only when the tower
+    was quantized.
+    """
+    if sc and head_bits is None:
+        raise ValueError("A self-calibrated quant must name its head bits")
+    core = f"SC-{variant}bpw-H{int(head_bits)}" if sc else f"{variant}bpw"
+    vis = f"-V{int(vision_bits)}" if vision_bits else ""
+    return f"{base_name}-exl3-{core}{vis}"
 
 
-def exl3_repo_id(owner: str, base_name: str, variant: str) -> str:
-    slug = exl3_repo_slug(base_name, variant)
+def exl3_slug_rx(base_name: str) -> re.Pattern:
+    """Matches every shape exl3_repo_slug emits, for one base model.
+
+    Discovery sites used to hand-roll ``-exl3-([0-9.]+)bpw$`` each, which meant
+    any name growing a component would quietly match nothing: publish_quant
+    would find zero variants and wipe the cross-links out of every card in the
+    family. Keep this next to the builder so the two move together.
+    """
+    return re.compile(
+        rf"^{re.escape(base_name)}-exl3-(?P<sc>SC-)?(?P<variant>[0-9.]+)bpw"
+        rf"(?:-H(?P<head_bits>\d+))?(?:-V(?P<vision_bits>\d+))?$"
+    )
+
+
+def parse_exl3_slug(slug: str, base_name: str) -> dict | None:
+    """The facts a slug encodes, or None when it is not one of ours."""
+    m = exl3_slug_rx(base_name).match(slug)
+    if not m:
+        return None
+    return {
+        "slug": slug,
+        "variant": m.group("variant"),
+        "sc": bool(m.group("sc")),
+        "head_bits": int(m.group("head_bits")) if m.group("head_bits") else None,
+        "vision_bits": int(m.group("vision_bits")) if m.group("vision_bits") else None,
+    }
+
+
+def exl3_repo_id(owner: str, base_name: str, variant: str, **kw) -> str:
+    slug = exl3_repo_slug(base_name, variant, **kw)
     return f"{owner}/{slug}" if owner else slug
 
 
