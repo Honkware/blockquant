@@ -51,6 +51,18 @@ def model_facts(cfg: dict) -> dict:
     }
 
 
+def _top_level_dirs(model_id: str, token: str) -> list:
+    """Directory names at the repo root, for telling someone where to look."""
+    try:
+        from huggingface_hub import HfApi
+        return sorted(
+            e.path for e in HfApi().list_repo_tree(model_id, token=token or None)
+            if type(e).__name__ == "RepoFolder"
+        )
+    except Exception:
+        return []
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--token', default=None, help='HuggingFace API token')
@@ -88,7 +100,9 @@ def main():
         # architectures[0]. Sets flags the Node side turns into clear errors.
         if args.model:
             from huggingface_hub import hf_hub_download
-            from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+            from huggingface_hub.utils import (
+                EntryNotFoundError, GatedRepoError, RepositoryNotFoundError,
+            )
             try:
                 cfg_path = hf_hub_download(args.model, 'config.json', token=token)
                 result['modelExists'] = True
@@ -111,6 +125,23 @@ def main():
             except RepositoryNotFoundError:
                 result['modelExists'] = False
                 result['error'] = f"Model {args.model} not found, or your token cannot access it."
+            except EntryNotFoundError:
+                # No config.json at the repo root. Usually a repo that ships
+                # several formats in subdirectories (BF16/, FP8/, GGUF/ ...),
+                # which the downloader pulls whole -- one of these cost a 433 GB
+                # download and 13 minutes of pod before the converter looked for
+                # a config that was never going to be there. The generic handler
+                # below used to swallow this and let the job through, because it
+                # cannot tell a missing file from a network blip.
+                result['modelExists'] = True
+                result['archSupported'] = False
+                dirs = _top_level_dirs(args.model, token)
+                where = f" It has subdirectories ({', '.join(dirs)})." if dirs else ""
+                result['error'] = (
+                    f"{args.model} has no config.json at its root, so there is nothing "
+                    f"to quantize there.{where} Point /quant at a repo whose model files "
+                    f"sit at the top level."
+                )
             except Exception:
                 # Could not read config (network, missing file): fall back to a
                 # plain existence check rather than hard-failing the preflight.
