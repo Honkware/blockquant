@@ -99,7 +99,7 @@ ENV MAX_JOBS=${MAX_JOBS}
 # this ref, so the same /quant request now produces a different artifact than it
 # did before the bump. The vision option on the command is what makes that
 # choice visible and reversible.
-ARG EXLLAMAV3_REF=5be886578ec80324c2c715269387be2058724b6e
+ARG EXLLAMAV3_REF=0740edc2da569fb99174023c1d2988b1e98cb41e
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 

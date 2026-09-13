@@ -39,7 +39,7 @@ logger = get_logger(__name__)
 # boot so they can't silently quantize with outdated kernels or fail on newer
 # model architectures. Keep in sync with EXLLAMAV3_VERSION in
 # docker/Dockerfile.runpod.
-_MIN_EXLLAMAV3 = (0, 0, 37)
+_MIN_EXLLAMAV3 = (1, 4, 9)
 
 
 class RunPodProvider(Provider):
