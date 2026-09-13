@@ -294,74 +294,6 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
-def _chat_format(model_dir: Path, text: str) -> tuple[str, str]:
-    """(text, label) with the model's chat template applied, when it has one.
-
-    turboderp's published curves are measured on chat-formatted text, and an
-    instruct model puts real probability mass on the control tokens, so raw
-    prose is a different distribution than the one anyone actually runs. Best
-    effort: a model with no template, or a template that will not render, gets
-    the raw text and says so rather than failing the whole measurement.
-    """
-    try:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=False)
-        if not getattr(tok, "chat_template", None):
-            return text, "raw (no chat template)"
-        out = tok.apply_chat_template(
-            [{"role": "user", "content": text}], tokenize=False,
-            add_generation_prompt=True,
-        )
-        return (out, "formatted") if out and out.strip() else (text, "raw (template empty)")
-    except Exception as e:  # noqa: BLE001
-        print(f"[kl] WARN chat template not applied: {type(e).__name__}: {e}", flush=True)
-        return text, "raw (template failed)"
-
-
-# Held-out text for the KL metric, baked into the image at build time.
-# Read off disk rather than pulled with load_dataset() so a paid pod can never
-# lose a run to a dataset outage -- the same reason the old corpus was a file.
-KL_CORPUS = Path("/opt/blockquant/kl_eval_corpus.utf8")
-
-
-def _eval_text() -> tuple[str, str]:
-    """(text, source) for the KL metric.
-
-    Held-out text, NOT exllamav3's standard_cal_data. That is the corpus EXL3
-    calibrates the quant against, so measuring KL on it is measuring on the
-    training set: it flatters every quant we publish and is not comparable to
-    turboderp's own numbers, which use openwebtext for exactly this reason.
-
-    Falls back to the calibration corpus on an image built before the eval text
-    was baked, and says so, because a wrong number reported as a right one is
-    worse than a missing one.
-    """
-    import glob
-    import os
-    try:
-        if KL_CORPUS.is_file():
-            text = KL_CORPUS.read_text(encoding="utf-8")
-            if text.strip():
-                return text, "openwebtext"
-    except Exception as e:
-        print(f"[kl] WARN eval corpus unreadable: {type(e).__name__}: {e}", flush=True)
-
-    import exllamav3
-    base = os.path.join(os.path.dirname(exllamav3.__file__),
-                        "conversion", "standard_cal_data")
-    parts = []
-    for fn in sorted(glob.glob(os.path.join(base, "*.utf8"))):
-        try:
-            with open(fn, encoding="utf-8") as f:
-                parts.append(f.read())
-        except Exception:
-            pass
-    if parts:
-        print("[kl] WARN no baked eval corpus; falling back to the CALIBRATION "
-              "data, which understates KL. Rebuild the image.", flush=True)
-    return "\n\n".join(parts), "the calibration set (stale image)"
-
-
 def _kl_kernel_usable() -> bool:
     """Whether exllamav3's CUDA compute_kl_div can be trusted on this image.
 
@@ -392,8 +324,8 @@ def _kl_kernel_usable() -> bool:
     return False
 
 
-def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
-                 seq_len: int = 8192) -> tuple[dict | None, str]:
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
+                 seq_len: int = 2048) -> tuple[dict | None, str]:
     """KL(fp16 || quant) over held-out text, as qbench reports it.
 
     Returns (stats, method). stats carries kld, kld_median, the p10-p90 spread
@@ -416,46 +348,46 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
         from exllamav3 import Config, Model, Cache, Tokenizer
         sys.path.insert(0, str(Path(__file__).parent.parent / "selfcal"))
         from eval.qbench.measure import DiffStats, save_reference_row, print_stats
-        from eval.qbench.data import save_tensors
+        from eval.qbench.data import QCache, get_test_rows, save_tensors
     except Exception as e:
         print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
 
     try:
-        text, corpus = _eval_text()
-        if not text:
-            print("[kl] WARN no bundled eval text found", flush=True)
-            return None, ""
-        text, fmt = _chat_format(quant_dir, text)
-        method = f"qbench · {corpus} · {rows}×{seq_len} · {fmt}"
+        # qbench's own loader: wiki2 at 10x2048, which is what its example
+        # project ships and the only corpus sc_measure implements. We measured
+        # openwebtext at 8x8192 before, which is a supported source but nobody
+        # else's geometry, so the number could not be read against anyone's.
+        # It also applies the chat template (prepend_hf_chat_context) and
+        # reports prefix_len, so metrics skip the framing rather than scoring it.
+        project = {
+            "test_data": {"source": "wiki2", "rows": rows, "length": seq_len,
+                          "stride": seq_len},
+            "tokenizer": {"source": str(quant_dir), "template": True},
+            "logit_cache": {"dir": str(quant_dir.parent), "max_size_gb": 50},
+        }
+        corpus = "wiki2"
+        qcache = QCache(project["logit_cache"])
+        ids, ranges, trace_vocab = get_test_rows(project, qcache)
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
-        all_ids = tokenizer.encode(text)
-        vocab = tokenizer.actual_vocab_size
-        n = all_ids.shape[-1]
-        seqs = [all_ids[:, a:a + seq_len]
-                for a in range(0, n - seq_len, seq_len)][:rows]
-        if not seqs:
-            print("[kl] WARN not enough eval tokens", flush=True)
-            return None, ""
+        vocab = trace_vocab or tokenizer.actual_vocab_size
+        method = f"qbench · {corpus} · {rows}×{seq_len}"
+        seqs = [ids[i:i + 1, :] for i in range(ids.shape[0])]
     except Exception as e:
-        print(f"[kl] WARN tokenize failed: {type(e).__name__}: {e}", flush=True)
+        print(f"[kl] WARN test data failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
-
-    # Score the whole row bar the first token, which has no context to predict from.
-    ranges = [(0, s.shape[-1]) for s in seqs]
-    ids = torch.cat([s.view(1, -1) for s in seqs], dim=0)
 
     def _forward_rows(model_dir, on_row) -> None:
         config = Config.from_directory(str(model_dir))
-        config.override_dynamic_seq_len(seq_len)
+        config.override_dynamic_seq_len(ids.shape[-1])
         model = Model.from_config(config)
-        cache = Cache(model, max_num_tokens=seq_len)
+        cache = Cache(model, max_num_tokens=ids.shape[-1])
         model.load()
         try:
             for i, seq in enumerate(seqs):
                 params = {"attn_mode": "flash_attn", "cache": cache,
-                          "past_len": 0, "batch_shape": (1, seq_len)}
+                          "past_len": 0, "batch_shape": (1, ids.shape[-1])}
                 logits = model.forward(seq, params=params)
                 on_row(i, logits)
         finally:

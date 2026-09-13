@@ -121,14 +121,21 @@ RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
 COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
 RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 
-# The corpus the KL metric is measured on, which must NOT be the one above:
-# that is what EXL3 calibrates against, so measuring there is measuring on the
-# training set. Baked rather than downloaded at run time so a paid pod cannot
-# lose a job to a dataset outage.
-COPY docker/fetch_kl_corpus.py /tmp/fetch_kl_corpus.py
-RUN mkdir -p /opt/blockquant \
-    && python /tmp/fetch_kl_corpus.py /opt/blockquant/kl_eval_corpus.utf8 \
-    && rm /tmp/fetch_kl_corpus.py
+# The corpus the KL metric is measured on: wikitext-2 test, which is what
+# qbench's own example project uses and the only set sc_measure implements.
+# It must not be what EXL3 calibrates against -- measuring there is measuring
+# on the training set. It is not: that is standard_cal_data/wiki.utf8, a
+# general Wikipedia dump, and 393 sampled 12-word shingles from this test split
+# appear in it zero times.
+#
+# Warmed into the image's dataset cache rather than downloaded per job, so a
+# paid pod cannot lose its number to a Hugging Face outage. qbench's loader
+# then finds it offline.
+ENV HF_DATASETS_CACHE=/opt/blockquant/datasets
+RUN mkdir -p /opt/blockquant/datasets \
+    && python -c "from datasets import load_dataset; \
+                  d=load_dataset('wikitext','wikitext-2-raw-v1',split='test'); \
+                  print('wikitext-2 test rows:', len(d))"
 
 # ---- Verify the stack at build time ---------------------------------------
 RUN python - <<'PY'
