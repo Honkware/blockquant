@@ -203,7 +203,8 @@ export async function handleQuant(interaction) {
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           bpw,
-          quantOptions: { headBits },
+          hasVision: flight.hasVision,
+          quantOptions: { headBits, visionBits },
         });
         precheckedRepos[String(bpw)] = state;
         // config_missing is a repo whose config.json could not be read -- an

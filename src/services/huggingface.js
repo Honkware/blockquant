@@ -391,6 +391,7 @@ export async function inspectUploadRepo(repoName, expected = {}) {
     '--quant_options_json',
     JSON.stringify(expected.quantOptions ?? {}),
   ];
+  if (expected.hasVision) args.push('--has-vision');
   if (expected.revision) {
     args.push('--revision', String(expected.revision));
   }
