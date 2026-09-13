@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.4.9 covers every registered
+# One image for every architecture. exllamav3 1.5.0 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake. The old three-image split (stable 0.0.38 +
@@ -14,7 +14,7 @@
 # -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
 # ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
 #
-# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.9 ships
+# flash-attn is NOT installed and is no longer needed: exllamav3 ships
 # Triton attention kernels that lead the dispatch order and handle sliding
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
@@ -87,17 +87,22 @@ ARG MAX_JOBS=2
 ENV MAX_JOBS=${MAX_JOBS}
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.4.9.
+# providers/runpod/provider.py); this ref reports 1.5.0.
 #
-# v1.4.9. Pinned to the tag's commit rather than the tag name, since a tag can
+# v1.5.0. Pinned to the tag's commit rather than the tag name, since a tag can
 # be moved.
 #
-# 1.4.2 -> 1.4.9 changes what we ship for vision models. --vision_bits used to
-# default to 16 (tower copied unquantized) and now defaults to auto: a tower the
-# arch declares validated goes to 6 bpw, every other tower stays at 16. Qwen3-VL,
-# Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are validated as of
-# this ref, so the same /quant request now produces a different artifact than it
-# did before the bump. The vision option on the command is what makes that
+# 1.4.9 -> 1.5.0 replaces the single-token and batched MoE paths with one
+# two-stage cooperative kernel and makes MoE output deterministic, and swaps in
+# new quantizer kernels chosen per group size and arch (with an accuracy fix at
+# K=2). Both change what a quant comes out as, which is why _MIN_EXLLAMAV3 moved
+# with it -- rolling back past this should not be quiet.
+#
+# Vision, carried over from the 1.4.2 -> 1.4.9 bump: --vision_bits used to
+# default to 16 (tower copied unquantized) and now defaults to auto, so a tower
+# the arch declares validated goes to 6 bpw and every other tower stays at 16.
+# Qwen3-VL, Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are the
+# validated ones. The vision_bits option on the command is what makes that
 # choice visible and reversible.
 ARG EXLLAMAV3_REF=0740edc2da569fb99174023c1d2988b1e98cb41e
 RUN python -m pip install --no-cache-dir --no-deps \
@@ -130,7 +135,8 @@ RUN python - <<'PY'
 import sys, torch, importlib.metadata as m
 assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
 assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
-assert m.version("exllamav3").startswith("1.4"), f"exllamav3 not 1.4.x: {m.version('exllamav3')}"
+_exl = tuple(int(x) for x in m.version("exllamav3").split(".")[:2])
+assert _exl >= (1, 5), f"exllamav3 older than 1.5: {m.version('exllamav3')}"
 print("python", sys.version.split()[0], "| torch", torch.__version__,
       "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
       "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))
