@@ -394,16 +394,22 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         print(f"[kl] WARN test data failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
 
+    # exllamav3 asserts the cache is a multiple of 256, and qbench's rows are
+    # not: prepend_hf_chat_context puts a chat prefix in front of each 2048, so
+    # the row is 2048 + however long that framing came out.
+    row_len = ids.shape[-1]
+    cache_len = -(-row_len // 256) * 256
+
     def _forward_rows(model_dir, on_row) -> None:
         config = Config.from_directory(str(model_dir))
-        config.override_dynamic_seq_len(ids.shape[-1])
+        config.override_dynamic_seq_len(cache_len)
         model = Model.from_config(config)
-        cache = Cache(model, max_num_tokens=ids.shape[-1])
+        cache = Cache(model, max_num_tokens=cache_len)
         model.load()
         try:
             for i, seq in enumerate(seqs):
                 params = {"attn_mode": "flash_attn", "cache": cache,
-                          "past_len": 0, "batch_shape": (1, ids.shape[-1])}
+                          "past_len": 0, "batch_shape": (1, row_len)}
                 logits = model.forward(seq, params=params)
                 on_row(i, logits)
         finally:

@@ -426,11 +426,29 @@ class RunPodProvider(Provider):
         )
 
     def _exec(self, client, command: str, timeout: int = 3600) -> dict:
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(self._with_pod_env(command), timeout=timeout)
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace")
         return {"stdout": out, "stderr": err, "code": exit_code}
+
+    # sshd on a RunPod pod is started outside the container's process tree, so
+    # an SSH session inherits none of the image's ENV. Two of them are load
+    # bearing and both failed silently: without TORCH_CUDA_ARCH_LIST torch JITs
+    # exllamav3's CUDA extension for the local arch only, which misses the cache
+    # the image built and recompiles it on every pod (~10 min of paid GPU, and
+    # the whole point of precompiling it); without HF_DATASETS_CACHE qbench
+    # cannot see the wikitext-2 warmed into the image and goes back to the
+    # network for it mid-job. Prepend them to everything we run.
+    POD_ENV = {
+        "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0;12.0+PTX",
+        "HF_DATASETS_CACHE": "/opt/blockquant/datasets",
+    }
+
+    @classmethod
+    def _with_pod_env(cls, command: str) -> str:
+        exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in cls.POD_ENV.items())
+        return f"export {exports}; {command}"
 
     def run(self, instance_id: str, command: str, retries: int = 4) -> dict:
         """Run a command via SSH with reconnect-on-transient-error.
@@ -500,7 +518,8 @@ class RunPodProvider(Provider):
         """
         client = self._connect_ssh(instance_id)
         try:
-            stdin, stdout, stderr = client.exec_command(command, timeout=read_timeout)
+            stdin, stdout, stderr = client.exec_command(
+                self._with_pod_env(command), timeout=read_timeout)
             try:
                 stdout.channel.settimeout(read_timeout)
                 out = stdout.readline()
