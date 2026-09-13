@@ -363,8 +363,11 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         project = {
             "test_data": {"source": "wiki2", "rows": rows, "length": seq_len,
                           "stride": seq_len},
-            "tokenizer": {"source": str(quant_dir), "template": True},
-            "logit_cache": {"dir": str(quant_dir.parent), "max_size_gb": 50},
+            # The reference's tokenizer, as qbench's example does. Keying it on
+            # the quant instead would re-tokenize per variant, since the cache
+            # key is a hash of (dataset spec, tokenizer source).
+            "tokenizer": {"source": str(fp16_dir), "template": True},
+            "logit_cache": {"dir": str(fp16_dir.parent), "max_size_gb": 50},
         }
         corpus = "wiki2"
         qcache = QCache(project["logit_cache"])
@@ -632,6 +635,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     quant_rows = [{
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
         "cal_rows": o.get("_cal_rows", cal_rows),
+        "vision_bits": o.get("_vision_bits"),
+        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"]),
         "size_gb": o.get("_size_gb"),
         "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
         "kl_div": o.get("kl_div"),
@@ -646,6 +651,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
+            vision_bits=o.get("_vision_bits"),
             cal_rows=o.get("_cal_rows", cal_rows),
             size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
@@ -718,6 +724,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         qcfg_v = _repo_quant_config(repo, hf_token)
         cb_v = str(qcfg_v.get("codebook") or "mcg")
         hb_v = qcfg_v.get("head_bits", head_bits)
+        vb_v = qcfg_v.get("vision_bits")
         # Already measured? read it back and skip the eval.
         existing = None
         try:
@@ -768,7 +775,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             except Exception as e:
                 print(f"[backfill] {v} quality upload failed: {e}", flush=True)
         table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v,
-                    "head_bits": hb_v}
+                    "head_bits": hb_v, "vision_bits": vb_v}
 
     # Re-render every card so the Quants table shows KL for all bpws.
     try:
@@ -781,6 +788,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                                              token=hf_token)
     quant_rows = [{
         "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
+        "vision_bits": d.get("vision_bits"), "repo_id": d["repo"],
         "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
         "kl_div": d["kl"], "kl_method": d.get("kl_method"),
     } for v, d in table.items()]
@@ -788,7 +796,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         try:
             card = cards.render_exl3_card(
                 base_repo=model_id, repo_id=d["repo"], variant=v,
-                head_bits=d.get("head_bits", head_bits), cal_rows=rows_cal,
+                head_bits=d.get("head_bits", head_bits),
+                vision_bits=d.get("vision_bits"), cal_rows=rows_cal,
                 size_gb=d["size_gb"],
                 model_config=model_config, quant_rows=quant_rows,
                 collection_url=collection_url, license_id=license_id,
@@ -990,6 +999,8 @@ def main() -> int:
             rec["_head_bits"] = _qc.get("head_bits", head_bits)
             rec["_codebook"] = _qc.get("codebook", codebook)
             rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
+            # Present only when the tower was quantized; that is the signal.
+            rec["_vision_bits"] = _qc.get("vision_bits")
             if not hf_token:
                 return
             repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"

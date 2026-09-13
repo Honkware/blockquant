@@ -191,3 +191,44 @@ def test_variant_keeps_one_decimal_unless_more_says_something():
     assert cards.exl3_variant("4.05") == "4.05"
     assert cards.exl3_variant("3.14") == "3.14"
     assert cards.exl3_repo_slug("M", "4.00") == cards.exl3_repo_slug("M", 4)
+
+
+def _row(variant, repo_id, **kw):
+    return dict({"variant": variant, "repo_id": repo_id, "size_gb": 15.0,
+                 "url": "https://x", "kl_div": 0.02, "head_bits": 6}, **kw)
+
+
+def test_mode_column_stays_away_from_a_plain_family():
+    """A family with nothing but plain quants must render exactly as before."""
+    rows = [_row("3.0", "o/m-exl3-3.0bpw"), _row("4.0", "o/m-exl3-4.0bpw")]
+    assert "Mode" not in cards.build_quants_table(rows, "4.0")
+
+
+def test_two_rows_at_one_bpw_are_told_apart():
+    """Once SC or a quantized tower is in play a bpw no longer identifies a row,
+    so the repo id decides which one is bolded as this card."""
+    rows = [
+        _row("4.0", "o/m-exl3-4.0bpw"),
+        _row("4.0", "o/m-exl3-SC-4.0bpw-H5-V6", sc=True, head_bits=5, vision_bits=6),
+    ]
+    t = cards.build_quants_table(rows, "4.0", current_repo_id="o/m-exl3-SC-4.0bpw-H5-V6")
+    assert "Mode" in t
+    assert "**SC&nbsp;H5&nbsp;V6**" in t
+    # exactly one row claims to be this repo
+    assert t.count("<kbd>this repo</kbd>") == 1
+    assert "| plain |" in t
+
+
+def test_vision_row_only_when_the_tower_was_quantized(monkeypatch):
+    kw = dict(base_repo="Q/M", variant="4.0", cal_rows=250, size_gb=15.0,
+              model_config={"architectures": ["Qwen3ForCausalLM"], "num_hidden_layers": 64},
+              collection_url="https://c", license_id="mit", quantized_by="o",
+              codebook="mul1", head_bits=6)
+    rows = [_row("4.0", "o/m-exl3-4.0bpw")]
+    plain = cards.render_exl3_card(repo_id="o/m-exl3-4.0bpw", quant_rows=rows, **kw)
+    assert "Vision tower" not in plain
+    withv = cards.render_exl3_card(repo_id="o/m-exl3-4.0bpw-V6", vision_bits=6,
+                                   quant_rows=rows, **kw)
+    assert "| Vision tower | `6` bits |" in withv
+    assert not re.search(r"\{\{[A-Z_]+\}\}", withv)
+

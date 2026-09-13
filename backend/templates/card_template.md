@@ -97,7 +97,7 @@ hf download \
 | Calibration data | {{CAL_SOURCE}} |
 | Codebook | `{{CODEBOOK}}` |
 | Out&#8209;scales | `always` |
-| Parallel mode | {{PARALLEL_LINE}} |
+| Parallel mode | {{PARALLEL_LINE}} |{{VISION_ROW}}
 
 </details>
 

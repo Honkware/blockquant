@@ -211,7 +211,8 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     return n_params_b * bpw / 8.0 + 1.5
 
 
-def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0) -> str:
+def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0,
+                       current_repo_id: str | None = None) -> str:
     """Render the Quants table.
 
     Each row: ``{"variant": str, "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
@@ -222,20 +223,34 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     # perturbation is amplified -- the median is what separates quantization
     # damage from that floor.
     has_kl = any(r.get("kl_div") is not None for r in rows)
+    # Mode only earns a column once a family holds more than one kind. A plain
+    # 4.0 and a self-calibrated 4.0 are different weights under the same number,
+    # so without it the table would show two rows that look like duplicates.
+    has_mode = any(r.get("sc") or r.get("vision_bits") for r in rows)
     # Head bits and calibration rows are the same down every row and the recipe
     # table below states them for this repo, so the columns only added width.
     header = (
-        "| BPW &nbsp; | &nbsp; Size &nbsp; |"
+        "| BPW &nbsp; |"
+        + (" &nbsp; Mode &nbsp; |" if has_mode else "")
+        + " &nbsp; Size &nbsp; |"
         + (" &nbsp; median&nbsp;KL &nbsp; |" if has_kl else "")
         + " &nbsp; Status |\n"
-        "| :---: | ---: |"
+        "| :---: |"
+        + (" :---: |" if has_mode else "")
+        + " ---: |"
         + (" :---: |" if has_kl else "")
         + " :--- |"
     )
     body = []
-    for row in sorted(rows, key=lambda r: float(r["variant"])):
+    # Plain before SC at the same bitrate, then by name so the order is stable.
+    for row in sorted(rows, key=lambda r: (float(r["variant"]), bool(r.get("sc")),
+                                           r.get("repo_id") or "")):
         v = row["variant"]
-        is_current = v == current_variant
+        # Two rows can share a bpw once SC or a quantized tower is in play, so
+        # the repo id decides which one is this card when callers supply it.
+        is_current = (row.get("repo_id") == current_repo_id
+                      if current_repo_id and row.get("repo_id")
+                      else v == current_variant)
         if row.get("size_gb") is not None:
             size_str = f"{row['size_gb']:.1f}&nbsp;GB"
             status = (
@@ -249,6 +264,13 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         if is_current:
             size_str = f"**{size_str}**"
         bpw_cell = f"**{v}**" if is_current else v
+        mode_cell = ""
+        if has_mode:
+            hb = row.get("head_bits")
+            mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
+            if row.get("vision_bits"):
+                mode += f"&nbsp;V{row['vision_bits']}"
+            mode_cell = f" **{mode}** |" if is_current else f" {mode} |"
         kl_cell = ""
         if has_kl:
             kl = row.get("kl_div")
@@ -256,7 +278,7 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
             if is_current and kl is not None:
                 kl_str = f"**{kl_str}**"
             kl_cell = f" {kl_str} |"
-        body.append(f"| {bpw_cell} | {size_str} |{kl_cell} {status} |")
+        body.append(f"| {bpw_cell} |{mode_cell} {size_str} |{kl_cell} {status} |")
     # No footnote: the column speaks for itself. How the number was measured
     # lives in each quant's bq_quality.json (kl_method), which is where a reader
     # who cares about the corpus should be looking anyway.
@@ -276,6 +298,7 @@ def render_exl3_card(
     repo_id: str,
     variant: str,
     head_bits: int | None,
+    vision_bits: int | None = None,
     cal_rows: int,
     size_gb: float | None,
     model_config: dict,
@@ -311,11 +334,17 @@ def render_exl3_card(
         # when that read failed, and a card saying "None" is worse than one
         # that omits a number it does not have.
         "HEAD_BITS": str(head_bits) if head_bits is not None else "unrecorded",
+        # Absent means the tower was copied at fp16, which is the common case and
+        # not worth a row. exllamav3 records vision_bits only when it quantized
+        # the tower, so presence is the whole signal.
+        "VISION_ROW": (f"\n| Vision tower | `{int(vision_bits)}` bits |"
+                       if vision_bits else ""),
         "CAL_ROWS": str(cal_rows),
         "CODEBOOK": (codebook or "mcg").lower(),
         "REPO_ID": repo_id,
         "SHORT_NAME": repo_id.split("/")[-1],
-        "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b),
+        "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b,
+                                           current_repo_id=repo_id),
         "COLLECTION_URL": collection_url,
     }
     return _render(_find_template(), ctx)

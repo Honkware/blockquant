@@ -236,7 +236,7 @@ def main():
         repo_id, v = row["repo_id"], row["variant"]
         rendered = cards.render_exl3_card(
             base_repo=args.base, repo_id=repo_id, variant=v,
-            head_bits=row["head_bits"],
+            head_bits=row["head_bits"], vision_bits=row.get("vision_bits"),
             cal_rows=args.cal_rows, size_gb=row["size_gb"],
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
