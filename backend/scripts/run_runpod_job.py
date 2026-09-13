@@ -100,7 +100,7 @@ def _default_codebook(model_id: str, token: str) -> str:
     return "mul1"
 
 
-def _resolve_arch(model_id: str, token: str, revision: str = ""):
+def _resolve_arch(model_id: str, token: str, revision: str = "", subfolder: str = ""):
     """(arch, supported, config_read_ok). arch is the first declared architecture
     exllamav3 knows, else whatever the config declares first."""
     import json as _json
