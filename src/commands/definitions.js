@@ -22,6 +22,12 @@ export const commands = [
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
     )
+    .addStringOption((opt) =>
+      opt
+        .setName('subfolder')
+        .setDescription('Subdirectory holding the model, for repos that ship several formats (e.g. BF16)')
+        .setRequired(false)
+    )
     .addIntegerOption((opt) =>
       opt
         .setName('vision_bits')

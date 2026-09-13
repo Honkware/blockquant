@@ -6,6 +6,7 @@ Outputs a single JSON line to stdout so Node can parse it.
 import argparse
 import json
 import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -61,6 +62,33 @@ def _top_level_dirs(model_id: str, token: str) -> list:
         )
     except Exception:
         return []
+
+
+def _subfolder_models(model_id: str, token: str) -> list:
+    """Subdirectories that hold a model, one entry each.
+
+    Some repos ship several formats side by side -- BF16/, FP8/, GGUF/, NVFP4/ --
+    with nothing at the root. Only an unquantized one is a usable source: an FP8
+    or NVFP4 copy has already been rounded once, and quantizing that again
+    compounds the error rather than measuring it.
+    """
+    from huggingface_hub import hf_hub_download
+
+    out = []
+    for d in _top_level_dirs(model_id, token):
+        try:
+            path = hf_hub_download(model_id, f"{d}/config.json", token=token)
+            cfg = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        archs = cfg.get("architectures") or []
+        out.append({
+            "path": d,
+            "architecture": archs[0] if archs else None,
+            "quantized": bool(cfg.get("quantization_config")),
+            **model_facts(cfg),
+        })
+    return out
 
 
 def main():
@@ -134,14 +162,42 @@ def main():
                 # below used to swallow this and let the job through, because it
                 # cannot tell a missing file from a network blip.
                 result['modelExists'] = True
-                result['archSupported'] = False
-                dirs = _top_level_dirs(args.model, token)
-                where = f" It has subdirectories ({', '.join(dirs)})." if dirs else ""
-                result['error'] = (
-                    f"{args.model} has no config.json at its root, so there is nothing "
-                    f"to quantize there.{where} Point /quant at a repo whose model files "
-                    f"sit at the top level."
-                )
+                subs = _subfolder_models(args.model, token)
+                result['subfolders'] = subs
+                usable = [x for x in subs
+                          if not x["quantized"] and x["architecture"] in supported_archs()]
+                if len(usable) == 1:
+                    # One obvious source, so do not make anyone name it.
+                    pick = usable[0]
+                    result['subfolder'] = pick["path"]
+                    result['architecture'] = pick["architecture"]
+                    result['archSupported'] = True
+                    result.update({k: pick[k] for k in ("hasVision", "isMoe", "numExperts")})
+                else:
+                    result['archSupported'] = False
+                    if usable:
+                        names = ", ".join(x["path"] for x in usable)
+                        result['error'] = (
+                            f"{args.model} keeps several quantizable models in "
+                            f"subdirectories ({names}). Pass one as `subfolder`."
+                        )
+                    elif subs:
+                        why = ", ".join(
+                            f"{x['path']} ({'already quantized' if x['quantized'] else x['architecture'] or 'no architecture'})"
+                            for x in subs
+                        )
+                        result['error'] = (
+                            f"{args.model} has no quantizable model in it: {why}. An "
+                            f"already-quantized copy is a bad source -- it has been "
+                            f"rounded once and quantizing it again compounds that."
+                        )
+                    else:
+                        dirs = _top_level_dirs(args.model, token)
+                        where = f" It has subdirectories ({', '.join(dirs)})." if dirs else ""
+                        result['error'] = (
+                            f"{args.model} has no config.json at its root, so there is "
+                            f"nothing to quantize there.{where}"
+                        )
             except Exception:
                 # Could not read config (network, missing file): fall back to a
                 # plain existence check rather than hard-failing the preflight.

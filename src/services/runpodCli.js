@@ -102,6 +102,7 @@ export function runViaCli({
   codebook = config.CODEBOOK,
   visionBits = null,
   headBits = null,
+  subfolder = null,
   gpuCount = null,
   onProgress,
 }) {
@@ -141,6 +142,7 @@ export function runViaCli({
     // entirely, so every quant came out at run_runpod_job.py's own default of
     // 8 while the bot recorded whatever the profile table said.
     if (headBits != null) args.push('--head-bits', String(headBits));
+    if (subfolder) args.push('--subfolder', String(subfolder));
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.

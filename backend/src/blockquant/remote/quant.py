@@ -839,6 +839,10 @@ def main() -> int:
         # How many cards the launcher rented. convert's -d defaults to "0", so
         # without this an N-GPU pod quantizes on one card and bills for N.
         gpu_count: int = max(1, int(cfg.get("gpu_count", 1) or 1))
+        # Repos that ship several formats keep each in its own directory. Only
+        # that subtree is fetched: the one that prompted this had 433 GB across
+        # BF16/FP8/GGUF/NVFP4 and we pulled all of it to quantize one.
+        subfolder: str = (cfg.get("subfolder") or "").strip().strip("/")
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -924,12 +928,15 @@ def main() -> int:
         # thread so the normal failure path still runs.
         import threading
         # Total repo size up front so the heartbeat can report a percent.
+        _want = f"{subfolder}/" if subfolder else ""
         try:
             _info = HfApi(token=hf_token or None).model_info(model_id, files_metadata=True)
-            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])) / 1e9
+            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])
+                            if s.rfilename.startswith(_want)) / 1e9
         except Exception:
             _total_gb = 0.0
-        print(f"[download] {model_id} ({_total_gb:.1f} GB) ...", flush=True)
+        _what = f"{model_id}/{subfolder}" if subfolder else model_id
+        print(f"[download] {_what} ({_total_gb:.1f} GB) ...", flush=True)
         _dl_done = threading.Event()
         _dl_err: dict = {}
 
@@ -939,6 +946,7 @@ def main() -> int:
                     repo_id=model_id,
                     local_dir=str(model_dir),
                     token=hf_token or None,
+                    allow_patterns=[f"{subfolder}/*"] if subfolder else None,
                 )
             except Exception as exc:  # surfaced after join()
                 _dl_err["exc"] = exc
@@ -958,6 +966,19 @@ def main() -> int:
         if "exc" in _dl_err:
             raise _dl_err["exc"]
         print("[download] complete", flush=True)
+
+        # snapshot_download preserves repo paths, so a subfolder fetch lands at
+        # model_dir/<subfolder>. Move the root here rather than threading the
+        # subfolder through _sanitize_config, the converter, the KL eval and the
+        # smoke test -- they all just want the directory the weights are in.
+        if subfolder:
+            model_dir = model_dir / subfolder
+            if not (model_dir / "config.json").exists():
+                raise FileNotFoundError(
+                    f"no config.json under {subfolder}/ after download; "
+                    f"got {sorted(p.name for p in model_dir.parent.iterdir())[:10]}"
+                )
+            print(f"[download] model root -> {model_dir}", flush=True)
 
         _sanitize_config(model_dir)
         _disable_missing_mtp(model_dir)

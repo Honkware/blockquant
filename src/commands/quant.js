@@ -89,6 +89,10 @@ export async function handleQuant(interaction) {
   // tower whole, so the same request gives a different artifact now. fp16 is
   // the way back.
   const visionBits = interaction.options.getInteger('vision_bits');
+  // Only for repos that keep their model in a subdirectory. Preflight picks it
+  // on its own when there is exactly one unquantized candidate, so this is the
+  // tie-breaker, not the normal path.
+  const subfolderOpt = (interaction.options.getString('subfolder') || '').trim().replace(/^\/+|\/+$/g, '');
   // Omitted means exllamav3 decides. Note its default is NOT a flat 6: it is
   // the tower's own declared default_vision_bits, which is 6 on the six
   // validated arches (qwen3_vl, gemma4, glm4v, step3_7, deepseek_v4_vision,
@@ -174,6 +178,9 @@ export async function handleQuant(interaction) {
       embeds: [embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`)],
     });
   }
+  // Preflight resolves this when the repo has one obvious source; an explicit
+  // option wins so someone can quant the FP8 copy if they really mean to.
+  const subfolder = subfolderOpt || flight.subfolder || null;
   if (!flight.canWrite) {
     return interaction.editReply({
       embeds: [embeds.error('Token Error', 'The HF token does not have write permissions. Update `HF_TOKEN` in .env.')],
@@ -312,6 +319,7 @@ export async function handleQuant(interaction) {
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
+      subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
       `**Head bits:** ${headBits ?? 6}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
       `**Provider:** ${provider}`,
       costLine,
@@ -406,6 +414,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     visionBits = null,
     // Older records predate the option; null keeps exllamav3's default.
     headBits = null,
+    subfolder = null,
     categories,
     provider,
     precheckedRepos = {},
@@ -650,6 +659,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               codebook,
               visionBits,
               headBits,
+              subfolder,
               onProgress: onVariantProgress(v),
             });
             const url = res && res[0] ? res[0].url : null;

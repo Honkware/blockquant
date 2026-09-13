@@ -106,7 +106,8 @@ def _resolve_arch(model_id: str, token: str, revision: str = ""):
     import json as _json
     from huggingface_hub import hf_hub_download
     try:
-        p = hf_hub_download(model_id, "config.json", token=token or None,
+        name = f"{subfolder}/config.json" if subfolder else "config.json"
+        p = hf_hub_download(model_id, name, token=token or None,
                             revision=revision or None)
         cfg = _json.loads(Path(p).read_text())
     except Exception:
@@ -433,6 +434,10 @@ def main():
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
+    parser.add_argument("--subfolder", default="",
+                        help="Subdirectory inside the repo holding the model, for repos "
+                             "that ship several formats (BF16/, FP8/, ...). Only that "
+                             "subtree is downloaded.")
     parser.add_argument("--head-bits", type=int, default=None,
                         help="Head bits (1-8, or 16 unquantized). Omitted: exllamav3's default of 6")
     parser.add_argument(
@@ -555,7 +560,7 @@ def main():
     # route. An unreadable config falls through -- the pod reports the real error.
     _reg = _load_arch_support()
     if _reg:
-        _arch, _supported, _ok = _resolve_arch(args.model, args.hf_token)
+        _arch, _supported, _ok = _resolve_arch(args.model, args.hf_token, subfolder=args.subfolder)
         if _ok and not _supported:
             print(f"[joberror] unsupported architecture '{_arch}' -- not in the exllamav3 "
                   f"{len(_reg)}-arch support set. Refusing before launch (no pod, no download).",
@@ -823,6 +828,7 @@ def main():
             hf_token=args.hf_token,
             hf_org=args.hf_org,
             head_bits=args.head_bits,
+            subfolder=args.subfolder,
             codebook=args.codebook,
             vision_bits=args.vision_bits,
             cal_rows=cal_rows,
