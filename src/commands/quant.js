@@ -298,6 +298,7 @@ export async function handleQuant(interaction) {
       codebook,
       visionBits,
       headBits,
+      subfolder,
       categories: [category],
       provider,
       precheckedRepos,
