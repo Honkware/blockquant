@@ -37,7 +37,23 @@ def _find_model_diff_script() -> Path:
     raise FileNotFoundError("exllamav3 eval/model_diff.py not found. Set EXLLAMAV3_DIR.")
 
 
-def _run_model_diff(base_dir: Path, quant_dir: Path, rows: int = 100, device: int = 0) -> dict:
+def _visible_devices() -> str:
+    """CUDA indices as model_diff's -d wants them, e.g. "0,1,2,3".
+
+    Falls back to "0" when torch cannot say, which is what this passed
+    unconditionally before -- on a host with more than one card that pinned the
+    comparison to the first one and could OOM beside idle GPUs.
+    """
+    try:
+        import torch
+        n = torch.cuda.device_count()
+    except Exception:
+        n = 0
+    return ",".join(str(i) for i in range(n)) if n else "0"
+
+
+def _run_model_diff(base_dir: Path, quant_dir: Path, rows: int = 100,
+                    devices: str | None = None) -> dict:
     """Run model_diff.py and parse KL divergence + perplexity."""
     script = _find_model_diff_script()
     cmd = [
@@ -46,7 +62,7 @@ def _run_model_diff(base_dir: Path, quant_dir: Path, rows: int = 100, device: in
         "-ma", str(base_dir),
         "-mb", str(quant_dir),
         "-r", str(rows),
-        "-d", str(device),
+        "-d", devices or _visible_devices(),
     ]
     logger.info(f"Running model_diff: {base_dir.name} vs {quant_dir.name}")
     result = subprocess.run(
@@ -98,7 +114,7 @@ def run(config: QuantConfig, workspace: Path, outputs: list[QuantOutput]) -> Non
             continue
 
         try:
-            metrics = _run_model_diff(base_dir, quant_dir, rows=100, device=0)
+            metrics = _run_model_diff(base_dir, quant_dir, rows=100)
             output.quality = {
                 "kl_div": metrics["kl_div"],
                 "ppl": metrics["ppl"],
