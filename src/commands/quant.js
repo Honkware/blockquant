@@ -16,7 +16,7 @@ import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
-import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
+import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
@@ -378,7 +378,20 @@ export async function handleQuant(interaction) {
  * the progress thread + live embed + execution, exactly as before, minus the
  * EXP accounting.
  */
-export async function runApprovedJob({ interaction, job }) {
+/**
+ * Pick a job back up after a bot restart, driving the embed it already has.
+ *
+ * runApprovedJob touches the interaction in exactly two places -- the channel
+ * to open a thread in, and approvedBy -- and the second only runs when this is
+ * not a resume. So a shim carrying the client is all it needs, and the whole
+ * completion path (cards, collection, the thread's final message) stays shared
+ * with a normal run rather than being reimplemented here and drifting.
+ */
+export function resumeJob({ client, job, resumeFrom }) {
+  return runApprovedJob({ interaction: { channel: null, client }, job, resumeFrom });
+}
+
+export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
   const {
     id: jobId,
     userId,
@@ -405,23 +418,33 @@ export async function runApprovedJob({ interaction, job }) {
   if (!channel || !channel.threads) {
     throw new Error('Could not resolve a channel to open the progress thread in.');
   }
-  const thread = await channel.threads.create({
-    name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
-    autoArchiveDuration: 1440,
-  });
+  // Resuming: the thread and the embed outlived the bot, so edit the message
+  // that is already there. Opening a second thread would strand the first one
+  // mid-progress with nothing ever finishing it.
+  const thread = resumeFrom
+    ? await channel.threads.fetch(job.threadId).catch(() => null)
+    : await channel.threads.create({
+        name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
+        autoArchiveDuration: 1440,
+      });
+  if (!thread) throw new Error(`Progress thread ${job.threadId} is gone; nothing to resume into.`);
 
-  const progressMsg = await thread.send({
-    embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
-    components: [stopButtons(jobId)],
-  });
+  const progressMsg = resumeFrom
+    ? await thread.messages.fetch(job.progressMessageId)
+    : await thread.send({
+        embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
+        components: [stopButtons(jobId)],
+      });
 
-  await db.patchJob(jobId, {
-    status: db.JOB_STATUS.queued,
-    approvedAt: Date.now(),
-    approvedBy: interaction.user.id,
-    threadId: thread.id,
-    progressMessageId: progressMsg.id,
-  });
+  await db.patchJob(jobId, resumeFrom
+    ? { status: db.JOB_STATUS.running, resumedAt: Date.now() }
+    : {
+        status: db.JOB_STATUS.queued,
+        approvedAt: Date.now(),
+        approvedBy: interaction.user.id,
+        threadId: thread.id,
+        progressMessageId: progressMsg.id,
+      });
 
   const updateEmbed = throttle(async (data) => {
     try {
@@ -581,12 +604,45 @@ export async function runApprovedJob({ interaction, job }) {
     // runVariantWithRetry: a signal-killed or pod-created failure is terminal,
     // so cancelling a broken model can't respawn a controller (the runaway).
     const MAX_ATTEMPTS = 3;
+
+    // Progress handler shared by a fresh run and a resumed one, so a reattached
+    // job draws the same embed the original was drawing.
+    const onVariantProgress = (v) => (d) => {
+      if (d.podId && !podIds.has(d.podId)) {
+        podIds.add(d.podId);
+        db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
+          log.debug(`could not record pod ${d.podId}: ${err.message}`)
+        );
+      }
+      pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      renderParallel();
+    };
+
     async function runVariant(v) {
+      // Resuming: the controller is already running and owns the pod. Attach to
+      // its log instead of spawning a second one, and do not retry -- a retry
+      // here would rent a pod alongside the one still working.
+      const handle = resumeFrom?.get(v);
+      if (handle) {
+        try {
+          const res = await attachToCli(handle, { variants: [v], onProgress: onVariantProgress(v) });
+          const url = res?.[0]?.url ?? null;
+          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url,
+                        sample: res?.[0]?.sample ?? null };
+          renderParallel();
+          return res;
+        } catch (err) {
+          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+          renderParallel();
+          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+        }
+      }
       try {
         return await runVariantWithRetry(v, {
           maxAttempts: MAX_ATTEMPTS,
           run: async () => {
             const res = await runViaCli({
+              jobId,
               modelId,
               variants: [v],
               hfOrg: config.HF_ORG,
@@ -594,16 +650,7 @@ export async function runApprovedJob({ interaction, job }) {
               codebook,
               visionBits,
               headBits,
-              onProgress: (d) => {
-                if (d.podId && !podIds.has(d.podId)) {
-                  podIds.add(d.podId);
-                  db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
-                    log.debug(`could not record pod ${d.podId}: ${err.message}`)
-                  );
-                }
-                pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
-                renderParallel();
-              },
+              onProgress: onVariantProgress(v),
             });
             const url = res && res[0] ? res[0].url : null;
             const sample = res && res[0] ? res[0].sample : null;

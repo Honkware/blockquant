@@ -93,6 +93,7 @@ export async function runVariantWithRetry(
  * resolves with one result row per variant.
  */
 export function runViaCli({
+  jobId = null,
   modelId,
   variants,
   hfOrg,
@@ -174,12 +175,32 @@ export function runViaCli({
         env: { ...process.env, PYTHONUNBUFFERED: '1' },
         logPath,
         kind: 'quant',
-        meta: { modelId, variants },
+        // jobId is what lets a restarted bot find the Discord message this
+        // controller belongs to. Matching on modelId alone breaks the moment
+        // two jobs share a model.
+        meta: { modelId, variants, jobId },
       });
     } catch (err) {
       return reject(err);
     }
 
+    resolve(attachToCli(handle, { variants, onProgress }));
+  });
+}
+
+/**
+ * Drive progress off a controller's log until it exits, and resolve with one
+ * result row per variant.
+ *
+ * Split out from runViaCli so a restarted bot can pick a controller back up:
+ * the controller is reparented to init and outlives the bot, but the progress
+ * embed died with the old process. detached.list() hands back the same shape
+ * spawnDetached returns, so this works on a handle read off disk. The parser
+ * is monotonic, so re-reading a log from the top replays to the right state
+ * rather than jittering the bar backwards.
+ */
+export function attachToCli(handle, { variants, onProgress }) {
+  return new Promise((resolve, reject) => {
     const total = variants.length;
     const results = new Map(); // bpw -> url
     const samples = new Map(); // bpw -> decoded smoke-test reply
@@ -283,9 +304,9 @@ export function runViaCli({
     let readOffset = 0;
     const drain = () => {
       let stat;
-      try { stat = fs.statSync(logPath); } catch { return; }
+      try { stat = fs.statSync(handle.logPath); } catch { return; }
       if (stat.size <= readOffset) return;
-      const fd = fs.openSync(logPath, 'r');
+      const fd = fs.openSync(handle.logPath, 'r');
       const b = Buffer.alloc(stat.size - readOffset);
       try { fs.readSync(fd, b, 0, b.length, readOffset); } finally { fs.closeSync(fd); }
       readOffset = stat.size;
