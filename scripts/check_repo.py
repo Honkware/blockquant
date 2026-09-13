@@ -68,7 +68,6 @@ def main():
     parser.add_argument("--token", default=None, help="HF API token")
     parser.add_argument("--org", default="", help="Organization name (blank = current user)")
     parser.add_argument("--source_model", default="", help="Expected source model ID")
-    parser.add_argument("--profile", default="", help="Ignored; profiles are gone")
     parser.add_argument("--bpw", default="", help="Expected bpw value")
     parser.add_argument(
         "--quant_options_json",

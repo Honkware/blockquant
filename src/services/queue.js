@@ -83,7 +83,6 @@ export function resume() {
  * @property {string[]} categories
  * @property {string}   userId
  * @property {string}   [jobId]
- * @property {string}   [profile]
  * @property {Object}   [quantOptions]
  * @property {Object}   [precheckedRepos]
  * @property {(data: object) => void} onProgress
@@ -226,7 +225,6 @@ export function enqueue(jobConfig) {
           prechecked ??
           (await hf.inspectUploadRepo(repoSuffix, {
             sourceModel: modelId,
-            profile: jobConfig.profile ?? 'balanced',
             bpw,
             quantOptions: jobConfig.quantOptions ?? {},
           }));
@@ -338,7 +336,6 @@ export function enqueue(jobConfig) {
           version: 1,
           generatedAt: new Date().toISOString(),
           sourceModel: modelId,
-          profile: jobConfig.profile ?? 'balanced',
           quantOptions: jobConfig.quantOptions ?? {},
           bpw,
           hfRepo: repoSuffix,

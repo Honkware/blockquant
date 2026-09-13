@@ -115,13 +115,13 @@ export function runViaCli({
       // EXL3 trellis codebook. The CLI validates it against the same three
       // values the converter takes, so a bad one dies here, not on a pod.
       '--codebook', String(codebook),
-      // Vision tower. 'auto' sends nothing, so exllamav3 decides -- which is
-      // what changed at 1.4.9, where a validated tower drops to 6 bpw instead
-      // of being copied whole. fp16 is the way back to the old artifact.
+      // Vision tower. Unset sends nothing, so exllamav3 uses the tower's own
+      // default_vision_bits: 6 where the arch declares it validated, 16
+      // otherwise. 16 is the explicit way to copy the tower whole.
       ...(visionBits != null ? ['--vision-bits', String(visionBits)] : []),
       // Cheapest card that fits, walking up on stock-outs. Without this the
-      // CLI uses the profile's H100/A100 list and dies fast when those are
-      // unavailable. Disk is auto-sized by the CLI (default).
+      // CLI walks its own _PREFERRED_GPUS (H100s, then an A100) and dies fast
+      // when none are free. Disk is auto-sized by the CLI (default).
       '--gpu', 'auto',
       '--min-vram', '24',
       // Cap $/hr scaled to model size: small models stay on cheap cards, a big
@@ -147,9 +147,8 @@ export function runViaCli({
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.
     if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
-    // Unset lets the profile decide, and 'balanced' leaves it to exllamav3
-    // (250 rows x 2048 cols). This used to pass 250 unconditionally, which is
-    // the same number but pinned it against both.
+    // Unset sends no --cal-rows, so the converter uses its own 250x2048. This
+    // passed 250 unconditionally, which is the same number but pinned it.
     if (calRows != null) args.push('--cal-rows', String(calRows));
     if (hfOrg) args.push('--hf-org', hfOrg);
     // Optional pre-baked image (config.RUNPOD_IMAGE). Empty = bootstrap path.

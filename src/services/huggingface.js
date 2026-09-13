@@ -384,8 +384,6 @@ export async function inspectUploadRepo(repoName, expected = {}) {
     owner,
     '--source_model',
     expected.sourceModel ?? '',
-    '--profile',
-    expected.profile ?? '',
     '--bpw',
     expected.bpw != null ? String(expected.bpw) : '',
     '--quant_options_json',
