@@ -217,12 +217,16 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     Each row: ``{"variant": str, "size_gb": float|None, "url": str|None}``. ``size_gb`` None means
     not-yet-published (shows an estimate + "queued").
     """
+    # Median, not mean. qbench reports both and turboderp's own note is that the
+    # mean is dominated by tokens the reference itself is undecided on, where any
+    # perturbation is amplified -- the median is what separates quantization
+    # damage from that floor.
     has_kl = any(r.get("kl_div") is not None for r in rows)
     # Head bits and calibration rows are the same down every row and the recipe
     # table below states them for this repo, so the columns only added width.
     header = (
         "| BPW &nbsp; | &nbsp; Size &nbsp; |"
-        + (" &nbsp; KL&nbsp;&divide;&nbsp;fp16 &nbsp; |" if has_kl else "")
+        + (" &nbsp; median&nbsp;KL &nbsp; |" if has_kl else "")
         + " &nbsp; Status |\n"
         "| :---: | ---: |"
         + (" :---: |" if has_kl else "")
