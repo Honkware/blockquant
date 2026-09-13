@@ -35,6 +35,18 @@
       "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
       "sha256": "9863dcd0f03d0ab7a3a6409e15db06d210a87c07c52a9a0b3fa5353df8013014",
       "note": "Unmodified. Only here because sc_trace.py imports it; exllamav3 ships it under eval/ at the repo root and the wheel does not carry it."
+    },
+    "eval/qbench/measure.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/eval/qbench/measure.py",
+      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
+      "sha256": "4ada99e11f998719aa77db249b7ef994fd1b217206efe54870fcadd2e829c111",
+      "note": "Measurement half of turboderp's qbench harness. Kept because it is the eval both turboderp and ezexl3 report against, so our KL numbers are comparable to theirs instead of being our own private figure. eval/qbench.py (YAML orchestration), engines.py (transformers/llamacpp backends we do not use) and plot.py are deliberately NOT vendored -- plot.py alone would drag matplotlib, numpy, pandas and seaborn into the pod image to draw charts that do not go on a card. Unmodified."
+    },
+    "eval/qbench/data.py": {
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/eval/qbench/data.py",
+      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
+      "sha256": "b6c79d06e9a0f4977981d727b71772e2fe7a770412054d35c67411dd7001e0e8",
+      "note": "Measurement half of turboderp's qbench harness. Kept because it is the eval both turboderp and ezexl3 report against, so our KL numbers are comparable to theirs instead of being our own private figure. eval/qbench.py (YAML orchestration), engines.py (transformers/llamacpp backends we do not use) and plot.py are deliberately NOT vendored -- plot.py alone would drag matplotlib, numpy, pandas and seaborn into the pod image to draw charts that do not go on a card. Unmodified."
     }
   }
 }
