@@ -346,7 +346,20 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer
-        sys.path.insert(0, str(Path(__file__).parent.parent / "selfcal"))
+        # The pod flattens this file to /opt/blockquant/quant.py (baked) or
+        # /root/quant.py (SFTP'd), so the repo's blockquant/remote/quant.py ->
+        # blockquant/selfcal relationship does not hold there. Try the layouts
+        # rather than one of them: getting it wrong fails the import, which the
+        # handler below swallows, and a card just quietly loses its KL number.
+        for _cand in (Path(__file__).parent / "selfcal",
+                      Path(__file__).parent.parent / "selfcal",
+                      Path("/opt/blockquant/selfcal")):
+            if (_cand / "eval" / "qbench" / "measure.py").is_file():
+                sys.path.insert(0, str(_cand))
+                break
+        else:
+            print("[kl] WARN vendored qbench not found; no KL this run", flush=True)
+            return None, ""
         from eval.qbench.measure import DiffStats, save_reference_row, print_stats
         from eval.qbench.data import QCache, get_test_rows, save_tensors
     except Exception as e:
