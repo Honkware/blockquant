@@ -22,16 +22,13 @@ export const commands = [
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
     )
-    .addStringOption((opt) =>
+    .addIntegerOption((opt) =>
       opt
-        .setName('vision')
-        .setDescription('Vision tower handling for multimodal models (default auto)')
+        .setName('vision_bits')
+        .setDescription('Bits for the vision tower. 1-8, or 16 to copy it unquantized. Default: the arch decides')
         .setRequired(false)
-        .addChoices(
-          { name: 'auto — 6bpw where the tower is validated, else fp16 (default)', value: 'auto' },
-          { name: 'fp16 — never quantize the tower', value: 'fp16' },
-          { name: '6 — force 6bpw even on an unvalidated tower', value: '6' }
-        )
+        .setMinValue(1)
+        .setMaxValue(16)
     )
     .addIntegerOption((opt) =>
       opt

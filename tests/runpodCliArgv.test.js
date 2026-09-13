@@ -44,14 +44,15 @@ describe('run_runpod_job argv', () => {
     expect(flag(h.args, '--codebook')).toBe('mcg');
   });
 
-  it('maps vision fp16 to 16 bits and auto to no flag at all', () => {
-    runViaCli({ modelId: 'org/model', variants: ['4.0'], vision: 'fp16' });
-    expect(flag(h.args, '--vision-bits')).toBe('16');
-
-    runViaCli({ modelId: 'org/model', variants: ['4.0'], vision: '6' });
-    expect(flag(h.args, '--vision-bits')).toBe('6');
-
-    runViaCli({ modelId: 'org/model', variants: ['4.0'], vision: 'auto' });
+  it('passes vision bits through, and omits them so the arch decides', () => {
+    // exllamav3 takes 1-8 or 16, and 16 is how it spells "copy the tower
+    // unquantized". Omitting is not the same as 6: unset resolves to the
+    // tower's own default_vision_bits, which is 16 on an unvalidated arch.
+    for (const n of [4, 6, 8, 16]) {
+      runViaCli({ modelId: 'org/model', variants: ['4.0'], visionBits: n });
+      expect(flag(h.args, '--vision-bits')).toBe(String(n));
+    }
+    runViaCli({ modelId: 'org/model', variants: ['4.0'] });
     expect(h.args).not.toContain('--vision-bits');
   });
 

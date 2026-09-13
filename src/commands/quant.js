@@ -88,9 +88,11 @@ export async function handleQuant(interaction) {
   // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
   // tower whole, so the same request gives a different artifact now. fp16 is
   // the way back.
-  const vision = interaction.options.getString('vision') || 'auto';
-  // Omitted means exllamav3 decides (6), the same way `vision: auto` sends
-  // nothing. Tracking its default beats hardcoding a copy of it here.
+  const visionBits = interaction.options.getInteger('vision_bits');
+  // Omitted means exllamav3 decides. Note its default is NOT a flat 6: it is
+  // the tower's own declared default_vision_bits, which is 6 on the six
+  // validated arches (qwen3_vl, gemma4, glm4v, step3_7, deepseek_v4_vision,
+  // muse_glimmer) and 16 everywhere else. Tracking that beats copying it.
   const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
@@ -129,6 +131,13 @@ export async function handleQuant(interaction) {
   // exllamav3 takes 1-8, or 16 for an unquantized head; 9-15 are not lattice
   // sizes it has codebooks for. Discord caps the range at 1-16, so only the
   // hole in the middle needs catching.
+  if (visionBits !== null && visionBits > 8 && visionBits !== 16) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('Invalid vision bits', 'Vision bits must be 1-8, or 16 to copy the tower unquantized.'),
+      ],
+    });
+  }
   if (headBits !== null && headBits > 8 && headBits !== 16) {
     return interaction.editReply({
       embeds: [
@@ -279,7 +288,7 @@ export async function handleQuant(interaction) {
       bpws,
       testPrompt,
       codebook,
-      vision,
+      visionBits,
       headBits,
       categories: [category],
       provider,
@@ -302,7 +311,7 @@ export async function handleQuant(interaction) {
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${vision}`,
+      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
@@ -380,7 +389,7 @@ export async function runApprovedJob({ interaction, job }) {
     bpws,
     testPrompt = null,
     codebook = config.CODEBOOK,
-    vision = 'auto',
+    visionBits = null,
     // Older records predate the option; null keeps exllamav3's default.
     headBits = null,
     categories,
@@ -582,7 +591,7 @@ export async function runApprovedJob({ interaction, job }) {
               hfOrg: config.HF_ORG,
               testPrompt,
               codebook,
-              vision,
+              visionBits,
               headBits,
               onProgress: (d) => {
                 if (d.podId && !podIds.has(d.podId)) {
