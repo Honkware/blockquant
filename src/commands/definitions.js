@@ -25,7 +25,7 @@ export const commands = [
     .addIntegerOption((opt) =>
       opt
         .setName('vision_bits')
-        .setDescription('Bits for the vision tower. 1-8, or 16 to copy it unquantized. Default: the arch decides')
+        .setDescription('Bits for the vision tower. 1-8, or 16 to copy it unquantized. Default depends on the arch.')
         .setRequired(false)
         .setMinValue(1)
         .setMaxValue(16)
@@ -33,7 +33,7 @@ export const commands = [
     .addIntegerOption((opt) =>
       opt
         .setName('head_bits')
-        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default: 6 (exllamav3)')
+        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default 6.')
         .setRequired(false)
         .setMinValue(1)
         .setMaxValue(16)

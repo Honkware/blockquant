@@ -311,7 +311,7 @@ export async function handleQuant(interaction) {
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
+      `**Head bits:** ${headBits ?? 6}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
