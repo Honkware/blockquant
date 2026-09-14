@@ -68,13 +68,17 @@ def main():
     parser.add_argument("--token", default=None, help="HF API token")
     parser.add_argument("--org", default="", help="Organization name (blank = current user)")
     parser.add_argument("--source_model", default="", help="Expected source model ID")
-    parser.add_argument("--profile", default="", help="Ignored; profiles are gone")
     parser.add_argument("--bpw", default="", help="Expected bpw value")
     parser.add_argument(
         "--quant_options_json",
         default="{}",
         help="Settings the request pinned, e.g. {\"headBits\":8,\"codebook\":\"mcg\"}. "
              "Anything absent was left to exllamav3 and is not compared.",
+    )
+    parser.add_argument(
+        "--has-vision", action="store_true",
+        help="The source model has a vision tower. An existing quant with no "
+             "vision_bits then predates tower quantization and is not a match.",
     )
     parser.add_argument(
         "--revision",
@@ -151,6 +155,14 @@ def main():
         if base is not None and base != args.source_model:
             reasons.append("source_model_mismatch")
 
+    # A tower the old default copied whole is not the quant we would make now.
+    # Every VL repo published before 1.4.9 has no vision_bits at all, while a
+    # re-run today quantizes a validated tower to 6 -- same name, different
+    # weights. Reusing one of those silently is what this catches; the requester
+    # can still ask for vision_bits 16 and match it on purpose.
+    if args.has_vision and "vision_bits" not in qc and pinned.get("visionBits") != 16:
+        reasons.append("vision_tower_differs")
+
     # Only what the request actually pinned. Leaving head bits unset means
     # "whatever exllamav3 picks", so an existing repo at this bpw satisfies it
     # regardless of what it was built with -- the requester expressed no opinion.
@@ -160,6 +172,11 @@ def main():
         if want in (None, ""):
             continue
         got = qc.get(field)
+        # An absent vision_bits is not "unknown", it is 16: exllamav3 writes the
+        # key only when it quantized the tower, so a repo without it has an fp16
+        # tower and satisfies a request that asked for exactly that.
+        if field == "vision_bits" and got is None:
+            got = 16
         same = _float_eq(got, want) if field != "codebook" else str(got) == str(want)
         if not same:
             reasons.append(f"{field}_mismatch")

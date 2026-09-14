@@ -58,6 +58,7 @@ class Provider(ABC):
         hf_token: str = "",
         hf_org: str = "",
         head_bits: int | None = None,
+        subfolder: str = "",
         codebook: str = "mul1",
     ) -> dict:
         """Kick off the remote quantization. Default: not supported."""

@@ -294,174 +294,178 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
-def _chat_format(model_dir: Path, text: str) -> tuple[str, str]:
-    """(text, label) with the model's chat template applied, when it has one.
+def _kl_kernel_usable() -> bool:
+    """Whether exllamav3's CUDA compute_kl_div can be trusted on this image.
 
-    turboderp's published curves are measured on chat-formatted text, and an
-    instruct model puts real probability mass on the control tokens, so raw
-    prose is a different distribution than the one anyone actually runs. Best
-    effort: a model with no template, or a template that will not render, gets
-    the raw text and says so rather than failing the whole measurement.
+    It segfaulted on the builds we ran before 1.5.0, and a segfault takes the
+    whole pod down mid-job rather than raising something we could catch. So the
+    check runs in a subprocess on tiny tensors: a crash there costs a second and
+    tells us to use the torch path instead.
     """
+    import subprocess
+    probe = (
+        "import torch;"
+        "from exllamav3.util.measures import compute_kl_div;"
+        "a=torch.randn(4,128,device='cuda');b=torch.randn(4,128,device='cuda');"
+        "r=compute_kl_div(a,b,128);"
+        "assert torch.isfinite(r).all();"
+        "print('ok')"
+    )
     try:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=False)
-        if not getattr(tok, "chat_template", None):
-            return text, "raw (no chat template)"
-        out = tok.apply_chat_template(
-            [{"role": "user", "content": text}], tokenize=False,
-            add_generation_prompt=True,
-        )
-        return (out, "formatted") if out and out.strip() else (text, "raw (template empty)")
-    except Exception as e:  # noqa: BLE001
-        print(f"[kl] WARN chat template not applied: {type(e).__name__}: {e}", flush=True)
-        return text, "raw (template failed)"
-
-
-# Held-out text for the KL metric, baked into the image at build time.
-# Read off disk rather than pulled with load_dataset() so a paid pod can never
-# lose a run to a dataset outage -- the same reason the old corpus was a file.
-KL_CORPUS = Path("/opt/blockquant/kl_eval_corpus.utf8")
-
-
-def _eval_text() -> tuple[str, str]:
-    """(text, source) for the KL metric.
-
-    Held-out text, NOT exllamav3's standard_cal_data. That is the corpus EXL3
-    calibrates the quant against, so measuring KL on it is measuring on the
-    training set: it flatters every quant we publish and is not comparable to
-    turboderp's own numbers, which use openwebtext for exactly this reason.
-
-    Falls back to the calibration corpus on an image built before the eval text
-    was baked, and says so, because a wrong number reported as a right one is
-    worse than a missing one.
-    """
-    import glob
-    import os
-    try:
-        if KL_CORPUS.is_file():
-            text = KL_CORPUS.read_text(encoding="utf-8")
-            if text.strip():
-                return text, "openwebtext"
+        p = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                           timeout=120, text=True)
     except Exception as e:
-        print(f"[kl] WARN eval corpus unreadable: {type(e).__name__}: {e}", flush=True)
-
-    import exllamav3
-    base = os.path.join(os.path.dirname(exllamav3.__file__),
-                        "conversion", "standard_cal_data")
-    parts = []
-    for fn in sorted(glob.glob(os.path.join(base, "*.utf8"))):
-        try:
-            with open(fn, encoding="utf-8") as f:
-                parts.append(f.read())
-        except Exception:
-            pass
-    if parts:
-        print("[kl] WARN no baked eval corpus; falling back to the CALIBRATION "
-              "data, which understates KL. Rebuild the image.", flush=True)
-    return "\n\n".join(parts), "the calibration set (stale image)"
+        print(f"[kl] kernel probe failed to run ({type(e).__name__}); using torch", flush=True)
+        return False
+    if p.returncode == 0 and "ok" in p.stdout:
+        return True
+    why = f"exit {p.returncode}" + (f", {p.stderr.strip().splitlines()[-1]}" if p.stderr.strip() else "")
+    print(f"[kl] compute_kl_div unusable ({why}); using torch", flush=True)
+    return False
 
 
-def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 8,
-                 seq_len: int = 8192) -> tuple[float | None, str]:
-    """Mean KL(fp16 || quant) over held-out text. Returns (kl, method).
+def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
+                 seq_len: int = 2048) -> tuple[dict | None, str]:
+    """KL(fp16 || quant) over held-out text, as qbench reports it.
 
-    8 x 8192 over openwebtext, chat-formatted, matching the setup behind
-    turboderp's published EXL3 curves so a number on our card can be read
-    against his chart. The maths already agreed -- his compute_kl_div is
-    F.kl_div(log_softmax(input), softmax(target)).sum(-1), which is the same
-    quantity computed below -- so the corpus and the chunking were the whole
-    difference.
+    Returns (stats, method). stats carries kld, kld_median, the p10-p90 spread
+    and buckets by reference confidence -- the shape turboderp's qbench emits,
+    computed by his own DiffStats, so a number on our card can be read against
+    his. The median and the high-confidence buckets are the ones worth quoting:
+    per his own note, the mean is dominated by tokens where the reference itself
+    is undecided, where any perturbation is amplified.
 
-    `method` travels with the number. Two incompatible measurement series
-    silently sharing a field name is the bug this change exists to fix, so the
-    fix must not create a second one.
-
-    Loads ONE model at a time (fp16, then quant) via the high-level Model API
-    that the smoke-test path already proved works, forwards each row to get
-    logits, and compares the distributions with compute_kl_div. The fp16 logits
-    are staged to disk between passes so only one model is ever resident -- this
-    sidesteps the segfault in exllamav3's low-level model_diff forward and fits
-    any model whose fp16 loads alone (up to ~35B on an 80GB card; a bigger fp16
-    like Mixtral will OOM and skip). Best-effort: returns None on any failure so
-    a finished quant still uploads without a number.
+    Two passes, one model resident at a time: the fp16 writes reference logits
+    and per-token confidence to disk, then the quant is streamed against them.
+    That is qbench's own arrangement and it is what lets a 35B fp16 fit on an
+    80GB card. Best-effort throughout: returns (None, "") so a finished quant
+    still uploads without a number.
     """
     import shutil
     import tempfile
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer
+        # The pod flattens this file to /opt/blockquant/quant.py (baked) or
+        # /root/quant.py (SFTP'd), so the repo's blockquant/remote/quant.py ->
+        # blockquant/selfcal relationship does not hold there. Try the layouts
+        # rather than one of them: getting it wrong fails the import, which the
+        # handler below swallows, and a card just quietly loses its KL number.
+        for _cand in (Path(__file__).parent / "selfcal",
+                      Path(__file__).parent.parent / "selfcal",
+                      Path("/opt/blockquant/selfcal")):
+            if (_cand / "eval" / "qbench" / "measure.py").is_file():
+                sys.path.insert(0, str(_cand))
+                break
+        else:
+            print("[kl] WARN vendored qbench not found; no KL this run", flush=True)
+            return None, ""
+        from eval.qbench.measure import DiffStats, save_reference_row, print_stats
+        from eval.qbench.data import QCache, get_test_rows, save_tensors
     except Exception as e:
         print(f"[kl] WARN import failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
 
-    # Tokenize the eval text once, with the quant's tokenizer, into fixed rows.
     try:
-        text, corpus = _eval_text()
-        if not text:
-            print("[kl] WARN no bundled eval text found", flush=True)
-            return None, ""
-        text, fmt = _chat_format(quant_dir, text)
-        method = f"{corpus} \u00b7 {rows}\u00d7{seq_len} \u00b7 {fmt}"
+        # qbench's own loader: wiki2 at 10x2048, which is what its example
+        # project ships and the only corpus sc_measure implements. We measured
+        # openwebtext at 8x8192 before, which is a supported source but nobody
+        # else's geometry, so the number could not be read against anyone's.
+        # It also applies the chat template (prepend_hf_chat_context) and
+        # reports prefix_len, so metrics skip the framing rather than scoring it.
+        project = {
+            "test_data": {"source": "wiki2", "rows": rows, "length": seq_len,
+                          "stride": seq_len},
+            # The reference's tokenizer, as qbench's example does. Keying it on
+            # the quant instead would re-tokenize per variant, since the cache
+            # key is a hash of (dataset spec, tokenizer source).
+            "tokenizer": {"source": str(fp16_dir), "template": True},
+            "logit_cache": {"dir": str(fp16_dir.parent), "max_size_gb": 50},
+        }
+        corpus = "wiki2"
+        qcache = QCache(project["logit_cache"])
+        ids, ranges, trace_vocab = get_test_rows(project, qcache)
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
-        all_ids = tokenizer.encode(text)
-        vocab = tokenizer.actual_vocab_size
-        n = all_ids.shape[-1]
-        seqs = [all_ids[:, a:a + seq_len]
-                for a in range(0, n - seq_len, seq_len)][:rows]
-        if not seqs:
-            print("[kl] WARN not enough eval tokens", flush=True)
-            return None, ""
+        vocab = trace_vocab or tokenizer.actual_vocab_size
+        method = f"qbench · {corpus} · {rows}×{seq_len}"
+        seqs = [ids[i:i + 1, :] for i in range(ids.shape[0])]
     except Exception as e:
-        print(f"[kl] WARN tokenize failed: {type(e).__name__}: {e}", flush=True)
+        print(f"[kl] WARN test data failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
 
+    # exllamav3 asserts the cache is a multiple of 256, and qbench's rows are
+    # not: prepend_hf_chat_context puts a chat prefix in front of each 2048, so
+    # the row is 2048 + however long that framing came out.
+    row_len = ids.shape[-1]
+    cache_len = -(-row_len // 256) * 256
+
     def _forward_rows(model_dir, on_row) -> None:
-        """Load model_dir, forward each seq, call on_row(i, logits_2d), unload."""
         config = Config.from_directory(str(model_dir))
-        config.override_dynamic_seq_len(seq_len)
+        config.override_dynamic_seq_len(cache_len)
         model = Model.from_config(config)
-        cache = Cache(model, max_num_tokens=seq_len)
+        cache = Cache(model, max_num_tokens=cache_len)
         model.load()
         try:
             for i, seq in enumerate(seqs):
                 params = {"attn_mode": "flash_attn", "cache": cache,
-                          "past_len": 0, "batch_shape": (1, seq_len)}
-                logits = model.forward(seq, params=params)  # (1, L, vocab)
-                on_row(i, logits[0])
+                          "past_len": 0, "batch_shape": (1, row_len)}
+                logits = model.forward(seq, params=params)
+                on_row(i, logits)
         finally:
             try:
                 model.unload()
             except Exception:
                 pass
-            torch.cuda.empty_cache()
+            del model, cache, config
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     stage = Path(tempfile.mkdtemp(prefix="klstage-", dir=str(quant_dir.parent)))
     try:
-        # Pass 1: fp16 -> stage each row's logits (fp16 on disk to halve size).
-        _forward_rows(fp16_dir, lambda i, lg: torch.save(lg.half().cpu(), stage / f"f{i}.pt"))
+        conf_rows: list = []
+        _forward_rows(fp16_dir, lambda i, lg: save_reference_row(str(stage), i, lg, ranges[i], conf_rows))
+        save_tensors(str(stage / "conf.safetensors"), {"conf": torch.cat(conf_rows)})
 
-        # Pass 2: quant -> KL vs the staged fp16 logits.
-        kls: list[float] = []
+        stats = DiffStats(ids, ranges, vocab, str(stage))
+        if _kl_kernel_usable():
+            _forward_rows(quant_dir, lambda i, lg: stats(i, lg))
+        else:
+            # Same quantity, plain torch: compute_kl_div documents itself as
+            # F.kl_div(log_softmax(input), softmax(target)).sum(-1), which is
+            # what this is. Fills the same accumulators so results() is identical.
+            from eval.qbench.data import load_tensor
+            from exllamav3.util.measures import compute_target_log_probs
 
-        def _cmp(i, q_logits):
-            f_logits = torch.load(stage / f"f{i}.pt").to(q_logits.device).float()
-            kv = min(vocab, q_logits.shape[-1], f_logits.shape[-1])
-            qi = q_logits[..., :kv].float()
-            fi = f_logits[..., :kv]
-            # KL(P_fp16 || P_quant), pure torch. exllamav3's compute_kl_div uses
-            # a custom kernel that segfaults here, so do the math directly.
-            kl = (torch.softmax(fi, dim=-1)
-                  * (torch.log_softmax(fi, dim=-1) - torch.log_softmax(qi, dim=-1))
-                  ).sum(-1).mean().item()
-            kls.append(kl)
+            def _cmp(r, logits):
+                a, b = ranges[r]
+                lg = logits[:, a:b, :].float()
+                lg.clamp_(min=-200.0)
+                tgt = ids[r, a + 1:b].view(1, -1).to(lg.device)
+                lp = compute_target_log_probs(lg[:, :-1, :], tgt, min(vocab, lg.shape[-1]))
+                fin = torch.isfinite(lp)
+                stats.logprob_sum += lp[fin].sum().item()
+                stats.logprob_count += fin.sum().item()
+                stats.total_count += tgt.numel()
+                ref = load_tensor(str(stage / f"row_{r:06d}.safetensors"), "logits")
+                ref = ref.to(lg.device).float()
+                kv = min(vocab, lg.shape[-1], ref.shape[-1])
+                qi, fi = lg.squeeze(0)[..., :kv], ref.squeeze(0)[..., :kv]
+                kl = (torch.softmax(fi, dim=-1)
+                      * (torch.log_softmax(fi, dim=-1) - torch.log_softmax(qi, dim=-1))
+                      ).sum(-1)
+                stats.kl_toks.append(kl.flatten().float().cpu())
+                del ref
 
-        _forward_rows(quant_dir, _cmp)
-        if not kls:
+            _forward_rows(quant_dir, _cmp)
+
+        res = stats.results()
+        if "kld" not in res:
             return None, ""
-        print(f"[kl] {sum(kls) / len(kls):.5f} over {method}", flush=True)
-        return sum(kls) / len(kls), method
+        print_stats(f"{quant_dir.name}", res)
+        return res, method
     except Exception as e:
         print(f"[kl] WARN eval failed: {type(e).__name__}: {e}", flush=True)
         return None, ""
@@ -650,6 +654,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     quant_rows = [{
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
         "cal_rows": o.get("_cal_rows", cal_rows),
+        "vision_bits": o.get("_vision_bits"),
+        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"]),
         "size_gb": o.get("_size_gb"),
         "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
         "kl_div": o.get("kl_div"),
@@ -664,6 +670,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
+            vision_bits=o.get("_vision_bits"),
             cal_rows=o.get("_cal_rows", cal_rows),
             size_gb=o.get("_size_gb"),
             model_config=model_config, quant_rows=quant_rows,
@@ -736,6 +743,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         qcfg_v = _repo_quant_config(repo, hf_token)
         cb_v = str(qcfg_v.get("codebook") or "mcg")
         hb_v = qcfg_v.get("head_bits", head_bits)
+        vb_v = qcfg_v.get("vision_bits")
         # Already measured? read it back and skip the eval.
         existing = None
         try:
@@ -766,7 +774,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                                 "tokenizer*"],
             )
             print(f"[backfill] {v} measuring KL vs fp16 ...", flush=True)
-            kl, _kl_method = _kl_div_eval(bdir, model_dir, rows=kl_rows)
+            _stats, _kl_method = _kl_div_eval(bdir, model_dir, rows=kl_rows)
+            kl = _stats["kld_median"] if _stats else None
         except Exception as e:
             print(f"[backfill] {v} eval failed: {type(e).__name__}: {e}", flush=True)
         finally:
@@ -777,14 +786,15 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                 api.upload_file(
                     path_or_fileobj=json.dumps(
                         {"kl_div": kl, "kl_rows": kl_rows, "kl_method": _kl_method,
-                         "metric": "KL(fp16||quant)"}).encode(),
+                         "kl_stats": _stats,
+                         "metric": "KL(fp16||quant) median"}).encode(),
                     path_in_repo="bq_quality.json", repo_id=repo,
                 )
                 print(f"[backfill] {v} KL={kl:.6f} -> bq_quality.json", flush=True)
             except Exception as e:
                 print(f"[backfill] {v} quality upload failed: {e}", flush=True)
         table[v] = {"repo": repo, "kl": kl, "size_gb": size_gb, "codebook": cb_v,
-                    "head_bits": hb_v}
+                    "head_bits": hb_v, "vision_bits": vb_v}
 
     # Re-render every card so the Quants table shows KL for all bpws.
     try:
@@ -797,6 +807,7 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
                                              token=hf_token)
     quant_rows = [{
         "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
+        "vision_bits": d.get("vision_bits"), "repo_id": d["repo"],
         "size_gb": d["size_gb"], "url": f"https://huggingface.co/{d['repo']}",
         "kl_div": d["kl"], "kl_method": d.get("kl_method"),
     } for v, d in table.items()]
@@ -804,7 +815,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         try:
             card = cards.render_exl3_card(
                 base_repo=model_id, repo_id=d["repo"], variant=v,
-                head_bits=d.get("head_bits", head_bits), cal_rows=rows_cal,
+                head_bits=d.get("head_bits", head_bits),
+                vision_bits=d.get("vision_bits"), cal_rows=rows_cal,
                 size_gb=d["size_gb"],
                 model_config=model_config, quant_rows=quant_rows,
                 collection_url=collection_url, license_id=license_id,
@@ -839,6 +851,10 @@ def main() -> int:
         # How many cards the launcher rented. convert's -d defaults to "0", so
         # without this an N-GPU pod quantizes on one card and bills for N.
         gpu_count: int = max(1, int(cfg.get("gpu_count", 1) or 1))
+        # Repos that ship several formats keep each in its own directory. Only
+        # that subtree is fetched: the one that prompted this had 433 GB across
+        # BF16/FP8/GGUF/NVFP4 and we pulled all of it to quantize one.
+        subfolder: str = (cfg.get("subfolder") or "").strip().strip("/")
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -924,12 +940,15 @@ def main() -> int:
         # thread so the normal failure path still runs.
         import threading
         # Total repo size up front so the heartbeat can report a percent.
+        _want = f"{subfolder}/" if subfolder else ""
         try:
             _info = HfApi(token=hf_token or None).model_info(model_id, files_metadata=True)
-            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])) / 1e9
+            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])
+                            if s.rfilename.startswith(_want)) / 1e9
         except Exception:
             _total_gb = 0.0
-        print(f"[download] {model_id} ({_total_gb:.1f} GB) ...", flush=True)
+        _what = f"{model_id}/{subfolder}" if subfolder else model_id
+        print(f"[download] {_what} ({_total_gb:.1f} GB) ...", flush=True)
         _dl_done = threading.Event()
         _dl_err: dict = {}
 
@@ -939,6 +958,7 @@ def main() -> int:
                     repo_id=model_id,
                     local_dir=str(model_dir),
                     token=hf_token or None,
+                    allow_patterns=[f"{subfolder}/*"] if subfolder else None,
                 )
             except Exception as exc:  # surfaced after join()
                 _dl_err["exc"] = exc
@@ -958,6 +978,19 @@ def main() -> int:
         if "exc" in _dl_err:
             raise _dl_err["exc"]
         print("[download] complete", flush=True)
+
+        # snapshot_download preserves repo paths, so a subfolder fetch lands at
+        # model_dir/<subfolder>. Move the root here rather than threading the
+        # subfolder through _sanitize_config, the converter, the KL eval and the
+        # smoke test -- they all just want the directory the weights are in.
+        if subfolder:
+            model_dir = model_dir / subfolder
+            if not (model_dir / "config.json").exists():
+                raise FileNotFoundError(
+                    f"no config.json under {subfolder}/ after download; "
+                    f"got {sorted(p.name for p in model_dir.parent.iterdir())[:10]}"
+                )
+            print(f"[download] model root -> {model_dir}", flush=True)
 
         _sanitize_config(model_dir)
         _disable_missing_mtp(model_dir)
@@ -985,6 +1018,8 @@ def main() -> int:
             rec["_head_bits"] = _qc.get("head_bits", head_bits)
             rec["_codebook"] = _qc.get("codebook", codebook)
             rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
+            # Present only when the tower was quantized; that is the signal.
+            rec["_vision_bits"] = _qc.get("vision_bits")
             if not hf_token:
                 return
             repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
@@ -1149,11 +1184,18 @@ def main() -> int:
             rec = {"variant": variant, "path": str(out_dir)}
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
-                kl, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
-                if kl is not None:
+                stats, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                if stats is not None:
+                    # The median is what the card quotes. The mean is kept
+                    # because turboderp's charts plot it, but his own note is
+                    # that it is dominated by tokens the reference is undecided
+                    # on, so it is the worse of the two to lead with.
+                    kl = stats["kld_median"]
                     rec["kl_div"] = kl
+                    rec["kl_stats"] = stats
                     rec["kl_method"] = kl_method
-                    print(f"[kl] {variant} KL(fp16||quant) = {kl:.6f}", flush=True)
+                    print(f"[kl] {variant} KL(fp16||quant) median {kl:.6f} "
+                          f"mean {stats['kld']:.6f}", flush=True)
                     # Persist next to the weights so a later card re-render
                     # (publish_quant) and retroactive backfill can read it back.
                     # The method goes with it: a number measured on held-out
@@ -1161,7 +1203,8 @@ def main() -> int:
                     # same metric and must not share a field unlabelled.
                     payload = json.dumps({"kl_div": kl, "kl_rows": kl_rows,
                                           "kl_method": kl_method,
-                                          "metric": "KL(fp16||quant)"})
+                                          "kl_stats": stats,
+                                          "metric": "KL(fp16||quant) median"})
                     try:
                         (out_dir / "bq_quality.json").write_text(payload, encoding="utf-8")
                     except Exception as e:

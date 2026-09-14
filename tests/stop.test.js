@@ -207,3 +207,39 @@ describe('stopJob', () => {
     expect(res.pods).toEqual(['pod-1', 'pod-2']);
   });
 });
+
+describe('controllersForJob matching', () => {
+  const ctl = (meta, extra = {}) => ({ running: true, pid: 1, logPath: '/x', meta, ...extra });
+
+  it('matches on the job id, not the model', () => {
+    // Two jobs quanting the same model at once: stopping one must not
+    // terminate the other's pods.
+    const mine = ctl({ modelId: 'org/m', jobId: 'job-a' });
+    const theirs = ctl({ modelId: 'org/m', jobId: 'job-b' });
+    const got = controllersForJob(
+      { id: 'job-a', modelId: 'org/m', startedAt: 1000 },
+      () => [mine, theirs]
+    );
+    expect(got).toEqual([mine]);
+  });
+
+  it('falls back to model and start time for a controller with no job id', () => {
+    // Spawned before jobId was recorded; the model plus "no earlier than the
+    // job" is all there is to go on.
+    // Slack is 60s, so "before the job" has to be more than that earlier.
+    const JOB_START = 1_700_000_000_000;
+    const mine = ctl({ modelId: 'org/m' }, { startedAt: JOB_START });
+    const earlier = ctl({ modelId: 'org/m' }, { startedAt: JOB_START - 600_000 });
+    const got = controllersForJob(
+      { id: 'job-a', modelId: 'org/m', startedAt: JOB_START },
+      () => [mine, earlier]
+    );
+    expect(got).toEqual([mine]);
+  });
+
+  it('ignores a controller that is no longer running', () => {
+    const dead = { ...ctl({ modelId: 'org/m', jobId: 'job-a' }), running: false };
+    expect(controllersForJob({ id: 'job-a', modelId: 'org/m' }, () => [dead])).toEqual([]);
+  });
+});
+

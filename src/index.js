@@ -10,6 +10,7 @@ import * as embeds from './utils/embeds.js';
 import { listPods, terminatePod } from './services/runpod.js';
 import { reapOrphans as reap } from './services/reaper.js';
 import { sweep as sweepControllers } from './services/detached.js';
+import { resumeJob } from './commands/quant.js';
 import { registerChat } from './chat/index.js';
 
 const log = getLogger('bot');
@@ -170,40 +171,51 @@ async function start() {
   // 2. Init job queue
   jobQueue.setPresenceUpdater((payload) => applyPresence(client, payload));
   jobQueue.init();
-  // Controllers outlive the bot now (services/detached.js), so a restart no
-  // longer kills the work. What it does lose is the Discord half: the progress
-  // embed stops moving and nothing bot-side runs at the end. Say so, with the
-  // log to watch, because otherwise nobody finds out.
+  // Controllers outlive the bot (services/detached.js), so a restart does not
+  // kill the work -- but it used to kill the Discord half, freezing the embed
+  // and marking a job that was still quantizing "failed". Everything needed to
+  // reconnect is on disk: detached.list() gives the log and the pid, and the
+  // job record kept threadId + progressMessageId. Pick those back up.
   const { live, finished } = sweepControllers();
-  for (const c of live) {
-    const what = `${c.kind} ${c.meta?.modelId || c.id}`;
-    log.warn(`${what} controller survived the restart (pid ${c.pid}); its embed is dead. Watch ${c.logPath}`);
-  }
-  if (live.some((c) => c.kind === 'quant')) {
-    log.warn('Cards and the collection are written bot-side: run backend/scripts/publish_quant.py --base <model> once those land');
-  }
   for (const c of finished) {
     const out = c.meta?.resultPath ? `, result ${c.meta.resultPath}` : '';
     log.warn(`${c.kind} ${c.meta?.modelId || c.id} finished while the bot was down: ${c.logPath}${out}`);
   }
-  const liveModels = new Set(live.map((c) => c.meta?.modelId).filter(Boolean));
 
-  // Do NOT auto-re-run persisted jobs on restart: the old recover path
-  // re-enqueued them to the LOCAL quantizer (a 70GB download on the host). Mark
-  // any leftover non-terminal job interrupted; the operator re-fires what they
-  // want, or lets a surviving controller finish it.
+  // jobId -> variant -> handle. Controllers spawned before jobId was recorded
+  // have no way back to their message; they still get the old warning.
+  const byJob = new Map();
+  for (const c of live) {
+    const jobId = c.meta?.jobId;
+    if (c.kind !== 'quant' || !jobId) {
+      log.warn(`${c.kind} ${c.meta?.modelId || c.id} survived the restart (pid ${c.pid}) but carries no job id; its embed stays dead. Watch ${c.logPath}`);
+      continue;
+    }
+    if (!byJob.has(jobId)) byJob.set(jobId, new Map());
+    for (const v of c.meta.variants || []) byJob.get(jobId).set(v, c);
+  }
+
   const stale = await db.listRecoverableJobs();
   for (const job of stale) {
+    const handles = byJob.get(job.id);
+    if (handles && job.threadId && job.progressMessageId) {
+      log.info(`reattaching job ${job.id} (${job.modelId}) to ${handles.size} live controller(s)`);
+      // Fire and forget: this resolves only when the quant does, hours later.
+      resumeJob({ client, job, resumeFrom: handles }).catch((err) =>
+        log.error(`reattach failed for ${job.id}: ${err.message}`)
+      );
+      continue;
+    }
+    // Nothing to attach to. Do NOT re-run: the old recover path re-enqueued to
+    // the LOCAL quantizer, which is a 70GB download onto the host.
     await db.patchJob(job.id, {
       status: db.JOB_STATUS.failed,
-      error: liveModels.has(job.modelId)
-        ? 'bot restarted; controller still running, quant will upload without the bot'
+      error: handles
+        ? 'bot restarted; controller still running but its progress thread is gone'
         : 'interrupted by bot restart',
       failedAt: Date.now(),
     });
-  }
-  if (stale.length) {
-    log.info(`Marked ${stale.length} interrupted job(s) on startup (not re-run)`);
+    log.info(`marked ${job.id} interrupted (not re-run)`);
   }
 
   // 3. Recover API jobs (so restart doesn't orphan running Celery tasks)

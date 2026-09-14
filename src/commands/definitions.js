@@ -24,19 +24,22 @@ export const commands = [
     )
     .addStringOption((opt) =>
       opt
-        .setName('vision')
-        .setDescription('Vision tower handling for multimodal models (default auto)')
+        .setName('subfolder')
+        .setDescription('Subdirectory holding the model, for repos that ship several formats (e.g. BF16)')
         .setRequired(false)
-        .addChoices(
-          { name: 'auto — 6bpw where the tower is validated, else fp16 (default)', value: 'auto' },
-          { name: 'fp16 — never quantize the tower', value: 'fp16' },
-          { name: '6 — force 6bpw even on an unvalidated tower', value: '6' }
-        )
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('vision_bits')
+        .setDescription('Bits for the vision tower. 1-8, or 16 to copy it unquantized. Default depends on the arch.')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(16)
     )
     .addIntegerOption((opt) =>
       opt
         .setName('head_bits')
-        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default: 6 (exllamav3)')
+        .setDescription('Bits for the output head. 1-8, or 16 to leave it unquantized. Default 6.')
         .setRequired(false)
         .setMinValue(1)
         .setMaxValue(16)

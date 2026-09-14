@@ -19,97 +19,56 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "blockquant" / "remote" / "quant.py"
-FETCH = Path(__file__).resolve().parents[2] / "docker" / "fetch_kl_corpus.py"
 CARDS = Path(__file__).resolve().parents[1] / "src" / "blockquant" / "cards.py"
 
-WANT = ("_eval_text", "_chat_format", "KL_CORPUS")
+SELFCAL = Path(__file__).resolve().parents[1] / "src" / "blockquant" / "selfcal"
 
 
-@pytest.fixture
-def kl(tmp_path, monkeypatch):
-    tree = ast.parse(SRC.read_text())
-    body = [n for n in tree.body
-            if (isinstance(n, ast.FunctionDef) and n.name in WANT)
-            or (isinstance(n, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id in WANT for t in n.targets))]
-    ns = {"json": json, "Path": Path, "__name__": "kl"}
-    future = ast.ImportFrom(module="__future__",
-                            names=[ast.alias(name="annotations", asname=None)], level=0)
-    mod = ast.fix_missing_locations(ast.Module(body=[future] + body, type_ignores=[]))
-    exec(compile(mod, str(SRC), "exec"), ns)
-    return ns
+def _kl_source() -> str:
+    return SRC.read_text()
 
 
-def test_the_baked_corpus_is_used_when_present(kl, tmp_path):
-    corpus = tmp_path / "kl_eval_corpus.utf8"
-    corpus.write_text("held out text, not the calibration set", encoding="utf-8")
-    kl["KL_CORPUS"] = corpus
-    text, source = kl["_eval_text"]()
-    assert "held out" in text
-    assert source == "openwebtext"
+def test_the_eval_asks_qbench_for_wiki2_at_its_own_geometry():
+    """wiki2 at 10x2048 is what qbench's example project ships and the only
+    corpus sc_measure implements. We measured openwebtext at 8x8192 before --
+    a supported source, but nobody else's geometry, so the number could not be
+    read against anyone's."""
+    src = _kl_source()
+    assert '"source": "wiki2"' in src
+    assert "rows: int = 10" in src
+    assert "seq_len: int = 2048" in src
 
 
-@pytest.fixture
-def fake_exllamav3(tmp_path, monkeypatch):
-    """Stand in for the installed package so the fallback branch can run here.
+def test_the_eval_split_is_not_the_calibration_set():
+    """EXL3 calibrates on standard_cal_data/*.utf8, wiki.utf8 among them, so
+    measuring on the same text would be measuring on the training set.
 
-    It reads standard_cal_data relative to exllamav3.__file__, which is the
-    whole point: the fallback IS the calibration corpus.
+    The vendored dataset spec has to name the TEST split; the calibration wiki
+    is a separate general Wikipedia dump. Read the spec rather than trusting
+    the comment above it.
     """
-    import types
-    pkg = tmp_path / "exllamav3"
-    cal = pkg / "conversion" / "standard_cal_data"
-    cal.mkdir(parents=True)
-    (cal / "c4.utf8").write_text("calibration text", encoding="utf-8")
-    mod = types.ModuleType("exllamav3")
-    mod.__file__ = str(pkg / "__init__.py")
-    monkeypatch.setitem(sys.modules, "exllamav3", mod)
-    return mod
+    spec = (SELFCAL / "eval" / "qbench" / "data.py").read_text()
+    block = spec[spec.index('"wiki2"'):spec.index('"wikitext2"')]
+    assert '"wikitext-2-raw-v1"' in block
+    assert '"split": "test"' in block
 
 
-def test_a_missing_corpus_falls_back_but_says_the_number_is_tainted(
-        kl, tmp_path, capsys, fake_exllamav3):
-    """An image built before the corpus was baked must not report a number that
-    looks like the corrected one."""
-    kl["KL_CORPUS"] = tmp_path / "does-not-exist.utf8"
-    text, source = kl["_eval_text"]()
-    assert text == "calibration text"
-    assert "calibration" in source.lower()
-    assert "understates" in capsys.readouterr().out
+def test_the_kl_kernel_is_probed_out_of_process():
+    """compute_kl_div segfaulted on builds before 1.5.0, and a segfault kills
+    the pod rather than raising. The probe has to be a subprocess or it cannot
+    help."""
+    src = _kl_source()
+    probe = src[src.index("def _kl_kernel_usable"):src.index("def _kl_div_eval")]
+    assert "subprocess.run" in probe
+    assert "returncode" in probe
 
 
-def test_an_empty_corpus_is_not_silently_accepted(kl, tmp_path, fake_exllamav3):
-    corpus = tmp_path / "kl_eval_corpus.utf8"
-    corpus.write_text("   \n\n  ", encoding="utf-8")
-    kl["KL_CORPUS"] = corpus
-    _text, source = kl["_eval_text"]()
-    assert "calibration" in source.lower()
-
-
-def test_chat_formatting_is_best_effort_never_fatal(kl, tmp_path):
-    """A model with no usable template still gets measured; it just says so."""
-    text, label = kl["_chat_format"](tmp_path, "some prose")
-    assert text == "some prose"
-    assert label.startswith("raw")
-
-
-# ── The corpus must not be the one the quantizer trains on ──────────────────
-
-def test_the_eval_corpus_is_disjoint_from_the_calibration_set():
-    """exllamav3 calibrates on c4/code/multilingual/technical/tiny/wiki.
-
-    Whatever we measure on must not be any of those, which is the entire point
-    of this change. Read the constant rather than trusting a comment.
-    """
-    src = FETCH.read_text()
-    ns: dict = {}
-    for node in ast.parse(src).body:
-        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in (
-                "DATASET", "CONFIG", "SPLIT"):
-            ns[node.targets[0].id] = ast.literal_eval(node.value)
-    assert "openwebtext" in ns["DATASET"].lower()
-    cal = ("c4", "code", "multilingual", "technical", "tiny", "wiki")
-    assert not any(ns["DATASET"].lower().endswith(c) for c in cal)
+def test_the_card_quotes_the_median_not_the_mean():
+    """turboderp's own note: the mean is dominated by tokens the reference is
+    undecided on. The median is what isolates quantization damage."""
+    src = _kl_source()
+    assert 'kl = stats["kld_median"]' in src
+    assert 'rec["kl_stats"] = stats' in src
 
 
 # ── The card has to state the method, not describe it from memory ───────────

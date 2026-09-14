@@ -611,8 +611,11 @@ class HFRunner:
         # straight to the GPU instead of materializing the whole model in CPU
         # RAM first, which matters at the 64 GB cap -- but not worth failing a
         # paid pod over, so fall back to a plain load and move it ourselves.
+        # "auto" spreads across whatever the pod rented; pinning cuda:0 meant a
+        # multi-GPU pod could only ever use the first card, so a model that
+        # needed two would OOM next to idle hardware we were paying for.
         try:
-            self.model = _load(device_map="cuda:0", low_cpu_mem_usage=True)
+            self.model = _load(device_map="auto", low_cpu_mem_usage=True)
         except (ImportError, ValueError) as e:
             if "accelerate" not in str(e):
                 raise

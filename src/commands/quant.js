@@ -16,7 +16,7 @@ import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
-import { runViaCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
+import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
@@ -88,9 +88,15 @@ export async function handleQuant(interaction) {
   // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
   // tower whole, so the same request gives a different artifact now. fp16 is
   // the way back.
-  const vision = interaction.options.getString('vision') || 'auto';
-  // Omitted means exllamav3 decides (6), the same way `vision: auto` sends
-  // nothing. Tracking its default beats hardcoding a copy of it here.
+  const visionBits = interaction.options.getInteger('vision_bits');
+  // Only for repos that keep their model in a subdirectory. Preflight picks it
+  // on its own when there is exactly one unquantized candidate, so this is the
+  // tie-breaker, not the normal path.
+  const subfolderOpt = (interaction.options.getString('subfolder') || '').trim().replace(/^\/+|\/+$/g, '');
+  // Omitted means exllamav3 decides. Note its default is NOT a flat 6: it is
+  // the tower's own declared default_vision_bits, which is 6 on the six
+  // validated arches (qwen3_vl, gemma4, glm4v, step3_7, deepseek_v4_vision,
+  // muse_glimmer) and 16 everywhere else. Tracking that beats copying it.
   const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
@@ -129,6 +135,13 @@ export async function handleQuant(interaction) {
   // exllamav3 takes 1-8, or 16 for an unquantized head; 9-15 are not lattice
   // sizes it has codebooks for. Discord caps the range at 1-16, so only the
   // hole in the middle needs catching.
+  if (visionBits !== null && visionBits > 8 && visionBits !== 16) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error('Invalid vision bits', 'Vision bits must be 1-8, or 16 to copy the tower unquantized.'),
+      ],
+    });
+  }
   if (headBits !== null && headBits > 8 && headBits !== 16) {
     return interaction.editReply({
       embeds: [
@@ -165,6 +178,9 @@ export async function handleQuant(interaction) {
       embeds: [embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`)],
     });
   }
+  // Preflight resolves this when the repo has one obvious source; an explicit
+  // option wins so someone can quant the FP8 copy if they really mean to.
+  const subfolder = subfolderOpt || flight.subfolder || null;
   if (!flight.canWrite) {
     return interaction.editReply({
       embeds: [embeds.error('Token Error', 'The HF token does not have write permissions. Update `HF_TOKEN` in .env.')],
@@ -194,7 +210,8 @@ export async function handleQuant(interaction) {
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           bpw,
-          quantOptions: { headBits },
+          hasVision: flight.hasVision,
+          quantOptions: { headBits, visionBits },
         });
         precheckedRepos[String(bpw)] = state;
         // config_missing is a repo whose config.json could not be read -- an
@@ -205,7 +222,19 @@ export async function handleQuant(interaction) {
             embeds: [
               embeds.error(
                 'Existing Repo Conflict',
-                `\`${state.repoId}\` was quantized with different settings (${state.reason ?? 'settings mismatch'}).`
+                // vision_tower_differs is the one worth spelling out. The plain
+                // name means "the tower default of the day", and that default
+                // moved at 1.4.9 from copying the tower whole to quantizing a
+                // validated one -- so the existing repo and a re-run today are
+                // different weights under one name. Naming every VL repo -V{n}
+                // to avoid this would be noise on the many to serve the few, so
+                // say it here instead, where it actually bites.
+                String(state.reason).includes('vision_tower_differs')
+                  ? `\`${state.repoId}\` has an fp16 vision tower — it predates tower ` +
+                    'quantization, so a re-run now would be different weights under the same ' +
+                    'name. Pass `vision_bits:16` to rebuild it as-is, or `vision_bits:6` to ' +
+                    'quantize the tower and publish alongside it as `-V6`.'
+                  : `\`${state.repoId}\` was quantized with different settings (${state.reason ?? 'settings mismatch'}).`
               ),
             ],
           });
@@ -279,8 +308,9 @@ export async function handleQuant(interaction) {
       bpws,
       testPrompt,
       codebook,
-      vision,
+      visionBits,
       headBits,
+      subfolder,
       categories: [category],
       provider,
       precheckedRepos,
@@ -302,7 +332,8 @@ export async function handleQuant(interaction) {
     [
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      `**Head bits:** ${headBits ?? '6 (default)'}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${vision}`,
+      subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
+      `**Head bits:** ${headBits ?? 6}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
@@ -368,7 +399,20 @@ export async function handleQuant(interaction) {
  * the progress thread + live embed + execution, exactly as before, minus the
  * EXP accounting.
  */
-export async function runApprovedJob({ interaction, job }) {
+/**
+ * Pick a job back up after a bot restart, driving the embed it already has.
+ *
+ * runApprovedJob touches the interaction in exactly two places -- the channel
+ * to open a thread in, and approvedBy -- and the second only runs when this is
+ * not a resume. So a shim carrying the client is all it needs, and the whole
+ * completion path (cards, collection, the thread's final message) stays shared
+ * with a normal run rather than being reimplemented here and drifting.
+ */
+export function resumeJob({ client, job, resumeFrom }) {
+  return runApprovedJob({ interaction: { channel: null, client }, job, resumeFrom });
+}
+
+export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
   const {
     id: jobId,
     userId,
@@ -380,9 +424,10 @@ export async function runApprovedJob({ interaction, job }) {
     bpws,
     testPrompt = null,
     codebook = config.CODEBOOK,
-    vision = 'auto',
+    visionBits = null,
     // Older records predate the option; null keeps exllamav3's default.
     headBits = null,
+    subfolder = null,
     categories,
     provider,
     precheckedRepos = {},
@@ -395,23 +440,33 @@ export async function runApprovedJob({ interaction, job }) {
   if (!channel || !channel.threads) {
     throw new Error('Could not resolve a channel to open the progress thread in.');
   }
-  const thread = await channel.threads.create({
-    name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
-    autoArchiveDuration: 1440,
-  });
+  // Resuming: the thread and the embed outlived the bot, so edit the message
+  // that is already there. Opening a second thread would strand the first one
+  // mid-progress with nothing ever finishing it.
+  const thread = resumeFrom
+    ? await channel.threads.fetch(job.threadId).catch(() => null)
+    : await channel.threads.create({
+        name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
+        autoArchiveDuration: 1440,
+      });
+  if (!thread) throw new Error(`Progress thread ${job.threadId} is gone; nothing to resume into.`);
 
-  const progressMsg = await thread.send({
-    embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
-    components: [stopButtons(jobId)],
-  });
+  const progressMsg = resumeFrom
+    ? await thread.messages.fetch(job.progressMessageId)
+    : await thread.send({
+        embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
+        components: [stopButtons(jobId)],
+      });
 
-  await db.patchJob(jobId, {
-    status: db.JOB_STATUS.queued,
-    approvedAt: Date.now(),
-    approvedBy: interaction.user.id,
-    threadId: thread.id,
-    progressMessageId: progressMsg.id,
-  });
+  await db.patchJob(jobId, resumeFrom
+    ? { status: db.JOB_STATUS.running, resumedAt: Date.now() }
+    : {
+        status: db.JOB_STATUS.queued,
+        approvedAt: Date.now(),
+        approvedBy: interaction.user.id,
+        threadId: thread.id,
+        progressMessageId: progressMsg.id,
+      });
 
   const updateEmbed = throttle(async (data) => {
     try {
@@ -571,29 +626,54 @@ export async function runApprovedJob({ interaction, job }) {
     // runVariantWithRetry: a signal-killed or pod-created failure is terminal,
     // so cancelling a broken model can't respawn a controller (the runaway).
     const MAX_ATTEMPTS = 3;
+
+    // Progress handler shared by a fresh run and a resumed one, so a reattached
+    // job draws the same embed the original was drawing.
+    const onVariantProgress = (v) => (d) => {
+      if (d.podId && !podIds.has(d.podId)) {
+        podIds.add(d.podId);
+        db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
+          log.debug(`could not record pod ${d.podId}: ${err.message}`)
+        );
+      }
+      pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      renderParallel();
+    };
+
     async function runVariant(v) {
+      // Resuming: the controller is already running and owns the pod. Attach to
+      // its log instead of spawning a second one, and do not retry -- a retry
+      // here would rent a pod alongside the one still working.
+      const handle = resumeFrom?.get(v);
+      if (handle) {
+        try {
+          const res = await attachToCli(handle, { variants: [v], onProgress: onVariantProgress(v) });
+          const url = res?.[0]?.url ?? null;
+          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url,
+                        sample: res?.[0]?.sample ?? null };
+          renderParallel();
+          return res;
+        } catch (err) {
+          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+          renderParallel();
+          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+        }
+      }
       try {
         return await runVariantWithRetry(v, {
           maxAttempts: MAX_ATTEMPTS,
           run: async () => {
             const res = await runViaCli({
+              jobId,
               modelId,
               variants: [v],
               hfOrg: config.HF_ORG,
               testPrompt,
               codebook,
-              vision,
+              visionBits,
               headBits,
-              onProgress: (d) => {
-                if (d.podId && !podIds.has(d.podId)) {
-                  podIds.add(d.podId);
-                  db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
-                    log.debug(`could not record pod ${d.podId}: ${err.message}`)
-                  );
-                }
-                pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
-                renderParallel();
-              },
+              subfolder,
+              onProgress: onVariantProgress(v),
             });
             const url = res && res[0] ? res[0].url : null;
             const sample = res && res[0] ? res[0].sample : null;

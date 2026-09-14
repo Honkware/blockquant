@@ -9,7 +9,7 @@ on:
 
 jobs:
   python:
-    name: pytest (provider unit tests)
+    name: pytest
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -25,14 +25,16 @@ jobs:
           cache-dependency-path: backend/requirements.txt
 
       - name: Install lightweight test deps
-        # Skip torch / heavy ML deps — the provider tests are fully mocked
-        # against runpod / paramiko / huggingface-hub and don't need a GPU stack.
+        # Skip torch / heavy ML deps — the tests are fully mocked against
+        # runpod / paramiko / huggingface-hub and don't need a GPU stack.
+        # pillow is not that: catbench_store really opens the PNGs it mirrors,
+        # and test_catbench_store builds real ones to feed it.
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio python-dotenv celery \
-                      runpod paramiko huggingface-hub pydantic fastapi
+                      runpod paramiko huggingface-hub pydantic fastapi pillow
 
-      - name: Run provider tests
+      - name: Run tests
         working-directory: backend
         run: pytest tests -v --tb=short

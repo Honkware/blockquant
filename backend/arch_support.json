@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-09-11T20:02:41+00:00",
+  "generated_at": "2026-09-13T18:51:47+00:00",
   "exllamav3": {
-    "ref": "5be8865",
-    "version": "1.4.9"
+    "ref": "0740edc",
+    "version": "1.5.0"
   },
   "architectures": [
     "AfmoeForCausalLM",

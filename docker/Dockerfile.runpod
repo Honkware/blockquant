@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.4.9 covers every registered
+# One image for every architecture. exllamav3 1.5.0 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake. The old three-image split (stable 0.0.38 +
@@ -14,7 +14,7 @@
 # -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
 # ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
 #
-# flash-attn is NOT installed and is no longer needed: exllamav3 1.4.9 ships
+# flash-attn is NOT installed and is no longer needed: exllamav3 ships
 # Triton attention kernels that lead the dispatch order and handle sliding
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
@@ -87,19 +87,24 @@ ARG MAX_JOBS=2
 ENV MAX_JOBS=${MAX_JOBS}
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.4.9.
+# providers/runpod/provider.py); this ref reports 1.5.0.
 #
-# v1.4.9. Pinned to the tag's commit rather than the tag name, since a tag can
+# v1.5.0. Pinned to the tag's commit rather than the tag name, since a tag can
 # be moved.
 #
-# 1.4.2 -> 1.4.9 changes what we ship for vision models. --vision_bits used to
-# default to 16 (tower copied unquantized) and now defaults to auto: a tower the
-# arch declares validated goes to 6 bpw, every other tower stays at 16. Qwen3-VL,
-# Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are validated as of
-# this ref, so the same /quant request now produces a different artifact than it
-# did before the bump. The vision option on the command is what makes that
+# 1.4.9 -> 1.5.0 replaces the single-token and batched MoE paths with one
+# two-stage cooperative kernel and makes MoE output deterministic, and swaps in
+# new quantizer kernels chosen per group size and arch (with an accuracy fix at
+# K=2). Both change what a quant comes out as, which is why _MIN_EXLLAMAV3 moved
+# with it -- rolling back past this should not be quiet.
+#
+# Vision, carried over from the 1.4.2 -> 1.4.9 bump: --vision_bits used to
+# default to 16 (tower copied unquantized) and now defaults to auto, so a tower
+# the arch declares validated goes to 6 bpw and every other tower stays at 16.
+# Qwen3-VL, Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are the
+# validated ones. The vision_bits option on the command is what makes that
 # choice visible and reversible.
-ARG EXLLAMAV3_REF=5be886578ec80324c2c715269387be2058724b6e
+ARG EXLLAMAV3_REF=0740edc2da569fb99174023c1d2988b1e98cb41e
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
@@ -116,21 +121,29 @@ RUN python -m pip install --no-cache-dir "flash-linear-attention>=0.5.0"
 COPY docker/fetch_cal_data.py /tmp/fetch_cal_data.py
 RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 
-# The corpus the KL metric is measured on, which must NOT be the one above:
-# that is what EXL3 calibrates against, so measuring there is measuring on the
-# training set. Baked rather than downloaded at run time so a paid pod cannot
-# lose a job to a dataset outage.
-COPY docker/fetch_kl_corpus.py /tmp/fetch_kl_corpus.py
-RUN mkdir -p /opt/blockquant \
-    && python /tmp/fetch_kl_corpus.py /opt/blockquant/kl_eval_corpus.utf8 \
-    && rm /tmp/fetch_kl_corpus.py
+# The corpus the KL metric is measured on: wikitext-2 test, which is what
+# qbench's own example project uses and the only set sc_measure implements.
+# It must not be what EXL3 calibrates against -- measuring there is measuring
+# on the training set. It is not: that is standard_cal_data/wiki.utf8, a
+# general Wikipedia dump, and 393 sampled 12-word shingles from this test split
+# appear in it zero times.
+#
+# Warmed into the image's dataset cache rather than downloaded per job, so a
+# paid pod cannot lose its number to a Hugging Face outage. qbench's loader
+# then finds it offline.
+ENV HF_DATASETS_CACHE=/opt/blockquant/datasets
+RUN mkdir -p /opt/blockquant/datasets \
+    && python -c "from datasets import load_dataset; \
+                  d=load_dataset('wikitext','wikitext-2-raw-v1',split='test'); \
+                  print('wikitext-2 test rows:', len(d))"
 
 # ---- Verify the stack at build time ---------------------------------------
 RUN python - <<'PY'
 import sys, torch, importlib.metadata as m
 assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
 assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
-assert m.version("exllamav3").startswith("1.4"), f"exllamav3 not 1.4.x: {m.version('exllamav3')}"
+_exl = tuple(int(x) for x in m.version("exllamav3").split(".")[:2])
+assert _exl >= (1, 5), f"exllamav3 older than 1.5: {m.version('exllamav3')}"
 print("python", sys.version.split()[0], "| torch", torch.__version__,
       "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
       "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))

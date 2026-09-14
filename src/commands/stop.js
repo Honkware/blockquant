@@ -14,9 +14,11 @@ const log = getLogger('cmd:stop');
 // so a log can hold several. Same line runpodCli.js reads for progress.
 const POD_ID = /Pod ID:\s*(\S+)/g;
 
-// A controller record carries the model and when it started, not the job id:
-// the meta is built in runpodCli.js. So a job's controllers are matched on the
-// model plus "started no earlier than the job did".
+// Controllers record their job id (runpodCli.js), so a job's controllers are
+// matched on it exactly. One spawned before that was added has only the model
+// and a start time, and for those the match falls back to "same model, started
+// no earlier than the job did" -- which cross-matches two jobs on the same model
+// started close together, so it is a fallback and not the rule.
 const CLOCK_SLACK_MS = 60_000;
 
 const STOPPABLE = [db.JOB_STATUS.queued, db.JOB_STATUS.running];
@@ -55,9 +57,11 @@ export async function canStop({ userId, member, job }) {
 
 export function controllersForJob(job, list = listControllers) {
   const since = (job.startedAt ?? job.approvedAt ?? job.createdAt ?? 0) - CLOCK_SLACK_MS;
-  return list().filter(
-    (c) => c.running && c.meta?.modelId === job.modelId && (c.startedAt ?? 0) >= since
-  );
+  return list().filter((c) => {
+    if (!c.running) return false;
+    if (c.meta?.jobId) return c.meta.jobId === job.id;
+    return c.meta?.modelId === job.modelId && (c.startedAt ?? 0) >= since;
+  });
 }
 
 function podIdsFromLog(logPath) {
