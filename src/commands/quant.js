@@ -222,7 +222,19 @@ export async function handleQuant(interaction) {
             embeds: [
               embeds.error(
                 'Existing Repo Conflict',
-                `\`${state.repoId}\` was quantized with different settings (${state.reason ?? 'settings mismatch'}).`
+                // vision_tower_differs is the one worth spelling out. The plain
+                // name means "the tower default of the day", and that default
+                // moved at 1.4.9 from copying the tower whole to quantizing a
+                // validated one -- so the existing repo and a re-run today are
+                // different weights under one name. Naming every VL repo -V{n}
+                // to avoid this would be noise on the many to serve the few, so
+                // say it here instead, where it actually bites.
+                String(state.reason).includes('vision_tower_differs')
+                  ? `\`${state.repoId}\` has an fp16 vision tower — it predates tower ` +
+                    'quantization, so a re-run now would be different weights under the same ' +
+                    'name. Pass `vision_bits:16` to rebuild it as-is, or `vision_bits:6` to ' +
+                    'quantize the tower and publish alongside it as `-V6`.'
+                  : `\`${state.repoId}\` was quantized with different settings (${state.reason ?? 'settings mismatch'}).`
               ),
             ],
           });

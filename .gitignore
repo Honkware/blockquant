@@ -68,3 +68,7 @@ gen_stub_b64*.py
 patch_b64*.txt
 stub_b64*.txt
 
+
+# Backups of .env hold live tokens; keep them out of the tree entirely.
+.env.bak*
+.env.*.bak
