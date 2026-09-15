@@ -12,6 +12,7 @@ Loaded by AST because remote/quant.py imports the exllamav3 stack at import.
 import ast
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -30,7 +31,7 @@ def heartbeat():
     body = [n for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name == "_heartbeat"]
     assert body, "_heartbeat is gone from quant.py"
-    ns = {"os": os, "re": re, "time": time, "deque": deque}
+    ns = {"os": os, "re": re, "time": time, "deque": deque, "select": select}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
     return ns["_heartbeat"]
 
@@ -65,7 +66,7 @@ def test_it_reports_while_the_stage_is_still_running(heartbeat, capsys):
     proc.wait()
     out = capsys.readouterr().out
     # Prefixed so it survives the controller's _PROGRESS_MARKERS filter.
-    assert "[sc] sc_trace: row 0" in out, out
+    assert "[sc] sc_trace:" in out and "row 0" in out, out
 
 
 def test_it_does_not_print_every_fragment(heartbeat, capsys):
@@ -74,6 +75,34 @@ def test_it_does_not_print_every_fragment(heartbeat, capsys):
     heartbeat(proc, "sc_trace", every=3600)  # never due
     proc.wait()
     assert "[sc] sc_trace:" not in capsys.readouterr().out
+
+
+def test_a_silent_stage_still_reports(heartbeat, capsys):
+    # THE case this exists for. A child that writes nothing for a while is
+    # exactly what a hung pod looks like, and reading straight off the pipe
+    # blocks until it writes -- so the first version of this reported nothing
+    # precisely when reporting mattered. One line in three minutes, observed on
+    # a live job while sc_trace loaded its donor.
+    proc = _run("import time\ntime.sleep(2.4)\n")
+    heartbeat(proc, "sc_trace", every=0.6)
+    proc.wait()
+    beats = [l for l in capsys.readouterr().out.splitlines() if "[sc] sc_trace:" in l]
+    assert len(beats) >= 2, beats
+
+
+def test_every_beat_differs_even_when_the_stage_says_nothing_new(heartbeat, capsys):
+    # get_progress is `grep | tail`, so repeating one line leaves the
+    # controller's progress text identical and its stall clock frozen -- the
+    # same failure by another route. Elapsed seconds is what breaks the tie.
+    # Beats are a whole second apart here because the elapsed stamp has
+    # second resolution; the real interval is 30s, where it always differs.
+    proc = _run("import sys,time\nsys.stdout.write('\\rrow 0')\ntime.sleep(3.4)\n")
+    heartbeat(proc, "sc_trace", every=1.1)
+    proc.wait()
+    beats = [l for l in capsys.readouterr().out.splitlines() if "[sc] sc_trace:" in l]
+    assert len(beats) >= 3, beats
+    assert len(set(beats)) == len(beats), beats
+    assert all("row 0" in b for b in beats), beats
 
 
 def test_the_last_lines_survive_for_the_error_message(heartbeat):

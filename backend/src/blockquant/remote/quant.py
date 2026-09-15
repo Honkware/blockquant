@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -321,31 +322,40 @@ def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
     """
     keep: deque[str] = deque(maxlen=12)
     buf = ""
-    last = time.monotonic()
+    start = last = time.monotonic()
     fd = proc.stdout.fileno()
     while True:
-        # os.read returns as soon as anything is there; a buffered read(n)
-        # would sit on a partial tqdm bar and defeat the point.
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk.decode("utf-8", "replace")
-        parts = re.split(r"[\r\n]", buf)
-        buf = parts.pop()
-        for frag in parts:
-            if frag.strip():
-                keep.append(frag.strip())
+        # Wake on output OR on the clock. Reading straight off the pipe blocks
+        # until the child writes, so a stage that goes quiet -- the only case
+        # that actually looks like a hung pod -- would report nothing at all.
+        # That was the first version of this, and it emitted one line in three
+        # minutes while sc_trace loaded a model.
+        ready, _, _ = select.select([fd], [], [], max(0.0, every - (time.monotonic() - last)))
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+            parts = re.split(r"[\r\n]", buf)
+            buf = parts.pop()
+            for frag in parts:
+                if frag.strip():
+                    keep.append(frag.strip())
         now = time.monotonic()
-        # The live state of a tqdm bar is the UNTERMINATED fragment -- it only
-        # gets a \r once the next update lands, and a slow stage can sit on one
-        # for minutes. Reporting completed fragments only meant reporting the
-        # previous bar update, or on a stage with one long-lived bar, nothing.
-        cur = buf.strip() or (keep[-1] if keep else "")
-        if cur and now - last >= every:
-            print(f"[sc] {name}: {cur[:160]}", flush=True)
+        if now - last >= every:
+            # The live state of a tqdm bar is the UNTERMINATED fragment: it only
+            # gets a \r when the next update lands, so reporting completed ones
+            # meant reporting the previous update, or nothing on a stage sitting
+            # on a single bar.
+            cur = buf.strip() or (keep[-1] if keep else "working")
+            # Elapsed is not decoration. get_progress is `grep | tail`, so a
+            # repeated identical line leaves the controller's progress text
+            # unchanged and its stall clock frozen -- the same failure by a
+            # different route. This guarantees every beat differs.
+            print(f"[sc] {name}: {int(now - start)}s {cur[:150]}", flush=True)
             last = now
     if buf.strip():
         keep.append(buf.strip())
