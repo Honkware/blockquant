@@ -83,6 +83,17 @@ function visionSummary(flight, bits) {
   return bits >= 1 && bits <= 8 ? `${bits} bpw` : 'fp16, copied';
 }
 
+// One pod per bitrate is right for plain quants: the work is independent and
+// they finish in parallel. Under SC it is not -- sc_trace, sc_rfn_probe and
+// sc_measure depend on the model, not the bitrate, and quant.py already shares
+// them across every variant in a job (only sc_optimize is per-bitrate).
+// Fanning out meant N pods each generating the same 512,000 calibration
+// tokens: measured at ~25 min and ~16 min on a 0.8B, so three bitrates paid
+// for that twice over and got nothing back.
+export function podGroups(variants, sc) {
+  return sc ? [variants.slice()] : variants.map((v) => [v]);
+}
+
 export async function handleQuant(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -709,34 +720,52 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
 
     // Progress handler shared by a fresh run and a resumed one, so a reattached
     // job draws the same embed the original was drawing.
-    const onVariantProgress = (v) => (d) => {
+    const onGroupProgress = (vs) => (d) => {
       if (d.podId && !podIds.has(d.podId)) {
         podIds.add(d.podId);
         db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
           log.debug(`could not record pod ${d.podId}: ${err.message}`)
         );
       }
-      pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      // Provisioning, download and calibration are one pod's work for the whole
+      // group, so every row in it shows them -- that is the truth, not a smear.
+      // Once the converter starts the stream names a bitrate, and only that row
+      // moves.
+      const targets = d.currentBPW && vs.includes(d.currentBPW) ? [d.currentBPW] : vs;
+      for (const v of targets) {
+        pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      }
       renderParallel();
     };
 
-    async function runVariant(v) {
+    // Each variant takes its own row's url/sample from the group's result.
+    function markComplete(vs, res) {
+      const byVariant = new Map((res || []).map((r) => [String(r.variant ?? r.bpw), r]));
+      for (const x of vs) {
+        const r = byVariant.get(String(x));
+        pstate[x] = { ...pstate[x], stage: 'Complete', overall: 100, message: 'done',
+                      url: r?.url ?? null, sample: r?.sample ?? null };
+      }
+      renderParallel();
+    }
+
+    async function runGroup(vs) {
+      const v = vs[0];
       // Resuming: the controller is already running and owns the pod. Attach to
       // its log instead of spawning a second one, and do not retry -- a retry
       // here would rent a pod alongside the one still working.
       const handle = resumeFrom?.get(v);
       if (handle) {
         try {
-          const res = await attachToCli(handle, { variants: [v], onProgress: onVariantProgress(v) });
-          const url = res?.[0]?.url ?? null;
-          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url,
-                        sample: res?.[0]?.sample ?? null };
-          renderParallel();
+          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs) });
+          markComplete(vs, res);
           return res;
         } catch (err) {
-          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+          for (const x of vs) {
+            pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
+          }
           renderParallel();
-          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+          return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
         }
       }
       try {
@@ -746,7 +775,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
             const res = await runViaCli({
               jobId,
               modelId,
-              variants: [v],
+              variants: vs,
               hfOrg: config.HF_ORG,
               testPrompt,
               codebook,
@@ -755,32 +784,34 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               subfolder,
               sc,
               donorRepo,
-              onProgress: onVariantProgress(v),
+              onProgress: onGroupProgress(vs),
             });
-            const url = res && res[0] ? res[0].url : null;
-            const sample = res && res[0] ? res[0].sample : null;
-            pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url, sample };
-            renderParallel();
+            markComplete(vs, res);
             return res;
           },
           onRetry: (next, max) => {
-            pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${next}/${max}` };
+            for (const x of vs) {
+              pstate[x] = { ...pstate[x], stage: 'Retrying', overall: 0, message: `attempt ${next}/${max}` };
+            }
             renderParallel();
           },
         });
       } catch (err) {
-        pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+        for (const x of vs) {
+          pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
+        }
         renderParallel();
-        return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+        return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
       }
     }
 
+    const groups = podGroups(variants, sc);
     let settled;
     try {
       settled = await Promise.all(
         // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
-        variants.map((v, i) =>
-          new Promise((r) => setTimeout(r, i * 4000)).then(() => runVariant(v))
+        groups.map((g, i) =>
+          new Promise((r) => setTimeout(r, i * 4000)).then(() => runGroup(g))
         )
       );
     } finally {
