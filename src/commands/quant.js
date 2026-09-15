@@ -757,7 +757,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       const handle = resumeFrom?.get(v);
       if (handle) {
         try {
-          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs) });
+          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs), sc });
           markComplete(vs, res);
           return res;
         } catch (err) {

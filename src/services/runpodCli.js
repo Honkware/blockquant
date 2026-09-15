@@ -31,7 +31,33 @@ const RE = {
   // The controller's one-line reason for a run that produced nothing. Without
   // this the user gets "exited 1 with no uploads", which says nothing.
   jobError: /\[joberror\]\s*(.+)/,
+  // Self-calibration. Match only the vocabulary quant.py emits -- "[sc] <stage>
+  // ...", "[sc] <stage> done -> file", "[sc] <stage>: <elapsed>s <text>". The
+  // text after the colon is turboderp's and changes with every EXLLAMAV3_REF
+  // bump (the vendor manifest exists because those files move), so it is shown
+  // and never parsed.
+  scStageDone: /\[sc\]\s*(sc_\w+)\s+done\s*->/,
+  scBeat: /\[sc\]\s*(sc_\w+):\s*(?:(\d+)s\s*)?(.*)/,
+  scStage: /\[sc\]\s*(sc_\w+)\s*\.\.\./,
+  scDonor: /\[sc\]\s*donor\s*(.+)/,
 };
+
+// What each self-calibration stage is worth, as a share of the SC band. Not
+// equal quarters: measured on a 0.8B, sc_trace ran 25.5 min and sc_measure
+// 16.3, while the probe took 12 seconds and sc_optimize 4. Weighting them
+// evenly would park the bar at 25% for most of an hour.
+const SC_WEIGHTS = { sc_trace: 0.60, sc_rfn_probe: 0.01, sc_measure: 0.38, sc_optimize: 0.01 };
+const SC_ORDER = ['sc_trace', 'sc_rfn_probe', 'sc_measure', 'sc_optimize'];
+
+// Fraction of the SC phase complete once `stage` has finished, plus whatever of
+// the running one we can claim. Stages report no internal percent, so a running
+// stage contributes nothing until it lands -- the elapsed counter in the message
+// is what shows it is alive.
+export function scProgress(doneStages) {
+  let f = 0;
+  for (const st of SC_ORDER) if (doneStages.has(st)) f += SC_WEIGHTS[st];
+  return Math.min(1, f);
+}
 
 /**
  * Decide whether a failed controller run is worth re-spawning a pod for. ONLY a
@@ -208,7 +234,7 @@ export function runViaCli({
       return reject(err);
     }
 
-    resolve(attachToCli(handle, { variants, onProgress }));
+    resolve(attachToCli(handle, { variants, onProgress, sc }));
   });
 }
 
@@ -223,7 +249,9 @@ export function runViaCli({
  * is monotonic, so re-reading a log from the top replays to the right state
  * rather than jittering the bar backwards.
  */
-export function attachToCli(handle, { variants, onProgress }) {
+// `sc` only widens the progress bands; a resumed job that does not pass it
+// still renders, just on the plain split.
+export function attachToCli(handle, { variants, onProgress, sc = false }) {
   return new Promise((resolve, reject) => {
     const total = variants.length;
     const results = new Map(); // bpw -> url
@@ -234,6 +262,7 @@ export function attachToCli(handle, { variants, onProgress }) {
     let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
+    const scDone = new Set();   // self-calibration stages that have landed
     let jobError = '';       // last [joberror] line, reported instead of the exit code
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
@@ -242,10 +271,16 @@ export function attachToCli(handle, { variants, onProgress }) {
     // ever knocking the bar backward.
     const report = (message) => {
       let overall;
+      // A self-calibrated job spends most of its life before the converter
+      // starts, so the quantize band has to make room for it. A plain quant
+      // keeps the old split -- it must not stall at 15 waiting for a phase
+      // that never comes.
+      const qLow = sc ? 55 : 25;
       switch (stage) {
         case 'Provisioning': overall = 4; break;
-        case 'Downloading':  overall = 4 + Math.round((curDownloadPct / 100) * 21); break;
-        case 'Quantizing':   overall = 25 + Math.round((curQuantPct / 100) * 65); break;
+        case 'Downloading':  overall = 4 + Math.round((curDownloadPct / 100) * (sc ? 11 : 21)); break;
+        case 'Calibrating':  overall = 15 + Math.round(scProgress(scDone) * 40); break;
+        case 'Quantizing':   overall = qLow + Math.round((curQuantPct / 100) * (90 - qLow)); break;
         case 'Uploading':    overall = 95; break;
         case 'Complete':     overall = 100; break;
         default:             overall = 0;
@@ -278,6 +313,26 @@ export function attachToCli(handle, { variants, onProgress }) {
         try { samples.set(m[1], Buffer.from(m[2], 'base64').toString('utf8')); }
         catch { /* ignore a malformed marker */ }
         return;
+      }
+      if ((m = RE.scStageDone.exec(line))) {
+        scDone.add(m[1]);
+        stage = 'Calibrating';
+        return report(`${m[1]} done`);
+      }
+      if ((m = RE.scBeat.exec(line))) {
+        stage = 'Calibrating';
+        // Elapsed is the liveness signal and survives upstream changing its
+        // output; the tail is shown as-is and trimmed for the embed.
+        const el = m[2] ? `${Math.round(Number(m[2]) / 60)}m · ` : '';
+        return report(`${m[1]} · ${el}${(m[3] || '').trim().slice(0, 60)}`);
+      }
+      if ((m = RE.scStage.exec(line))) {
+        stage = 'Calibrating';
+        return report(`${m[1]} ...`);
+      }
+      if ((m = RE.scDonor.exec(line))) {
+        stage = 'Calibrating';
+        return report(`donor ${m[1].trim().slice(0, 60)}`);
       }
       if ((m = RE.quantProgress.exec(line))) {
         // pct is layer/total*100 (global, monotonic). "(preparing)" lines have
