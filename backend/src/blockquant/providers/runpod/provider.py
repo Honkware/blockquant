@@ -149,7 +149,8 @@ class RunPodProvider(Provider):
 
     @staticmethod
     def recommend_container_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 120
+        model_id: str, variants, token: str = "", floor_gb: int = 120,
+        sc: bool = False,
     ) -> int:
         """Size the local-NVMe container disk for the SERIAL pipeline. remote/
         quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
@@ -162,6 +163,12 @@ class RunPodProvider(Provider):
           + base_gb * max_bpw/16          largest single work dir (~one output)
           + kl_rows*seq_len*vocab*2        fp16 logits staged for the KL eval
           + 30                             OS + torch/deps + scratch
+
+        Self-calibration adds a donor quant (another output-sized download) and
+        its working set -- the packed calibration rows, the measurement JSON and
+        a recipe per bitrate. The measurement is the big one: it is a per-tensor
+        record, tens of MB, but the trace at 250x2048 tokens and the donor are
+        real. Budget the donor plus 20 GB rather than pretend the stages are free.
 
         Falls back generously when the HF lookups fail; never below floor_gb.
         """
@@ -180,6 +187,10 @@ class RunPodProvider(Provider):
         vocab = RunPodProvider._base_vocab(model_id, token) or 200000
         kl = 32 * 2048 * vocab * 2 / 1024**3
         needed = base_gb + out + work + kl + 30.0
+        if sc:
+            # Donor is a quant of this model, so it is output-sized; the trace,
+            # measurement and recipes are small next to it but not nothing.
+            needed += out + 20.0
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------

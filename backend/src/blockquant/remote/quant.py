@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -294,6 +295,83 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
+def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
+                   head_bits: int, cal_rows: int, cal_cols: int) -> tuple[Path, Path]:
+    """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
+
+    Four of turboderp's scripts in order, each a subprocess so a crash in one
+    is a stage failure rather than something that takes this process with it.
+    Every coupling below cost a pod to discover -- see backend/scripts/
+    sc_chain_smoke.py, which runs the same sequence small:
+
+      - sc_measure's -tr takes sc_trace's -co (packed safetensors), NOT its -o
+        (the qbench trace JSON). Hand it the JSON and it falls back to the
+        bundled corpus without saying so, which optimizes the quant against the
+        wrong distribution.
+      - donor_dir must be a quant of THIS model. sc_rfn_probe walks both module
+        trees together, and sc_measure runs the donor's trace through this
+        model's embedding, so a foreign tokenizer indexes out of range.
+      - cal_rows/cal_cols must match what the conversion will ask for. convert
+        crops the file to its own --cal_rows x --cal_cols and refuses anything
+        smaller, so the caller passes one pair to both.
+      - A stage is judged on the artifact it leaves. sc_measure can write its
+        output and still exit non-zero.
+    """
+    sc = _selfcal_dir()
+    if sc is None:
+        raise RuntimeError("vendored selfcal scripts not found on this pod")
+    work_root.mkdir(parents=True, exist_ok=True)
+    trace = work_root / "trace.json"
+    cal = work_root / "cal.safetensors"
+    rfn = work_root / "rfn.json"
+    measure = work_root / "measure.json"
+    recipe = work_root / f"recipe-{bpw}.yaml"
+
+    def stage(name: str, args: list[str], produces: Path) -> None:
+        # Resume: every one of these is expensive and all of them can be
+        # re-entered, so a retried job does not redo what already landed.
+        if produces.exists() and produces.stat().st_size > 0:
+            print(f"[sc] {name} already done -> {produces.name}", flush=True)
+            return
+        print(f"[sc] {name} ...", flush=True)
+        r = subprocess.run([sys.executable, str(sc / f"{name}.py"), *args],
+                           cwd=str(sc), capture_output=True, text=True)
+        tail = "\n".join((r.stdout or "").splitlines()[-12:])
+        if tail.strip():
+            print(tail, flush=True)
+        if not (produces.exists() and produces.stat().st_size > 0):
+            err = "\n".join((r.stderr or "").splitlines()[-12:])
+            raise RuntimeError(f"sc stage {name} produced no {produces.name} "
+                               f"(exit {r.returncode}): {err}")
+
+    stage("sc_trace", ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
+                       "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
+    stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
+                           "-o", str(rfn)], rfn)
+    stage("sc_measure", ["-m", str(model_dir), "-o", str(measure), "--streaming",
+                         "-tr", str(cal)], measure)
+    stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
+                          "-rr", str(rfn), "-o", str(recipe)], recipe)
+    return recipe, cal
+
+
+def _selfcal_dir() -> Path | None:
+    """Where the vendored selfcal tree is, whichever layout this is running in.
+
+    The pod flattens this file to /opt/blockquant/quant.py (baked, then
+    overwritten with the current one) or /root/quant.py, so the repo's
+    blockquant/remote/quant.py -> blockquant/selfcal relationship does not hold
+    there. Getting it wrong is silent: the import fails into a best-effort
+    handler and the number it was going to produce just never appears.
+    """
+    for cand in (Path(__file__).parent / "selfcal",
+                 Path(__file__).parent.parent / "selfcal",
+                 Path("/opt/blockquant/selfcal")):
+        if (cand / "sc_measure.py").is_file():
+            return cand
+    return None
+
+
 def _kl_kernel_usable() -> bool:
     """Whether exllamav3's CUDA compute_kl_div can be trusted on this image.
 
@@ -346,20 +424,11 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer
-        # The pod flattens this file to /opt/blockquant/quant.py (baked) or
-        # /root/quant.py (SFTP'd), so the repo's blockquant/remote/quant.py ->
-        # blockquant/selfcal relationship does not hold there. Try the layouts
-        # rather than one of them: getting it wrong fails the import, which the
-        # handler below swallows, and a card just quietly loses its KL number.
-        for _cand in (Path(__file__).parent / "selfcal",
-                      Path(__file__).parent.parent / "selfcal",
-                      Path("/opt/blockquant/selfcal")):
-            if (_cand / "eval" / "qbench" / "measure.py").is_file():
-                sys.path.insert(0, str(_cand))
-                break
-        else:
+        _sc = _selfcal_dir()
+        if _sc is None:
             print("[kl] WARN vendored qbench not found; no KL this run", flush=True)
             return None, ""
+        sys.path.insert(0, str(_sc))
         from eval.qbench.measure import DiffStats, save_reference_row, print_stats
         from eval.qbench.data import QCache, get_test_rows, save_tensors
     except Exception as e:
@@ -858,6 +927,16 @@ def main() -> int:
         # that subtree is fetched: the one that prompted this had 433 GB across
         # BF16/FP8/GGUF/NVFP4 and we pulled all of it to quantize one.
         subfolder: str = (cfg.get("subfolder") or "").strip().strip("/")
+        # Self-calibration. donor_repo is a quant OF THIS MODEL at >= the
+        # bitrate being built -- sc_rfn_probe and sc_measure both fail on a
+        # foreign one, in two different ways. The bot resolves it before the
+        # job starts; nothing here goes looking.
+        sc: bool = bool(cfg.get("sc", False))
+        donor_repo: str = (cfg.get("donor_repo") or "").strip()
+        # One pair drives sc_trace and the conversion both, because convert
+        # crops the calibration file to its own and refuses a smaller one.
+        sc_cal_rows: int = int(cfg.get("cal_rows") or 250)
+        sc_cal_cols: int = int(cfg.get("cal_cols") or 2048)
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -995,6 +1074,19 @@ def main() -> int:
                 )
             print(f"[download] model root -> {model_dir}", flush=True)
 
+        # The self-calibration donor: a quant of this model that generates the
+        # in-domain trace everything downstream is built on. Small next to the
+        # fp16, and fetched here so a failure lands before any GPU time.
+        donor_dir = None
+        if sc:
+            if not donor_repo:
+                raise ValueError("self-calibration needs a donor quant; none was given")
+            donor_dir = workspace / "donor"
+            print(f"[sc] donor {donor_repo} ...", flush=True)
+            snapshot_download(repo_id=donor_repo, local_dir=str(donor_dir),
+                              token=hf_token or None)
+            print(f"[sc] donor ready ({_dir_size_gb(donor_dir):.1f} GB)", flush=True)
+
         _sanitize_config(model_dir)
         _disable_missing_mtp(model_dir)
         _vision_preprocessor_config(model_dir)
@@ -1057,6 +1149,18 @@ def main() -> int:
                 _publish(variant, out_dir, work_dir, rec)
                 outputs.append(rec)
                 continue
+            # Self-calibration runs before the conversion and hands it a
+            # per-tensor recipe plus the model's own calibration rows. The
+            # stages are shared across every bitrate in the job -- only
+            # sc_optimize is per-bitrate -- so the expensive part (trace,
+            # probe, measure) is paid once.
+            sc_recipe = sc_cal = None
+            if sc:
+                sc_recipe, sc_cal = _run_sc_stages(
+                    model_dir, donor_dir, work_root=workspace / "selfcal",
+                    bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
+                    cal_cols=sc_cal_cols)
+
             print(f"[quantize] {variant} bpw ...", flush=True)
             old_argv = sys.argv
             argv = [
@@ -1076,16 +1180,27 @@ def main() -> int:
             # tower the arch declares validated to 6 bpw and copies the rest at
             # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
             # tracks the image, and an explicit value is how a request pins it.
+            if sc_recipe is not None:
+                # -rcp replaces the budgeted allocation from --bits/--head_bits
+                # (the recipe carries head_bits), and -cd replaces the bundled
+                # corpus. cal_rows/cal_cols must match what sc_trace generated:
+                # convert crops to its own and refuses a smaller file.
+                argv += ["-rcp", str(sc_recipe), "-cd", str(sc_cal),
+                         "--cal_rows", str(sc_cal_rows),
+                         "--cal_cols", str(sc_cal_cols)]
             if gpu_count > 1:
                 argv += ["-d", ",".join(str(i) for i in range(gpu_count))]
             if head_bits is not None:
                 argv += ["--head_bits", str(int(head_bits))]
             if vision_bits is not None:
                 argv += ["-vb", str(int(vision_bits))]
-            if cal_rows is not None:
-                argv += ["--cal_rows", str(int(cal_rows))]
-            if cal_cols is not None:
-                argv += ["--cal_cols", str(int(cal_cols))]
+            # SC already set these to match its trace; a second pair would be
+            # argparse's last-wins and could quietly disagree with the file.
+            if not sc:
+                if cal_rows is not None:
+                    argv += ["--cal_rows", str(int(cal_rows))]
+                if cal_cols is not None:
+                    argv += ["--cal_cols", str(int(cal_cols))]
             sys.argv = argv
             try:
                 args = parser.parse_args()

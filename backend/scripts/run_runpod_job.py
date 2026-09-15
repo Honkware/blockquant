@@ -203,7 +203,7 @@ _PREFERRED_GPUS = [
 ]
 
 
-def _recommend_max_price(base_gb: float | None) -> float:
+def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
     """Price cap scaled to model size, PER GPU-HOUR. The quant is compute-bound,
     so a big model finishes ~3x faster on an A100/H100 for roughly the same
     TOTAL cost, while a small model is plenty fast on the cheap tier. Tiers by
@@ -214,6 +214,11 @@ def _recommend_max_price(base_gb: float | None) -> float:
     """
     if not base_gb:
         return 1.5
+    if sc:
+        # Self-calibration is long enough that a slow cheap card costs more in
+        # hours than a fast one costs per hour. Same reasoning the size tiers
+        # already use, applied because the work is bigger rather than the model.
+        return max(1.30, _recommend_max_price(base_gb))
     if base_gb <= 20:
         return 0.80   # <= ~10B: cheap cards are fast enough
     if base_gb <= 50:
@@ -223,7 +228,8 @@ def _recommend_max_price(base_gb: float | None) -> float:
     return 2.80       # 50B+: A100 80GB / H100
 
 
-def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
+def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int,
+                   sc: bool = False) -> float:
     """Resolve --max-price into a ceiling on the POD's $/hr.
 
     RunPod bills per card, so the cap is compared against the card's rate times
@@ -234,7 +240,7 @@ def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
     names the pod, so 8 GPUs under --max-price 2 means eight cards at 25c.
     """
     if str(max_price).strip().lower() == "auto":
-        return _recommend_max_price(base_gb) * gpu_count
+        return _recommend_max_price(base_gb, sc=sc) * gpu_count
     return float(max_price)
 
 
@@ -434,6 +440,14 @@ def main():
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
+    parser.add_argument("--sc", action="store_true",
+                        help="Self-calibrated quantization: measure this model's own "
+                             "sensitivity and convert from a per-tensor recipe. Needs "
+                             "--donor-repo and --head-bits. Dense models only.")
+    parser.add_argument("--donor-repo", default="",
+                        help="An existing quant OF THIS MODEL used to generate the "
+                             "calibration trace. Must be the same model: the probe walks "
+                             "both module trees together and the trace is tokenized by it.")
     parser.add_argument("--subfolder", default="",
                         help="Subdirectory inside the repo holding the model, for repos "
                              "that ship several formats (BF16/, FP8/, ...). Only that "
@@ -497,6 +511,18 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.sc:
+        if not args.donor_repo:
+            print("[joberror] --sc needs --donor-repo: a quant of this model to "
+                  "generate the calibration trace from. Make a plain quant first.",
+                  flush=True)
+            sys.exit(2)
+        if args.head_bits is None:
+            print("[joberror] --sc needs --head-bits. The recipe carries head bits "
+                  "and they go in the published name, so there is no default to take.",
+                  flush=True)
+            sys.exit(2)
+
     # Resolve the codebook before anything reads it: the summary, the [job]
     # header and the provider all want a concrete value, not "auto".
     if args.codebook == "auto":
@@ -533,7 +559,7 @@ def main():
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
         args.container_disk = RunPodProvider.recommend_container_gb(
-            args.model, _variants, args.hf_token)
+            args.model, _variants, args.hf_token, sc=args.sc)
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
@@ -549,7 +575,7 @@ def main():
     _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
     # A ceiling on the POD, not the card: it is compared against
     # get_cost_per_hour(), which is the card's rate times --gpu-count.
-    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count)
+    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count, sc=args.sc)
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
           f"({args.gpu_count} GPU), "
           f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
@@ -590,6 +616,14 @@ def main():
         # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
         # NVL with cal_rows=250 — use that as the baseline.
         baseline_h = 3.7
+        if args.sc:
+            # Self-calibration runs three whole extra passes over the model
+            # before the conversion starts: generating 250x2048 tokens from the
+            # donor, probing per-tensor error, then perturbing and re-running
+            # every quantizable tensor twice. The multiplier is a guess -- no SC
+            # job has been timed on a real model yet -- and it is deliberately
+            # wide rather than confidently wrong.
+            baseline_h *= 4.0
         # Not scaled by --gpu-count: the baseline is a single-card measurement
         # and nobody has timed a multi-GPU convert yet, so the band reads
         # pessimistic on a multi-GPU pod rather than promising a speedup.
@@ -829,6 +863,8 @@ def main():
             hf_org=args.hf_org,
             head_bits=args.head_bits,
             subfolder=args.subfolder,
+            sc=args.sc,
+            donor_repo=args.donor_repo,
             codebook=args.codebook,
             vision_bits=args.vision_bits,
             cal_rows=cal_rows,

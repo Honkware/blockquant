@@ -103,6 +103,8 @@ export function runViaCli({
   visionBits = null,
   headBits = null,
   subfolder = null,
+  sc = false,
+  donorRepo = null,
   gpuCount = null,
   onProgress,
 }) {
@@ -143,6 +145,12 @@ export function runViaCli({
     // 8 while the bot recorded whatever the profile table said.
     if (headBits != null) args.push('--head-bits', String(headBits));
     if (subfolder) args.push('--subfolder', String(subfolder));
+    // The donor rides with the flag: run_runpod_job refuses --sc without it,
+    // because the probe and the measurement both need a quant of this model.
+    if (sc) {
+      args.push('--sc');
+      if (donorRepo) args.push('--donor-repo', String(donorRepo));
+    }
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.

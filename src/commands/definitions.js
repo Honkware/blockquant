@@ -22,6 +22,12 @@ export const commands = [
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
     )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('sc')
+        .setDescription('Self-calibrated: measure this model and convert from a per-tensor recipe. Needs head_bits')
+        .setRequired(false)
+    )
     .addStringOption((opt) =>
       opt
         .setName('subfolder')

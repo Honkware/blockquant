@@ -245,6 +245,32 @@ export async function preflight(modelUrl) {
   }
 }
 
+/**
+ * An existing quant of `modelName` at >= `minBpw`, to generate a calibration
+ * trace from, or null when there is none.
+ *
+ * Highest bitrate first: the trace is the model talking to itself, so the least
+ * damaged quant available is the one to sample from. Only plain quants are
+ * considered -- an SC quant was itself built from a trace, and calibrating on
+ * that compounds whatever the first one got wrong.
+ */
+export async function findDonorQuant(modelName, minBpw) {
+  const scriptPath = path.join(config.ROOT_DIR, 'scripts', 'find_donor.py');
+  const raw = await runPython(
+    [scriptPath, '--base', modelName, '--min-bpw', String(minBpw), '--org', config.HF_ORG || ''],
+    {
+      timeoutMs: config.HF_PREFLIGHT_TIMEOUT_MS,
+      attempts: 1,
+      retryable: false,
+      env: { HF_TOKEN: config.HF_TOKEN },
+    }
+  );
+  const line = raw.trim().split('\n').filter(Boolean).pop() ?? '{}';
+  const result = JSON.parse(line);
+  if (result.error) throw new AppError('HF_UPLOAD_FAILED', result.error);
+  return result.donor || null;
+}
+
 // ── Download ────────────────────────────────────────────────────────────────
 
 export async function downloadModel(modelUrl, onProgress) {
