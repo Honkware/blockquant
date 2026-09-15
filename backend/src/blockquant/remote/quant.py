@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 CONFIG_PATH = "/root/bq-config.json"
@@ -295,6 +297,53 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
+def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
+    """Report a running stage into the log, and return its last lines.
+
+    These stages used to run under capture_output, which meant one line at the
+    start and silence until they exited -- and the controller's stall clock
+    advances on the progress text CHANGING, so a stage outliving stall_timeout
+    looked exactly like a hung pod and got a working one terminated.
+
+    Not a straight passthrough: these are turboderp's scripts and they write
+    tqdm bars, which are carriage returns rather than lines, so this reads raw
+    and splits on both. Every fragment would be the flood the progress filter
+    exists to keep out of the log, so it emits the newest one every `every`
+    seconds. The [sc] prefix is what gets it past _PROGRESS_MARKERS.
+    """
+    keep: deque[str] = deque(maxlen=12)
+    buf = ""
+    last = time.monotonic()
+    fd = proc.stdout.fileno()
+    while True:
+        # os.read returns as soon as anything is there; a buffered read(n)
+        # would sit on a partial tqdm bar and defeat the point.
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", "replace")
+        parts = re.split(r"[\r\n]", buf)
+        buf = parts.pop()
+        for frag in parts:
+            if frag.strip():
+                keep.append(frag.strip())
+        now = time.monotonic()
+        # The live state of a tqdm bar is the UNTERMINATED fragment -- it only
+        # gets a \r once the next update lands, and a slow stage can sit on one
+        # for minutes. Reporting completed fragments only meant reporting the
+        # previous bar update, or on a stage with one long-lived bar, nothing.
+        cur = buf.strip() or (keep[-1] if keep else "")
+        if cur and now - last >= every:
+            print(f"[sc] {name}: {cur[:160]}", flush=True)
+            last = now
+    if buf.strip():
+        keep.append(buf.strip())
+    return list(keep)
+
+
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int) -> tuple[Path, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
@@ -334,15 +383,15 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
             print(f"[sc] {name} already done -> {produces.name}", flush=True)
             return
         print(f"[sc] {name} ...", flush=True)
-        r = subprocess.run([sys.executable, str(sc / f"{name}.py"), *args],
-                           cwd=str(sc), capture_output=True, text=True)
-        tail = "\n".join((r.stdout or "").splitlines()[-12:])
-        if tail.strip():
-            print(tail, flush=True)
+        proc = subprocess.Popen([sys.executable, str(sc / f"{name}.py"), *args],
+                                cwd=str(sc), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        tail = _heartbeat(proc, name)
+        rc = proc.wait()
         if not (produces.exists() and produces.stat().st_size > 0):
-            err = "\n".join((r.stderr or "").splitlines()[-12:])
             raise RuntimeError(f"sc stage {name} produced no {produces.name} "
-                               f"(exit {r.returncode}): {err}")
+                               f"(exit {rc}): " + " | ".join(tail))
+        print(f"[sc] {name} done -> {produces.name}", flush=True)
 
     stage("sc_trace", ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
                        "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
