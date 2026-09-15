@@ -250,6 +250,26 @@ def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int,
     return float(max_price)
 
 
+def _unseen_lines(prev: list[str], cur: list[str]) -> list[str]:
+    """The lines of `cur` not already printed, allowing for a slid window.
+
+    get_progress is `grep | tail -n N`, so once the filtered log passes N lines
+    the window slides and the new tail no longer STARTS WITH the old one. The
+    check here was a prefix test, which therefore failed on every poll from
+    that point on and reprinted the whole window -- 15 duplicate lines per
+    tick. It stayed hidden while almost nothing matched the progress filter;
+    adding the [sc] heartbeat put a line in every 30s and the controller log
+    went to 94 lines for 62 distinct ones.
+
+    So: find the longest overlap between the end of what we printed and the
+    start of what we just read, and print only past it.
+    """
+    for k in range(min(len(prev), len(cur)), 0, -1):
+        if prev[-k:] == cur[:k]:
+            return cur[k:]
+    return cur
+
+
 def _capable_first(base_gb: float | None, sc: bool = False) -> bool:
     """Whether to try the fastest allowed card first rather than the cheapest.
 
@@ -905,14 +925,16 @@ def main():
         print(f"      Remote script started")
 
         print(f"[5/6] Polling progress every {args.poll_interval}s...")
-        last_tail = ""
+        last_lines: list[str] = []
 
         def _print_new(tail):
-            nonlocal last_tail
-            new = tail[len(last_tail):] if tail.startswith(last_tail) else tail
-            sys.stdout.write(new if new.endswith("\n") else new + "\n")
-            sys.stdout.flush()
-            last_tail = tail
+            nonlocal last_lines
+            cur = tail.splitlines()
+            new = _unseen_lines(last_lines, cur)
+            if new:
+                sys.stdout.write("\n".join(new) + "\n")
+                sys.stdout.flush()
+            last_lines = cur
 
         outcome = poll_remote(
             provider, instance_id,
@@ -932,9 +954,9 @@ def main():
         # poll skips most of these when the run wraps up between ticks.
         try:
             final_tail = provider.get_progress(instance_id, lines=500, raw=True)
-            if final_tail and final_tail != last_tail:
-                new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
-                sys.stdout.write(new if new.endswith("\n") else new + "\n")
+            new = _unseen_lines(last_lines, final_tail.splitlines()) if final_tail else []
+            if new:
+                sys.stdout.write("\n".join(new) + "\n")
                 sys.stdout.flush()
         except Exception as e:
             print(f"      (final drain skipped: {e})", flush=True)
