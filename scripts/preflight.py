@@ -18,6 +18,22 @@ from pathlib import Path
 _ARCH_SUPPORT = Path(__file__).resolve().parent.parent / "backend" / "arch_support.json"
 
 
+def auto_vision_bits(arch: str) -> int:
+    """What --vision_bits `auto` resolves to for this architecture.
+
+    exllamav3 takes the number off the vision model's caps and falls back to 16
+    -- copy the tower whole -- for anything with no validated tower. Knowing it
+    here is what lets the published name say -V{n} without asking the requester,
+    instead of the tower state being discoverable only from config.json after
+    the upload.
+    """
+    try:
+        table = json.loads(_ARCH_SUPPORT.read_text(encoding="utf-8")).get("default_vision_bits", {})
+    except Exception:
+        return 16
+    return int(table.get(arch, 16))
+
+
 def supported_archs() -> set:
     """Arch strings from arch_support.json, or an empty set if it is unreadable.
     Empty means no gate here; the launcher checks again before renting a pod, so
@@ -145,6 +161,8 @@ def main():
                     result['error'] = (f"exllamav3 does not support the '{arch}' architecture, "
                                        f"so this model cannot be quantized to EXL3.")
                 result.update(model_facts(cfg))
+                if result.get("hasVision"):
+                    result["visionBitsAuto"] = auto_vision_bits(arch)
             except GatedRepoError:
                 result['modelExists'] = True
                 result['accessDenied'] = True
@@ -173,6 +191,8 @@ def main():
                     result['architecture'] = pick["architecture"]
                     result['archSupported'] = True
                     result.update({k: pick[k] for k in ("hasVision", "isMoe", "numExperts")})
+                    if pick["hasVision"]:
+                        result["visionBitsAuto"] = auto_vision_bits(pick["architecture"])
                 else:
                     result['archSupported'] = False
                     if usable:

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-13T18:51:47+00:00",
+  "generated_at": "2026-09-15T21:33:04+00:00",
   "exllamav3": {
     "ref": "0740edc",
     "version": "1.5.0"
@@ -70,5 +70,23 @@
     "Spark2_5ForCausalLM",
     "Step3p5ForCausalLM",
     "Step3p7ForConditionalGeneration"
-  ]
+  ],
+  "default_vision_bits": {
+    "DeepseekV4ForCausalLM": 6,
+    "Gemma4ForConditionalGeneration": 6,
+    "Gemma4UnifiedForConditionalGeneration": 6,
+    "Glm4vForConditionalGeneration": 6,
+    "Glm4vMoeForConditionalGeneration": 6,
+    "Glm5NextForConditionalGeneration": 6,
+    "MuseGlimmerForConditionalGeneration": 6,
+    "Qwen3VLForConditionalGeneration": 6,
+    "Qwen3VLMoeForConditionalGeneration": 6,
+    "Qwen3_5ForCausalLM": 6,
+    "Qwen3_5ForConditionalGeneration": 6,
+    "Qwen3_5MoeForCausalLM": 6,
+    "Qwen3_5MoeForConditionalGeneration": 6,
+    "Qwen4ExpForConditionalGeneration": 6,
+    "Step3p7ForConditionalGeneration": 6
+  },
+  "default_head_bits": 6
 }
