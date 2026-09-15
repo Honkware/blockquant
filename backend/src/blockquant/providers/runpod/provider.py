@@ -1106,8 +1106,14 @@ class RunPodProvider(Provider):
     # [progress] heartbeat or overwhelm the controller->bot stream, which left
     # the embed frozen on a 35B MoE. The [progress] line already carries the
     # quantize stage + percent, so we don't need the per-layer flood.
+    # Every phase that can run for minutes has to be in here, and not only so
+    # the embed moves: poll_remote's stall clock is driven by this string
+    # changing. A phase whose lines are all filtered out looks identical to a
+    # hung pod, so the controller terminates a healthy one at stall_timeout.
+    # Self-calibration is four such stages and the longest part of an SC job.
     _PROGRESS_MARKERS = (
         r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
+        r"\[sc\]|\[kl\]|\[backfill\]|\[card\]|\[fatal\]|"
         r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
     )
 
