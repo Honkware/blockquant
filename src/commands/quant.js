@@ -414,7 +414,9 @@ export async function handleQuant(interaction) {
     releaseRunSlot(userId);
   }
 
-  const costLine = provider === 'runpod' ? await costPreflightLine(variants.length) : '';
+  const costLine = provider === 'runpod'
+    ? await costPreflightLine(variants.length, { sc, sizeGb: flight.sizeGb })
+    : '';
 
   const requestEmbed = embeds.info(
     slot.quanter ? 'Quantization request · starting' : 'Quantization request · awaiting approval',

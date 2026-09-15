@@ -394,7 +394,8 @@ def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
 
 
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
-                   head_bits: int, cal_rows: int, cal_cols: int) -> tuple[Path, Path]:
+                   head_bits: int, cal_rows: int, cal_cols: int,
+                   timings: dict | None = None) -> tuple[Path, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
 
     Four of turboderp's scripts in order, each a subprocess so a crash in one
@@ -433,7 +434,10 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
         ok = done or (lambda p: p.stat().st_size > 0)
         if produces.exists() and ok(produces):
             print(f"[sc] {name} already done -> {produces.name}", flush=True)
+            if timings is not None:
+                timings[name] = 0.0   # reused, not run
             return
+        _t0 = time.monotonic()
         print(f"[sc] {name} ...", flush=True)
         # -u, because these scripts print without flush=True and their stdout
         # here is a pipe: Python block-buffers it, so a quiet stage's output
@@ -449,7 +453,14 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
         if not (produces.exists() and ok(produces)):
             raise RuntimeError(f"sc stage {name} left no usable {produces.name} "
                                f"(exit {rc}): " + " | ".join(tail))
-        print(f"[sc] {name} done -> {produces.name}", flush=True)
+        _el = time.monotonic() - _t0
+        if timings is not None:
+            timings[name] = round(_el, 1)
+        # Timed because every estimate of this so far has been a guess, and each
+        # one was wrong: the cost band multiplies a 35B baseline by 4, which no
+        # measured SC run has ever justified. Recorded per run so the estimate
+        # can be fitted from real jobs instead.
+        print(f"[sc] {name} done -> {produces.name} ({_el / 60:.1f}m)", flush=True)
 
     stage("sc_trace", ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
                        "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
@@ -1327,13 +1338,15 @@ def main() -> int:
             # sc_optimize is per-bitrate -- so the expensive part (trace,
             # probe, measure) is paid once.
             sc_recipe = sc_cal = None
+            sc_timings: dict = {}
             if sc:
                 sc_recipe, sc_cal = _run_sc_stages(
                     model_dir, donor_dir, work_root=workspace / "selfcal",
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
-                    cal_cols=sc_cal_cols)
+                    cal_cols=sc_cal_cols, timings=sc_timings)
 
             print(f"[quantize] {variant} bpw ...", flush=True)
+            _t_quant = time.time()
             old_argv = sys.argv
             argv = [
                 "convert",
@@ -1470,8 +1483,17 @@ def main() -> int:
                 sys.stdout = _old_stdout
                 _q_done.set()
                 _qt.join(timeout=2)
-            print(f"[quantize] {variant} complete", flush=True)
+            _quant_secs = round(time.time() - _t_quant, 1)
+            print(f"[quantize] {variant} complete ({_quant_secs / 60:.1f}m)", flush=True)
             rec = {"variant": variant, "path": str(out_dir)}
+            # Shipped in the result so the cost estimate has something to fit.
+            # A flat per-variant band cannot describe a job whose two longest
+            # stages are bound by different things -- sc_trace on the GPU,
+            # sc_measure on the CPU.
+            if sc:
+                rec["_sc_timings"] = dict(sc_timings)
+                rec["_sc_cal"] = {"rows": sc_cal_rows, "cols": sc_cal_cols}
+            rec["_quantize_secs"] = _quant_secs
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
                 stats, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)

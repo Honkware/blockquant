@@ -68,6 +68,28 @@ def model_facts(cfg: dict) -> dict:
     }
 
 
+def _weight_gb(model_id: str, token: str, subfolder: str = "") -> float:
+    """Total weight-file size in GB, or 0 when it cannot be read.
+
+    The bot needs this before a pod exists: the cost band was a flat per-variant
+    number that knew nothing about the model, so a 0.8B and a 70B quoted the
+    same figure. Only the weights count -- tokenizer and config files are noise
+    at this scale.
+    """
+    try:
+        from huggingface_hub import HfApi
+        total = 0
+        for e in HfApi().list_repo_tree(model_id, token=token or None,
+                                        path_in_repo=subfolder or None, recursive=True):
+            if type(e).__name__ != "RepoFile":
+                continue
+            if e.path.endswith((".safetensors", ".bin", ".pt", ".gguf")):
+                total += getattr(e, "size", 0) or 0
+        return round(total / (1024 ** 3), 2)
+    except Exception:
+        return 0.0
+
+
 def _top_level_dirs(model_id: str, token: str) -> list:
     """Directory names at the repo root, for telling someone where to look."""
     try:
@@ -161,6 +183,7 @@ def main():
                     result['error'] = (f"exllamav3 does not support the '{arch}' architecture, "
                                        f"so this model cannot be quantized to EXL3.")
                 result.update(model_facts(cfg))
+                result["sizeGb"] = _weight_gb(args.model, token)
                 if result.get("hasVision"):
                     result["visionBitsAuto"] = auto_vision_bits(arch)
             except GatedRepoError:
