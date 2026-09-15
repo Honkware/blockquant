@@ -114,16 +114,19 @@ def test_the_stages_run_unbuffered(heartbeat):
     because 8K had not accumulated. sc_trace printed enough to keep flushing
     and hid the problem.
     """
-    src = SRC.read_text()
-    for node in ast.walk(ast.parse(src)):
+    # Scoped to _run_sc_stages: quant.py has another Popen (the self-terminate
+    # backstop, python -c) that this must not grade.
+    runner = next((n for n in ast.walk(ast.parse(SRC.read_text()))
+                   if isinstance(n, ast.FunctionDef) and n.name == "_run_sc_stages"), None)
+    assert runner, "_run_sc_stages is gone from quant.py"
+    for node in ast.walk(runner):
         if (isinstance(node, ast.Call)
                 and getattr(getattr(node.func, "value", None), "id", "") == "subprocess"
                 and getattr(node.func, "attr", "") == "Popen"):
-            argv = node.args[0]
-            flags = [e.value for e in argv.elts if isinstance(e, ast.Constant)]
+            flags = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant)]
             assert "-u" in flags, f"sc stages launched buffered: {flags}"
             return
-    pytest.fail("no subprocess.Popen in quant.py")
+    pytest.fail("no subprocess.Popen inside _run_sc_stages")
 
 
 def test_the_last_lines_survive_for_the_error_message(heartbeat):
