@@ -250,6 +250,16 @@ def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int,
     return float(max_price)
 
 
+def _capable_first(base_gb: float | None, sc: bool = False) -> bool:
+    """Whether to try the fastest allowed card first rather than the cheapest.
+
+    The sweep and the two lines that announce it read this, because they said
+    different things for a while: the banner reported cheapest-first on an SC
+    job that was in fact sweeping capable-first.
+    """
+    return bool(sc or (base_gb and base_gb > 25))
+
+
 def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
                   sc: bool = False) -> list[str]:
     """GPU type ids with at least min_vram_gb, ordered by how much work this is.
@@ -300,7 +310,7 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
     # Big model (> ~25 GB download, ~12B+) or a self-calibrated one -> capable-
     # first: sort by price (then VRAM) DESCENDING so the fastest allowed card is
     # tried first, falling back to cheaper ones. Otherwise cheapest/smallest.
-    big = bool(sc or (base_gb and base_gb > 25))
+    big = _capable_first(base_gb, sc)
     cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
     return [gid for _, gid in cards]
 
@@ -593,7 +603,7 @@ def main():
     args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count, sc=args.sc)
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
           f"({args.gpu_count} GPU), "
-          f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
+          f"{'capable-first' if _capable_first(_base_gb, args.sc) else 'cheapest-first'}", flush=True)
 
     # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
     # is rented and the weights are pulled. The image is whatever the bot pinned
@@ -689,7 +699,7 @@ def main():
         if not gpu_candidates:
             print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
             sys.exit(1)
-        _order = "capable first" if (args.sc or (_base_gb and _base_gb > 25)) else "cheapest first"
+        _order = "capable first" if _capable_first(_base_gb, args.sc) else "cheapest first"
         print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, {_order}")
     else:
         gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
