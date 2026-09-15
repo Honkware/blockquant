@@ -209,6 +209,11 @@ export async function handleQuant(interaction) {
   // to make the requester state it by hand; preflight resolves the arch default
   // off the generated table now, so it names itself.
   const effVisionBits = visionBits ?? (flight.hasVision ? flight.visionBitsAuto : null);
+  // SC has to pin head bits rather than leave them to the converter: the name
+  // states them, and run_runpod_job refuses --sc without them for that reason.
+  // Resolving this only for the name left the flag unsent and every SC job from
+  // Discord died at launch unless the requester happened to type a number.
+  const effHeadBits = sc ? headBits ?? defaultHeadBits() : headBits;
   // Pinning the tower to the number the arch already picks says nothing the
   // plain name does not, and would publish a -V6 beside an identical unsuffixed
   // build. Drop it back to auto so both spellings land on one repo.
@@ -244,14 +249,14 @@ export async function handleQuant(interaction) {
       for (const bpw of bpws) {
         const repoName = exl3RepoName(modelName, bpw, {
           sc,
-          headBits: sc ? headBits ?? defaultHeadBits() : null,
+          headBits: sc ? effHeadBits : null,
           visionBits: sc ? effVisionBits : towerBits,
         });
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           bpw,
           hasVision: flight.hasVision,
-          quantOptions: { headBits, visionBits: towerBits },
+          quantOptions: { headBits: effHeadBits, visionBits: towerBits },
         });
         precheckedRepos[String(bpw)] = state;
         // config_missing is a repo whose config.json could not be read -- an
@@ -382,7 +387,7 @@ export async function handleQuant(interaction) {
       sc,
       donorRepo,
       visionBits: towerBits,
-      headBits,
+      headBits: effHeadBits,
       subfolder,
       categories: [category],
       provider,
@@ -406,7 +411,7 @@ export async function handleQuant(interaction) {
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
       subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
-      `**Head bits:** ${headBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
+      `**Head bits:** ${effHeadBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,

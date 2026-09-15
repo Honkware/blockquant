@@ -148,6 +148,15 @@ export function runViaCli({
     // The donor rides with the flag: run_runpod_job refuses --sc without it,
     // because the probe and the measurement both need a quant of this model.
     if (sc) {
+      // run_runpod_job refuses --sc without head bits, because the recipe
+      // carries them and the published name states them. Say so here instead
+      // of building an argv that dies a minute later on the launcher: the
+      // caller resolving head bits for the name but not passing them is what
+      // that looked like, and the error named the flag, not the caller.
+      if (headBits == null) {
+        reject(new Error('runViaCli: sc needs headBits -- the name states them, so they cannot be left to the converter'));
+        return;
+      }
       args.push('--sc');
       if (donorRepo) args.push('--donor-repo', String(donorRepo));
     }
