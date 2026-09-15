@@ -710,7 +710,8 @@ def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
 
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                    head_bits, cal_rows, codebook, model_dir) -> None:
+                    head_bits, cal_rows, codebook, model_dir,
+                    name_parts: dict | None = None) -> None:
     """Render each variant's card with the full cross-variant table and push
     README.md to its repo. Runs after the serial upload+delete, so the out_dir
     is gone -- sizes/KL come from the recs and the card goes up via the API."""
@@ -738,7 +739,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
 
     for o in outputs:
-        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"], **(name_parts or {}))
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
@@ -935,6 +936,11 @@ def main() -> int:
         donor_repo: str = (cfg.get("donor_repo") or "").strip()
         # One pair drives sc_trace and the conversion both, because convert
         # crops the calibration file to its own and refuses a smaller one.
+        # What the published name carries. A plain quant leaves its defaults
+        # unstated; SC states head bits always and the tower when it was
+        # quantized, matching what turboderp publishes.
+        name_parts = {"sc": sc, "head_bits": head_bits, "vision_bits": vision_bits} if sc \
+            else ({"vision_bits": vision_bits} if vision_bits else {})
         sc_cal_rows: int = int(cfg.get("cal_rows") or 250)
         sc_cal_cols: int = int(cfg.get("cal_cols") or 2048)
         # Calibration tunables — fewer rows trades quality for speed.
@@ -1117,7 +1123,10 @@ def main() -> int:
             rec["_vision_bits"] = _qc.get("vision_bits")
             if not hf_token:
                 return
-            repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
+            # Build the name, never format it here: an SC quant under the
+            # plain name would collide with the plain quant of the same
+            # bitrate, which is the one thing the suffixes exist to stop.
+            repo_id = cards.exl3_repo_id(owner, model_name, variant, **name_parts)
             print(f"[upload] {variant} -> {repo_id} ...", flush=True)
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
             _upload_folder_hb(api, str(out_dir), repo_id, variant)
@@ -1355,7 +1364,8 @@ def main() -> int:
             # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
                 _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                                head_bits, cal_rows, codebook, model_dir)
+                                head_bits, cal_rows, codebook, model_dir,
+                                name_parts=name_parts)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an
