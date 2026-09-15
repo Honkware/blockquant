@@ -227,6 +227,14 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     return n_params_b * bpw / 8.0 + 1.5
 
 
+def _mode_label(row: dict) -> str:
+    """How one row differs from a plain quant at its bitrate."""
+    hb = row.get("head_bits")
+    mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
+    vb = quantized_vision_bits(row.get("vision_bits"))
+    return f"{mode}&nbsp;V{vb}" if vb else mode
+
+
 def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0,
                        current_repo_id: str | None = None) -> str:
     """Render the Quants table.
@@ -242,7 +250,10 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     # Mode only earns a column once a family holds more than one kind. A plain
     # 4.0 and a self-calibrated 4.0 are different weights under the same number,
     # so without it the table would show two rows that look like duplicates.
-    has_mode = any(r.get("sc") or r.get("vision_bits") for r in rows)
+    # A VL family where every row reads "plain V6" is not more than one kind --
+    # that was a whole column restating one fact on every line.
+    modes = [_mode_label(r) for r in rows]
+    has_mode = any(r.get("sc") for r in rows) or len(set(modes)) > 1
     # Head bits and calibration rows are the same down every row and the recipe
     # table below states them for this repo, so the columns only added width.
     header = (
@@ -282,10 +293,7 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         bpw_cell = f"**{v}**" if is_current else v
         mode_cell = ""
         if has_mode:
-            hb = row.get("head_bits")
-            mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
-            if row.get("vision_bits"):
-                mode += f"&nbsp;V{row['vision_bits']}"
+            mode = _mode_label(row)
             mode_cell = f" **{mode}** |" if is_current else f" {mode} |"
         kl_cell = ""
         if has_kl:

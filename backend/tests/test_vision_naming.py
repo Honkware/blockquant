@@ -75,3 +75,31 @@ def test_a_plain_quant_states_only_what_was_pinned():
     # pinned to fp16: still not a quantized tower
     f = _name_parts_for(sc=False, head_bits=None, vision_bits=16)
     assert f({"_head_bits": 6, "_vision_bits": None}) == {}
+
+
+def test_the_mode_column_calls_a_self_calibrated_quant_sc():
+    mk = lambda v, sc, rid: {"variant": v, "head_bits": 6, "vision_bits": 6, "sc": sc,
+                             "repo_id": rid, "size_gb": 0.5, "url": "u", "kl_div": 0.01}
+    t = cards.build_quants_table(
+        [mk("4.0", False, "o/m-exl3-4.0bpw"), mk("3.0", True, "o/m-exl3-SC-3.0bpw-H6-V6")],
+        "3.0", current_repo_id="o/m-exl3-SC-3.0bpw-H6-V6")
+    assert "SC&nbsp;H6&nbsp;V6" in t
+    assert "plain&nbsp;V6" in t
+
+
+def test_a_column_that_says_one_thing_on_every_row_is_not_drawn():
+    mk = lambda v: {"variant": v, "head_bits": 6, "vision_bits": 6, "sc": False,
+                    "repo_id": f"o/m-exl3-{v}bpw", "size_gb": 0.5, "url": "u"}
+    assert "Mode" not in cards.build_quants_table([mk("4.0"), mk("5.0")], "4.0")
+
+
+def test_the_card_rows_carry_the_sc_flag_the_column_reads():
+    # build_quants_table read row["sc"] correctly; _finalize_cards never put it
+    # there, so every SC card would have called itself plain.
+    tree = ast.parse(SRC.read_text())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "quant_rows"):
+            keys = {k.value for k in node.value.elt.keys if isinstance(k, ast.Constant)}
+            assert "sc" in keys, f"quant_rows builds {sorted(keys)} -- no sc"
+            return
+    pytest.fail("no quant_rows in quant.py")

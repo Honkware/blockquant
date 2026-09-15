@@ -728,6 +728,9 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
         "cal_rows": o.get("_cal_rows", cal_rows),
         "vision_bits": o.get("_vision_bits"),
+        # Without this the Mode column calls a self-calibrated quant "plain",
+        # which is the one distinction the column exists to draw.
+        "sc": bool((o.get("_name_parts") or {}).get("sc")),
         "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(
             owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "size_gb": o.get("_size_gb"),
