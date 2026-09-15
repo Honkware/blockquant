@@ -1229,6 +1229,7 @@ def main() -> int:
             owner = hf_org or api.whoami()["name"]
 
         def _name_parts_for(rec: dict) -> dict:
+            import cards
             """Name the artifact from what the converter wrote, not what we asked for.
 
             The request is an intent and can be vague -- head bits unset means
@@ -1250,6 +1251,13 @@ def main() -> int:
             return {"vision_bits": vb} if vb else {}
 
         def _publish(variant, out_dir, work_dir, rec):
+            # Own import, like _finalize_cards and _backfill_sibling_kl. main()
+            # imports cards further down, which makes the name a local of main
+            # -- so a nested function reading it gets an unassigned free
+            # variable and NameErrors at the upload, after the whole quant is
+            # built. quant.py cannot import it at module scope: in the repo it
+            # is blockquant.cards, on the pod it is flat beside this file.
+            import cards
             # Serial: upload one variant and free its disk before the next, so
             # peak = model + one output + one work dir + one kl-stage, not the
             # sum over all variants. rmtree only AFTER a confirmed upload -- on
