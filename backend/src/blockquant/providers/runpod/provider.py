@@ -992,6 +992,8 @@ class RunPodProvider(Provider):
         hf_org: str = "",
         head_bits: int | None = None,
         subfolder: str = "",
+        sc: bool = False,
+        donor_repo: str = "",
         vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
@@ -1030,6 +1032,10 @@ class RunPodProvider(Provider):
             "hf_org": hf_org,
             "head_bits": head_bits,
             "subfolder": subfolder or "",
+            # Self-calibration, and the quant of this model it calibrates
+            # through. quant.py refuses --sc without the donor.
+            "sc": bool(sc),
+            "donor_repo": donor_repo or "",
             "vision_bits": vision_bits,
             "codebook": codebook,
             "pod_id": instance_id,
@@ -1038,9 +1044,8 @@ class RunPodProvider(Provider):
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
-            # Carried for the remote side, which does not read it yet:
-            # exllamav3's convert defaults to --devices 0, so the extra cards on
-            # a multi-GPU pod sit idle until quant.py passes this through.
+            # exllamav3's convert defaults to --devices 0, so without this the
+            # extra cards on a multi-GPU pod sit idle and bill.
             "gpu_count": self.gpu_count,
         }
         if cal_rows is not None:
