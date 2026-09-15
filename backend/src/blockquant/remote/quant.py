@@ -297,6 +297,14 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
+def _has_results(p: Path) -> bool:
+    """True once sc_measure's streamed output actually holds measurements."""
+    try:
+        return bool(json.loads(p.read_text(encoding="utf-8")).get("results"))
+    except Exception:
+        return False
+
+
 def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
     """Report a running stage into the log, and return its last lines.
 
@@ -376,10 +384,13 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
     measure = work_root / "measure.json"
     recipe = work_root / f"recipe-{bpw}.yaml"
 
-    def stage(name: str, args: list[str], produces: Path) -> None:
+    def stage(name: str, args: list[str], produces: Path, done=None) -> None:
         # Resume: every one of these is expensive and all of them can be
         # re-entered, so a retried job does not redo what already landed.
-        if produces.exists() and produces.stat().st_size > 0:
+        # `done` is for a stage that creates its file up front and fills it in
+        # as it goes -- existence there means "started", not "finished".
+        ok = done or (lambda p: p.stat().st_size > 0)
+        if produces.exists() and ok(produces):
             print(f"[sc] {name} already done -> {produces.name}", flush=True)
             return
         print(f"[sc] {name} ...", flush=True)
@@ -388,8 +399,8 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
                                 stderr=subprocess.STDOUT)
         tail = _heartbeat(proc, name)
         rc = proc.wait()
-        if not (produces.exists() and produces.stat().st_size > 0):
-            raise RuntimeError(f"sc stage {name} produced no {produces.name} "
+        if not (produces.exists() and ok(produces)):
+            raise RuntimeError(f"sc stage {name} left no usable {produces.name} "
                                f"(exit {rc}): " + " | ".join(tail))
         print(f"[sc] {name} done -> {produces.name}", flush=True)
 
@@ -397,8 +408,13 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
                        "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
     stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
                            "-o", str(rfn)], rfn)
+    # --streaming writes the header and an empty "results" before it measures
+    # anything, so the file exists seconds in and stays that way for the whole
+    # stage. On size alone a resumed job skips the measurement entirely and a
+    # crash halfway reads as success -- either way sc_optimize builds a recipe
+    # from nothing and the quant is silently optimized against it.
     stage("sc_measure", ["-m", str(model_dir), "-o", str(measure), "--streaming",
-                         "-tr", str(cal)], measure)
+                         "-tr", str(cal)], measure, done=_has_results)
     stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
                           "-rr", str(rfn), "-o", str(recipe)], recipe)
     return recipe, cal
