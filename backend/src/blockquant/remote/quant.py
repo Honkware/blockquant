@@ -877,7 +877,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     } for o in outputs]
 
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
+    collection_url = cards.collection_url_for(owner=owner, base_name=model_name, token=hf_token)
 
     for o in outputs:
         repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(
@@ -1018,8 +1018,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         model_config = {}
     rows_cal = int(cal_rows) if cal_rows else 250
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(owner=owner, base_name=model_name,
-                                             token=hf_token)
+    collection_url = cards.collection_url_for(owner=owner, base_name=model_name,
+                                              token=hf_token)
     quant_rows = [{
         "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
         "vision_bits": d.get("vision_bits"), "repo_id": d["repo"],

@@ -428,6 +428,16 @@ def add_to_collection(slug: str, repo_id: str, token: str) -> None:
         pass
 
 
+def collection_url_for(*, owner: str, base_name: str, token: str) -> str:
+    """The model's collection URL, creating the collection if it is not there.
+
+    Adds nothing to it. The card needs a URL at render time and the callers that
+    only want one were calling ensure_collection with no item_repo_ids, which
+    reads as though it files the repos and does not.
+    """
+    return ensure_collection(owner=owner, base_name=base_name, token=token)
+
+
 def ensure_collection(
     *, owner: str, base_name: str, token: str, item_repo_ids: list[str] | None = None
 ) -> str:
