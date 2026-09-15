@@ -106,6 +106,11 @@ export function runViaCli({
   sc = false,
   donorRepo = null,
   gpuCount = null,
+  // Leaves the pod up on BOTH paths, so a crash after the conversion keeps the
+  // finished quant reachable for rescue_upload.py. Not a Discord option: the
+  // controller normally terminates on failure, which is right for unattended
+  // jobs and wrong when you are watching one you expect to break.
+  keepPod = false,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -164,6 +169,7 @@ export function runViaCli({
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.
     if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
+    if (keepPod) args.push('--keep-pod');
     // Unset sends no --cal-rows, so the converter uses its own 250x2048. This
     // passed 250 unconditionally, which is the same number but pinned it.
     if (calRows != null) args.push('--cal-rows', String(calRows));

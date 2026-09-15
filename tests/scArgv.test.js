@@ -36,3 +36,12 @@ describe('self-calibration argv', () => {
     expect(h.args).not.toContain('--donor-repo');
   });
 });
+
+describe("keep-pod passthrough", () => {
+  it("sends the flag only when asked", () => {
+    runViaCli({ modelId: "o/m", variants: ["4.0"] });
+    expect(h.args).not.toContain("--keep-pod");
+    runViaCli({ modelId: "o/m", variants: ["4.0"], keepPod: true });
+    expect(h.args).toContain("--keep-pod");
+  });
+});
