@@ -298,12 +298,43 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
-def _has_results(p: Path) -> bool:
-    """True once sc_measure's streamed output actually holds measurements."""
+def _rfn_count(rfn_path: Path) -> int:
+    """How many tensors sc_rfn_probe found, or 0 if unreadable."""
     try:
-        return bool(json.loads(p.read_text(encoding="utf-8")).get("results"))
+        d = json.loads(rfn_path.read_text(encoding="utf-8"))
+        if isinstance(d, dict):
+            # Key presence, not truthiness: an empty results list means the
+            # probe found nothing, which is 0 -- an `or` chain falls through it
+            # and returns the length of the wrapper dict instead.
+            for k in ("results", "tensors"):
+                if k in d:
+                    return len(d[k])
+        return len(d)
+    except Exception:
+        return 0
+
+
+def _measured_all(measure_path: Path, rfn_path: Path) -> bool:
+    """True once sc_measure has a result for EVERY tensor the probe found.
+
+    Non-empty is not enough. sc_measure streams results and resumes from a
+    partial file on its own, so a crash at tensor 50 of 151 leaves a file that
+    reads as finished and hands sc_optimize a measurement covering a third of
+    the model -- which it will happily build a recipe from. The probe walks the
+    same module tree immediately beforehand, so its entry count is the expected
+    total: 151 and 151 on the first real run.
+
+    Unreadable rfn.json means no expected count, so fall back to re-running the
+    stage rather than trusting a number we do not have.
+    """
+    exp = _rfn_count(rfn_path)
+    if not exp:
+        return False
+    try:
+        res = json.loads(measure_path.read_text(encoding="utf-8")).get("results") or []
     except Exception:
         return False
+    return len(res) >= exp
 
 
 def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
@@ -430,7 +461,8 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
     # crash halfway reads as success -- either way sc_optimize builds a recipe
     # from nothing and the quant is silently optimized against it.
     stage("sc_measure", ["-m", str(model_dir), "-o", str(measure), "--streaming",
-                         "-tr", str(cal)], measure, done=_has_results)
+                         "-tr", str(cal)], measure,
+          done=lambda p: _measured_all(p, rfn))
     stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
                           "-rr", str(rfn), "-o", str(recipe)], recipe)
     return recipe, cal

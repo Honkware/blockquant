@@ -19,39 +19,77 @@ import pytest
 SRC = Path(__file__).resolve().parent.parent / "src/blockquant/remote/quant.py"
 
 
+WANT = ("_rfn_count", "_measured_all")
+
+
 @pytest.fixture
-def has_results():
+def mod():
     tree = ast.parse(SRC.read_text())
     body = [n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "_has_results"]
-    assert body, "_has_results is gone from quant.py"
+            if isinstance(n, ast.FunctionDef) and n.name in WANT]
+    assert len(body) == len(WANT), f"missing from quant.py: {WANT}"
     ns = {"json": json, "Path": Path}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SRC), "exec"), ns)
-    return ns["_has_results"]
+    return ns
+
+
+@pytest.fixture
+def done(mod, tmp_path):
+    """done(measure_obj, n_rfn) -> the predicate's verdict."""
+    def run(measure_obj, n_rfn=151):
+        m = tmp_path / "measure.json"
+        r = tmp_path / "rfn.json"
+        m.write_text(measure_obj if isinstance(measure_obj, str) else json.dumps(measure_obj))
+        r.write_text(json.dumps({"results": [{"key": f"t{i}"} for i in range(n_rfn)]}))
+        return mod["_measured_all"](m, r)
+    return run
 
 
 HEADER = {"model": "/m", "rows": 10, "length": 1024, "mode": "iid", "results": []}
 
 
-def test_the_header_sc_measure_writes_first_is_not_a_finished_stage(has_results, tmp_path):
-    f = tmp_path / "measure.json"
-    f.write_text(json.dumps(HEADER))
-    assert f.stat().st_size > 0      # what the old check looked at
-    assert not has_results(f)        # what it actually means
+def _measured(n):
+    return {**HEADER, "results": [{"key": f"t{i}", "rfn": 0.07} for i in range(n)]}
 
 
-def test_a_measurement_with_results_is_done(has_results, tmp_path):
-    f = tmp_path / "measure.json"
-    f.write_text(json.dumps({**HEADER, "results": [{"key": "blk.0.attn_q", "rfn": 0.07}]}))
-    assert has_results(f)
+def test_the_header_sc_measure_writes_first_is_not_a_finished_stage(done):
+    assert not done(HEADER)
+
+
+def test_a_partial_measurement_is_not_a_finished_stage(done):
+    # The one non-empty made look finished. sc_measure resumes from a partial
+    # file by design, so this is a normal crash state, not an exotic one --
+    # and sc_optimize will build a recipe from a third of the model.
+    assert not done(_measured(50))
+
+
+def test_a_complete_measurement_is_done(done):
+    # 151 of 151: the counts the first real SC run produced.
+    assert done(_measured(151))
+
+
+def test_more_results_than_expected_is_still_done(done):
+    assert done(_measured(151), n_rfn=140)
 
 
 @pytest.mark.parametrize("content", ["", "{", '{"results": null}', "not json"])
-def test_an_unreadable_or_truncated_file_is_not_done(has_results, tmp_path, content):
+def test_an_unreadable_or_truncated_file_is_not_done(done, content):
     # A stage killed mid-write leaves exactly this.
-    f = tmp_path / "measure.json"
-    f.write_text(content)
-    assert not has_results(f)
+    assert not done(content)
+
+
+def test_an_empty_probe_means_re_run_not_trust(done):
+    # With no expected count there is nothing to check against, so the stage
+    # has to run again rather than be assumed complete. An `or` chain read the
+    # empty list as missing and returned the wrapper dict's length, 1, which
+    # any non-empty measurement clears.
+    assert not done(_measured(151), n_rfn=0)
+
+
+def test_a_missing_probe_means_re_run_not_trust(mod, tmp_path):
+    m = tmp_path / "measure.json"
+    m.write_text(json.dumps(_measured(151)))
+    assert not mod["_measured_all"](m, tmp_path / "nope.json")
 
 
 def test_sc_measure_is_the_stage_that_gets_the_content_check():
