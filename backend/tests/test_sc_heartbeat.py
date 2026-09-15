@@ -105,6 +105,27 @@ def test_every_beat_differs_even_when_the_stage_says_nothing_new(heartbeat, caps
     assert all("row 0" in b for b in beats), beats
 
 
+def test_the_stages_run_unbuffered(heartbeat):
+    """A quiet stage has to be launched with -u or the heartbeat sees nothing.
+
+    turboderp's scripts print without flush=True, and their stdout here is a
+    pipe, so Python block-buffers. sc_measure printed "Reference pass" and then
+    nothing for 13 minutes of saturated CPU -- not because it was silent, but
+    because 8K had not accumulated. sc_trace printed enough to keep flushing
+    and hid the problem.
+    """
+    src = SRC.read_text()
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call)
+                and getattr(getattr(node.func, "value", None), "id", "") == "subprocess"
+                and getattr(node.func, "attr", "") == "Popen"):
+            argv = node.args[0]
+            flags = [e.value for e in argv.elts if isinstance(e, ast.Constant)]
+            assert "-u" in flags, f"sc stages launched buffered: {flags}"
+            return
+    pytest.fail("no subprocess.Popen in quant.py")
+
+
 def test_the_last_lines_survive_for_the_error_message(heartbeat):
     proc = _run("import sys\nsys.stdout.write('boom: no such file\\n')")
     tail = heartbeat(proc, "sc_measure", every=0)

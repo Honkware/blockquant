@@ -404,7 +404,13 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
             print(f"[sc] {name} already done -> {produces.name}", flush=True)
             return
         print(f"[sc] {name} ...", flush=True)
-        proc = subprocess.Popen([sys.executable, str(sc / f"{name}.py"), *args],
+        # -u, because these scripts print without flush=True and their stdout
+        # here is a pipe: Python block-buffers it, so a quiet stage's output
+        # sits in an 8K buffer for the whole run and the heartbeat has nothing
+        # to report. sc_trace prints enough to keep filling the buffer and
+        # looked fine; sc_measure printed "Reference pass" and went dark for
+        # 13 minutes.
+        proc = subprocess.Popen([sys.executable, "-u", str(sc / f"{name}.py"), *args],
                                 cwd=str(sc), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         tail = _heartbeat(proc, name)
