@@ -408,8 +408,11 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         model.load()
         try:
             for i, seq in enumerate(seqs):
+                # batch_shape is the cache's geometry, not the input's -- the
+                # real length comes from input_ids -- and attn.py asserts the
+                # seq len is a page multiple, so it takes the rounded value.
                 params = {"attn_mode": "flash_attn", "cache": cache,
-                          "past_len": 0, "batch_shape": (1, row_len)}
+                          "past_len": 0, "batch_shape": (1, cache_len)}
                 logits = model.forward(seq, params=params)
                 on_row(i, logits)
         finally:
