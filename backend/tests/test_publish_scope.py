@@ -54,6 +54,34 @@ def test_every_nested_helper_that_uses_cards_imports_it():
         f"local, so these NameError at call time -- after the quant is built")
 
 
+def test_no_nested_helper_relies_on_a_name_main_imports():
+    """The same trap for every name, not just `cards`.
+
+    Any `import X` in main()'s body makes X a local of main for the whole
+    function. A nested helper reading X therefore gets a free variable that is
+    unassigned until that line runs -- and these helpers are called from the
+    middle of main, long before its tail. The rule is simply: if you use a name
+    main imports, import it yourself.
+    """
+    main = _main_fn()
+    imported = {a.asname or a.name.split(".")[0]
+                for n in ast.walk(main) if isinstance(n, ast.Import) for a in n.names}
+    bad = []
+    for node in main.body:
+        for fn in ast.walk(node):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            own = {a.asname or a.name.split(".")[0]
+                   for n in ast.walk(fn) if isinstance(n, ast.Import) for a in n.names}
+            used = {n.id for n in ast.walk(fn)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+            for name in sorted(used & imported - own):
+                bad.append(f"{fn.name} reads {name}")
+    assert not bad, (
+        "nested helpers read names main() imports, so they resolve to unassigned "
+        f"locals at call time: {bad}")
+
+
 def test_the_scoping_really_does_raise():
     """Proves the hazard rather than asserting it: same shape, run for real."""
     src = (

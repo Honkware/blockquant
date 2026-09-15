@@ -597,6 +597,18 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
                           "past_len": 0, "batch_shape": (1, cache_len)}
                 logits = model.forward(seq, params=params)
                 on_row(i, logits)
+                # A hybrid/linear-attn model takes a recurrent state slot per
+                # forward: with no "recurrent_states" in params, exllamav3
+                # allocates from the cache's pool and this fresh dict per row
+                # means it never comes back. The pool is max_batch_size, 16 by
+                # default, and kl_rows is 40 -- so row 17 died on "Cannot
+                # create new state: no available slots" and the job published
+                # with no KL number. Rows are independent (past_len 0), so
+                # hand the slots back after each one.
+                try:
+                    cache.reset_states()
+                except AttributeError:
+                    pass
         finally:
             try:
                 model.unload()
