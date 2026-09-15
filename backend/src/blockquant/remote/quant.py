@@ -728,9 +728,11 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
         "cal_rows": o.get("_cal_rows", cal_rows),
         "vision_bits": o.get("_vision_bits"),
-        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"]),
+        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "size_gb": o.get("_size_gb"),
-        "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
+        "url": o.get("hf_url") or "https://huggingface.co/" + cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "kl_div": o.get("kl_div"),
         "kl_method": o.get("kl_method"),
     } for o in outputs]
@@ -739,7 +741,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
 
     for o in outputs:
-        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"], **(name_parts or {}))
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or name_parts or {}))
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
@@ -936,9 +939,9 @@ def main() -> int:
         donor_repo: str = (cfg.get("donor_repo") or "").strip()
         # One pair drives sc_trace and the conversion both, because convert
         # crops the calibration file to its own and refuses a smaller one.
-        # What the published name carries. A plain quant leaves its defaults
-        # unstated; SC states head bits always and the tower when it was
-        # quantized, matching what turboderp publishes.
+        # What the published name carries, for anything that needs it before a
+        # conversion exists. Once one does, _name_parts_for reads it back off
+        # the written config instead -- see there.
         name_parts = {"sc": sc, "head_bits": head_bits, "vision_bits": vision_bits} if sc \
             else ({"vision_bits": vision_bits} if vision_bits else {})
         sc_cal_rows: int = int(cfg.get("cal_rows") or 250)
@@ -1109,6 +1112,27 @@ def main() -> int:
             # bare slugs without a namespace.
             owner = hf_org or api.whoami()["name"]
 
+        def _name_parts_for(rec: dict) -> dict:
+            """Name the artifact from what the converter wrote, not what we asked for.
+
+            The request is an intent and can be vague -- head bits unset means
+            "whatever exllamav3 picks", vision bits unset means "whatever the
+            arch does", and 16 means "copy the tower", which is not a tower
+            bitrate at all. The written quantization_config is the fact: it
+            carries head_bits always and vision_bits only when the tower was
+            quantized. Naming off the request published SC quants as -V16 for
+            towers that were copied, and dropped the -V6 off ones that were.
+
+            A plain quant still states nothing it did not choose, so it takes
+            the suffix only when the requester pinned the tower themselves.
+            """
+            if sc:
+                return {"sc": True,
+                        "head_bits": rec.get("_head_bits", head_bits),
+                        "vision_bits": rec.get("_vision_bits")}
+            vb = cards.quantized_vision_bits(vision_bits)
+            return {"vision_bits": vb} if vb else {}
+
         def _publish(variant, out_dir, work_dir, rec):
             # Serial: upload one variant and free its disk before the next, so
             # peak = model + one output + one work dir + one kl-stage, not the
@@ -1121,12 +1145,15 @@ def main() -> int:
             rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
             # Present only when the tower was quantized; that is the signal.
             rec["_vision_bits"] = _qc.get("vision_bits")
+            # Settle the name here, where the conversion is on disk to read, so
+            # the card pass and the manifest cannot derive a different one.
+            rec["_name_parts"] = _name_parts_for(rec)
             if not hf_token:
                 return
             # Build the name, never format it here: an SC quant under the
             # plain name would collide with the plain quant of the same
             # bitrate, which is the one thing the suffixes exist to stop.
-            repo_id = cards.exl3_repo_id(owner, model_name, variant, **name_parts)
+            repo_id = cards.exl3_repo_id(owner, model_name, variant, **rec["_name_parts"])
             print(f"[upload] {variant} -> {repo_id} ...", flush=True)
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
             _upload_folder_hb(api, str(out_dir), repo_id, variant)

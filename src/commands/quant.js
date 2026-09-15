@@ -13,6 +13,7 @@ import * as quantizer from '../services/quantizer.js';
 import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
+import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
@@ -74,6 +75,14 @@ function approvalButtons(jobId) {
  * running immediately. The actual quantization runs from runApprovedJob once
  * an admin clicks Approve (see approval.js).
  */
+// What the tower gets, in the terms the requester cares about -- a bitrate or
+// an untouched copy. Which of the two came from the arch and which they typed
+// is not interesting once it is settled.
+function visionSummary(flight, bits) {
+  if (!flight.hasVision) return 'none';
+  return bits >= 1 && bits <= 8 ? `${bits} bpw` : 'fp16, copied';
+}
+
 export async function handleQuant(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -85,19 +94,19 @@ export async function handleQuant(interaction) {
   // Trellis codebook. Recorded in the quant itself, so it decides which
   // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
   const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
-  // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
-  // tower whole, so the same request gives a different artifact now. fp16 is
-  // the way back.
   const sc = interaction.options.getBoolean('sc') ?? false;
+  // Omitted means exllamav3 decides, and its default is NOT a flat 6: it is the
+  // tower's own declared default_vision_bits, 6 on the arches with a validated
+  // tower and 16 -- copy it whole -- everywhere else. 1.4.9 is where that split
+  // appeared; older builds copied every tower, so the same request gives a
+  // different artifact now, and 16 is the way back. preflight resolves which
+  // off the generated table, so the name can say -V6 without asking.
   const visionBits = interaction.options.getInteger('vision_bits');
   // Only for repos that keep their model in a subdirectory. Preflight picks it
   // on its own when there is exactly one unquantized candidate, so this is the
   // tie-breaker, not the normal path.
   const subfolderOpt = (interaction.options.getString('subfolder') || '').trim().replace(/^\/+|\/+$/g, '');
-  // Omitted means exllamav3 decides. Note its default is NOT a flat 6: it is
-  // the tower's own declared default_vision_bits, which is 6 on the six
-  // validated arches (qwen3_vl, gemma4, glm4v, step3_7, deepseek_v4_vision,
-  // muse_glimmer) and 16 everywhere else. Tracking that beats copying it.
+  // Omitted means exllamav3 decides.
   const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
@@ -195,21 +204,15 @@ export async function handleQuant(interaction) {
       embeds: [embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`)],
     });
   }
-  // Under SC the name carries the tower state, so it has to be known before the
-  // job runs -- inspectUploadRepo checks the final name up front. A plain quant
-  // can leave it to the arch because its name says nothing either way.
-  if (sc && flight.hasVision && visionBits === null) {
-    return interaction.editReply({
-      embeds: [
-        embeds.error(
-          'Self-calibration needs the vision tower stated',
-          'This model has a vision tower, and a self-calibrated name says whether it ' +
-            'was quantized (`-V{n}`) or copied whole (no suffix). Pass `vision_bits`: ' +
-            '**16** copies it, **1-8** quantizes it.'
-        ),
-      ],
-    });
-  }
+  // Under SC the name carries the tower state, so it has to be settled before
+  // the job runs -- inspectUploadRepo checks the final name up front. This used
+  // to make the requester state it by hand; preflight resolves the arch default
+  // off the generated table now, so it names itself.
+  const effVisionBits = visionBits ?? (flight.hasVision ? flight.visionBitsAuto : null);
+  // Pinning the tower to the number the arch already picks says nothing the
+  // plain name does not, and would publish a -V6 beside an identical unsuffixed
+  // build. Drop it back to auto so both spellings land on one repo.
+  const towerBits = visionBits !== null && visionBits === flight.visionBitsAuto ? null : visionBits;
 
   // Preflight resolves this when the repo has one obvious source; an explicit
   // option wins so someone can quant the FP8 copy if they really mean to.
@@ -239,12 +242,16 @@ export async function handleQuant(interaction) {
   if (format === 'exl3') {
     try {
       for (const bpw of bpws) {
-        const repoName = exl3RepoName(modelName, bpw);
+        const repoName = exl3RepoName(modelName, bpw, {
+          sc,
+          headBits: sc ? headBits ?? defaultHeadBits() : null,
+          visionBits: sc ? effVisionBits : towerBits,
+        });
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           bpw,
           hasVision: flight.hasVision,
-          quantOptions: { headBits, visionBits },
+          quantOptions: { headBits, visionBits: towerBits },
         });
         precheckedRepos[String(bpw)] = state;
         // config_missing is a repo whose config.json could not be read -- an
@@ -374,7 +381,7 @@ export async function handleQuant(interaction) {
       codebook,
       sc,
       donorRepo,
-      visionBits,
+      visionBits: towerBits,
       headBits,
       subfolder,
       categories: [category],
@@ -399,7 +406,7 @@ export async function handleQuant(interaction) {
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
       subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
-      `**Head bits:** ${headBits ?? 6}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
+      `**Head bits:** ${headBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,

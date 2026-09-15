@@ -31,6 +31,21 @@ def exl3_variant(bpw) -> str:
     return s + "0" if s.endswith(".") else s
 
 
+def quantized_vision_bits(vision_bits) -> int | None:
+    """The tower bits a name should carry, or None when it carries nothing.
+
+    A request says 16 to mean "copy the tower whole", and the converter records
+    no vision_bits at all for that -- two spellings of the same fact. Callers
+    got this wrong in both directions (a -V16 that claims a quantized tower it
+    does not have, an auto run that drops the -V6 it does), so normalize once
+    here instead of at each call site.
+    """
+    if vision_bits is None:
+        return None
+    n = int(vision_bits)
+    return n if 1 <= n <= 8 else None
+
+
 def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
                    head_bits: int | None = None, vision_bits: int | None = None) -> str:
     """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
@@ -50,7 +65,8 @@ def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
         raise ValueError("A self-calibrated quant must name its head bits")
     v = exl3_variant(variant)
     core = f"SC-{v}bpw-H{int(head_bits)}" if sc else f"{v}bpw"
-    vis = f"-V{int(vision_bits)}" if vision_bits else ""
+    vb = quantized_vision_bits(vision_bits)
+    vis = f"-V{vb}" if vb else ""
     return f"{base_name}-exl3-{core}{vis}"
 
 
