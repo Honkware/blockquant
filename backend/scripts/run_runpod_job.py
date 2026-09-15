@@ -40,7 +40,13 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
 # TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
 # RunPod GPU id.
-_BLACKWELL_EXCLUDE = ("B200", "B300")
+# Matched as substrings of the RunPod GPU id. "Blackwell" covers the whole RTX
+# PRO family; the GeForce ones carry no such marker and need naming. Do NOT
+# shorten these to "50" -- RTX 5000 Ada and RTX PRO 5000 are Ada sm_89 and run
+# fine. This listed only B200/B300 while claiming to cover sm_120, which went
+# unnoticed because a 5090 at $0.94 sat above the small-model cap and was never
+# reached; SC raises the cap to $1.30 AND sorts capable-first, which reaches it.
+_BLACKWELL_EXCLUDE = ("B200", "B300", "Blackwell", "RTX 5090", "RTX 5080")
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
@@ -244,13 +250,22 @@ def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int,
     return float(max_price)
 
 
-def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
-    """GPU type ids with at least min_vram_gb, ordered by the model size.
+def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
+                  sc: bool = False) -> list[str]:
+    """GPU type ids with at least min_vram_gb, ordered by how much work this is.
 
     Small models go cheapest-first (cheap cards quantize them fast). Big models
     are compute-bound and would crawl on a cheap card, so they go capable-first
     (priciest within the cap) and fall back to cheaper cards on a stock-out, so
     they finish far faster for ~the same total cost without ever getting stuck.
+
+    Self-calibration counts as big whatever the model is, because the work is
+    big rather than the model: sc_trace generates cal_rows x cal_cols tokens
+    through the donor before a single weight is quantized -- 31 minutes of it
+    on a 3090 for a 0.8B model. _recommend_max_price already floors the SC cap
+    at $1.30 on exactly this reasoning, but the ordering here did not know
+    about SC, so on a small model it still took the cheapest card and the
+    raised cap bought nothing.
     """
     from blockquant.providers.runpod.pricing import static_price
     import runpod
@@ -282,10 +297,10 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
         if gid in _WEAK_FOR_QUANT:
             continue
         cards.append((mem, gid))
-    # Big model (> ~25 GB download, ~12B+) -> capable-first: sort by price (then
-    # VRAM) DESCENDING so the fastest allowed card is tried first, falling back
-    # to cheaper ones. Small model -> cheapest/smallest first.
-    big = bool(base_gb and base_gb > 25)
+    # Big model (> ~25 GB download, ~12B+) or a self-calibrated one -> capable-
+    # first: sort by price (then VRAM) DESCENDING so the fastest allowed card is
+    # tried first, falling back to cheaper ones. Otherwise cheapest/smallest.
+    big = bool(sc or (base_gb and base_gb > 25))
     cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
     return [gid for _, gid in cards]
 
@@ -669,11 +684,13 @@ def main():
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
-        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb)
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb,
+                                       sc=args.sc)
         if not gpu_candidates:
             print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
             sys.exit(1)
-        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, cheapest first")
+        _order = "capable first" if (args.sc or (_base_gb and _base_gb > 25)) else "cheapest first"
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, {_order}")
     else:
         gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
