@@ -434,7 +434,12 @@ def _sc_cache_key(model_id: str, model_rev: str, donor_repo: str,
         "cal_rows": int(cal_rows),
         "cal_cols": int(cal_cols),
         "exllamav3": exl,
-        "schema": 1,
+        # The noise model the measurement was taken under. measure.json from an
+        # iid run and one from a shaped run are not interchangeable -- the whole
+        # point of the change is that they disagree -- so a cache written before
+        # this must not be restored over it.
+        "noise": "shaped+rfn_ref",
+        "schema": 2,
     }
 
 
@@ -578,8 +583,27 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
     # so it exists seconds in and keeps that shape for the whole stage. On size
     # alone a resumed job would skip the measurement and a crash halfway would
     # read as success, and sc_optimize would build the recipe from nothing.
+    # --shaped and -rr are not optional extras, they are how this is meant to
+    # be run. The script's own help calls shaped "recommended", and its header
+    # says the iid default carries a median 1.95x KL overestimate with strong
+    # per-type structure, up to 5.8x on v_proj -- "the bias is almost entirely
+    # the missing LDLQ error shaping". A recipe fitted to that bias protects
+    # the wrong tensors. Shaped noise reuses the quantizer's own Hessians, so
+    # damping, sign flips, block Hadamard and the block-16 LDL match conversion
+    # byte for byte.
+    #
+    # -rr is what sc_rfn_probe exists for: per-tensor noise anchored to the
+    # real error of an actual quant of this model, overriding the one global
+    # --rfn pair. We were generating rfn.json, handing it to sc_optimize, and
+    # never giving it to the measurement that needed it -- so every tensor was
+    # probed at the same 0.29/0.145 regardless of how it actually quantizes.
+    #
+    # Measured consequence, on Qwen3.5-0.8B at 3.0bpw against a plain quant of
+    # the same bitrate and head/vision bits: SC came out at 0.1200 median KL
+    # against plain's 0.0782. Worse, from a pipeline that ran clean.
     stage("sc_measure", ["-m", str(model_dir), "-o", str(measure),
-                         "--load-mode", "auto", "-tr", str(cal)], measure,
+                         "--load-mode", "auto", "-tr", str(cal),
+                         "--shaped", "-rr", str(rfn)], measure,
           done=lambda p: _measured_all(p, rfn))
     stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
                           "-rr", str(rfn), "-o", str(recipe)], recipe)
