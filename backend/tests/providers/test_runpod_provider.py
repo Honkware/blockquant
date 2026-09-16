@@ -679,7 +679,9 @@ def test_get_cost_per_hour_static_fallback_on_error(mock_ensure, mock_ssh_key):
         gpu_type="NVIDIA H100 80GB HBM3",
         ssh_key_path=str(mock_ssh_key),
     )
-    assert provider.get_cost_per_hour() == 1.99
+    # The static fallback is the SECURE rate, so it has to track what the card
+    # really bills: this one lists at $3.49, not the $1.99 carried before.
+    assert provider.get_cost_per_hour() == 3.49
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +739,11 @@ def test_get_cost_per_hour_unknown_gpu(mock_ensure, mock_ssh_key):
         gpu_type="NVIDIA Imaginary GPU",
         ssh_key_path=str(mock_ssh_key),
     )
-    assert provider.get_cost_per_hour() == 2.00
+    # An unrecognised card is priced high, not at $2.00. The old default sat
+    # below the high-end tier, so an unlisted expensive card -- "NVIDIA H200
+    # NVL", whose id is not "NVIDIA H200" -- cleared a $2.10 cap and billed
+    # $3.79/hr. Skipping a cheap new card costs nothing by comparison.
+    assert provider.get_cost_per_hour() == 9.99
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +863,7 @@ def test_cost_per_hour_static_fallback_also_covers_the_pod(mock_ensure, mock_ssh
         gpu_count=2,
         ssh_key_path=str(mock_ssh_key),
     )
-    assert provider.get_cost_per_hour() == pytest.approx(2 * 1.99)
+    assert provider.get_cost_per_hour() == pytest.approx(2 * 3.49)
 
 
 @patch("blockquant.providers.runpod.provider._ensure_runpod")

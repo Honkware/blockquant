@@ -149,7 +149,8 @@ class RunPodProvider(Provider):
 
     @staticmethod
     def recommend_container_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 120
+        model_id: str, variants, token: str = "", floor_gb: int = 120,
+        sc: bool = False,
     ) -> int:
         """Size the local-NVMe container disk for the SERIAL pipeline. remote/
         quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
@@ -162,6 +163,12 @@ class RunPodProvider(Provider):
           + base_gb * max_bpw/16          largest single work dir (~one output)
           + kl_rows*seq_len*vocab*2        fp16 logits staged for the KL eval
           + 30                             OS + torch/deps + scratch
+
+        Self-calibration adds a donor quant (another output-sized download) and
+        its working set -- the packed calibration rows, the measurement JSON and
+        a recipe per bitrate. The measurement is the big one: it is a per-tensor
+        record, tens of MB, but the trace at 250x2048 tokens and the donor are
+        real. Budget the donor plus 20 GB rather than pretend the stages are free.
 
         Falls back generously when the HF lookups fail; never below floor_gb.
         """
@@ -180,6 +187,10 @@ class RunPodProvider(Provider):
         vocab = RunPodProvider._base_vocab(model_id, token) or 200000
         kl = 32 * 2048 * vocab * 2 / 1024**3
         needed = base_gb + out + work + kl + 30.0
+        if sc:
+            # Donor is a quant of this model, so it is output-sized; the trace,
+            # measurement and recipes are small next to it but not nothing.
+            needed += out + 20.0
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------
@@ -981,6 +992,8 @@ class RunPodProvider(Provider):
         hf_org: str = "",
         head_bits: int | None = None,
         subfolder: str = "",
+        sc: bool = False,
+        donor_repo: str = "",
         vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
@@ -1019,6 +1032,10 @@ class RunPodProvider(Provider):
             "hf_org": hf_org,
             "head_bits": head_bits,
             "subfolder": subfolder or "",
+            # Self-calibration, and the quant of this model it calibrates
+            # through. quant.py refuses --sc without the donor.
+            "sc": bool(sc),
+            "donor_repo": donor_repo or "",
             "vision_bits": vision_bits,
             "codebook": codebook,
             "pod_id": instance_id,
@@ -1027,9 +1044,8 @@ class RunPodProvider(Provider):
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
-            # Carried for the remote side, which does not read it yet:
-            # exllamav3's convert defaults to --devices 0, so the extra cards on
-            # a multi-GPU pod sit idle until quant.py passes this through.
+            # exllamav3's convert defaults to --devices 0, so without this the
+            # extra cards on a multi-GPU pod sit idle and bill.
             "gpu_count": self.gpu_count,
         }
         if cal_rows is not None:
@@ -1090,8 +1106,14 @@ class RunPodProvider(Provider):
     # [progress] heartbeat or overwhelm the controller->bot stream, which left
     # the embed frozen on a 35B MoE. The [progress] line already carries the
     # quantize stage + percent, so we don't need the per-layer flood.
+    # Every phase that can run for minutes has to be in here, and not only so
+    # the embed moves: poll_remote's stall clock is driven by this string
+    # changing. A phase whose lines are all filtered out looks identical to a
+    # hung pod, so the controller terminates a healthy one at stall_timeout.
+    # Self-calibration is four such stages and the longest part of an SC job.
     _PROGRESS_MARKERS = (
         r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
+        r"\[sc\]|\[kl\]|\[backfill\]|\[card\]|\[fatal\]|"
         r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
     )
 

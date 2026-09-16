@@ -8,7 +8,9 @@
       "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_trace.py",
       "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
       "sha256": "2e53d53217611200bf02d704231c4e48639224b29cd5aad41c71e4804cd9182a",
-      "note": "Unmodified. Generates a self-sampled calibration trace (safetensors) that sc_measure.py can eval on. Imports `eval.qbench_prompts`, which is not in the exllamav3 wheel, so that module is vendored alongside it; run the script by path (python .../selfcal/sc_trace.py) so its own directory lands on sys.path."
+      "note": "Generates a self-sampled calibration trace (safetensors) that sc_measure.py can eval on. Imports `eval.qbench_prompts`, which is not in the exllamav3 wheel, so that module is vendored alongside it; run the script by path (python .../selfcal/sc_trace.py) so its own directory lands on sys.path.",
+      "local_sha256": "28d7016d78dbe8d217ea8c9ad5fb447748d320db9930b85aa23fe2538cf79990",
+      "local_patch": "Wave sizing. Upstream checks the token target only at turn-wave boundaries, and a wave is every live conversation at once, so crossing the target early in a wave still generates the whole wave: measured at 798,117 tokens for a 512,000 target on Qwen3.5-0.8B, the last wave almost all surplus. Rows are pooled, shuffled and sliced to cal_rows x cal_cols at the end, so surplus is not waste -- it is mixing -- but 1.56x is whatever wave granularity happened to give, not a chosen figure. The patch keeps a running mean of tokens per conversation and enqueues only as many of the wave's conversations as a deliberate 1.15x pool needs (over-provisioned 1.25x, since falling short costs another whole wave), picking them by stride rather than prefix because the seed set is ordered by domain. Simulated at ~1.2x generated instead of ~1.6-1.9x. Marked BLOCKQUANT LOCAL PATCH at all three sites. Drop this if upstream ever cancels in-flight jobs once the target is met."
     },
     "sc_rfn_probe.py": {
       "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_rfn_probe.py",

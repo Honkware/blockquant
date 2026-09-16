@@ -40,7 +40,13 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
 # TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
 # RunPod GPU id.
-_BLACKWELL_EXCLUDE = ("B200", "B300")
+# Matched as substrings of the RunPod GPU id. "Blackwell" covers the whole RTX
+# PRO family; the GeForce ones carry no such marker and need naming. Do NOT
+# shorten these to "50" -- RTX 5000 Ada and RTX PRO 5000 are Ada sm_89 and run
+# fine. This listed only B200/B300 while claiming to cover sm_120, which went
+# unnoticed because a 5090 at $0.94 sat above the small-model cap and was never
+# reached; SC raises the cap to $1.30 AND sorts capable-first, which reaches it.
+_BLACKWELL_EXCLUDE = ("B200", "B300", "Blackwell", "RTX 5090", "RTX 5080")
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
@@ -203,7 +209,7 @@ _PREFERRED_GPUS = [
 ]
 
 
-def _recommend_max_price(base_gb: float | None) -> float:
+def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
     """Price cap scaled to model size, PER GPU-HOUR. The quant is compute-bound,
     so a big model finishes ~3x faster on an A100/H100 for roughly the same
     TOTAL cost, while a small model is plenty fast on the cheap tier. Tiers by
@@ -214,6 +220,24 @@ def _recommend_max_price(base_gb: float | None) -> float:
     """
     if not base_gb:
         return 1.5
+    if sc:
+        # Self-calibration is long enough that a slow cheap card costs more in
+        # hours than a fast one costs per hour. Same reasoning the size tiers
+        # already use, applied because the work is bigger rather than the model.
+        #
+        # Above the small tier it buys two specific things. sc_trace generates
+        # cal_rows x cal_cols tokens through the donor and is bound by memory
+        # bandwidth; sc_measure falls back to a CPU-bound streaming path unless
+        # the fp16 model fits resident in VRAM, which on the 0.8B run meant 13
+        # cores for 16 minutes. $2.10 is what reaches an H100 80GB HBM3 ($1.99)
+        # or an H200 NVL ($2.00, 143 GB) at today's prices -- roughly twice the
+        # bandwidth of the A100 the $1.80 tier topped out at, and enough VRAM to
+        # keep a 50 GB model off the streaming path. About 11% more per hour for
+        # a stage that should take appreciably less than half as long.
+        base = _recommend_max_price(base_gb)
+        if not base_gb or base_gb <= 20:
+            return max(1.30, base)
+        return max(2.10, base)
     if base_gb <= 20:
         return 0.80   # <= ~10B: cheap cards are fast enough
     if base_gb <= 50:
@@ -223,7 +247,8 @@ def _recommend_max_price(base_gb: float | None) -> float:
     return 2.80       # 50B+: A100 80GB / H100
 
 
-def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
+def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int,
+                   sc: bool = False) -> float:
     """Resolve --max-price into a ceiling on the POD's $/hr.
 
     RunPod bills per card, so the cap is compared against the card's rate times
@@ -234,17 +259,77 @@ def _pod_price_cap(max_price, base_gb: float | None, gpu_count: int) -> float:
     names the pod, so 8 GPUs under --max-price 2 means eight cards at 25c.
     """
     if str(max_price).strip().lower() == "auto":
-        return _recommend_max_price(base_gb) * gpu_count
+        return _recommend_max_price(base_gb, sc=sc) * gpu_count
     return float(max_price)
 
 
-def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) -> list[str]:
-    """GPU type ids with at least min_vram_gb, ordered by the model size.
+def _unseen_lines(prev: list[str], cur: list[str]) -> list[str]:
+    """The lines of `cur` not already printed, allowing for a slid window.
+
+    get_progress is `grep | tail -n N`, so once the filtered log passes N lines
+    the window slides and the new tail no longer STARTS WITH the old one. The
+    check here was a prefix test, which therefore failed on every poll from
+    that point on and reprinted the whole window -- 15 duplicate lines per
+    tick. It stayed hidden while almost nothing matched the progress filter;
+    adding the [sc] heartbeat put a line in every 30s and the controller log
+    went to 94 lines for 62 distinct ones.
+
+    So: find the longest overlap between the end of what we printed and the
+    start of what we just read, and print only past it.
+    """
+    for k in range(min(len(prev), len(cur)), 0, -1):
+        if prev[-k:] == cur[:k]:
+            return cur[k:]
+    return cur
+
+
+def _sc_min_vram(base_gb: float | None, floor: int) -> int:
+    """VRAM a self-calibrated job should insist on, not merely prefer.
+
+    sc_measure keeps the fp16 weights resident when they fit and otherwise
+    walks one module at a time with the states in system RAM -- the CPU-bound
+    path, 13 cores for 16 minutes on a model 30x smaller than this floor is
+    aimed at. So a card too small to hold the model does not just run slower,
+    it runs a different algorithm.
+
+    That makes falling back to a smaller card a bad trade rather than a partial
+    one: better to keep sweeping for a big one, which is what raising the floor
+    does -- small cards stop being candidates at all. 1.25x covers activations
+    for the measurement rows on top of the weights.
+
+    Only ever raises the floor, and only when the size is known.
+    """
+    if not base_gb:
+        return floor
+    return max(floor, int(base_gb * 1.25) + 1)
+
+
+def _capable_first(base_gb: float | None, sc: bool = False) -> bool:
+    """Whether to try the fastest allowed card first rather than the cheapest.
+
+    The sweep and the two lines that announce it read this, because they said
+    different things for a while: the banner reported cheapest-first on an SC
+    job that was in fact sweeping capable-first.
+    """
+    return bool(sc or (base_gb and base_gb > 25))
+
+
+def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
+                  sc: bool = False) -> list[str]:
+    """GPU type ids with at least min_vram_gb, ordered by how much work this is.
 
     Small models go cheapest-first (cheap cards quantize them fast). Big models
     are compute-bound and would crawl on a cheap card, so they go capable-first
     (priciest within the cap) and fall back to cheaper cards on a stock-out, so
     they finish far faster for ~the same total cost without ever getting stuck.
+
+    Self-calibration counts as big whatever the model is, because the work is
+    big rather than the model: sc_trace generates cal_rows x cal_cols tokens
+    through the donor before a single weight is quantized -- 31 minutes of it
+    on a 3090 for a 0.8B model. _recommend_max_price already floors the SC cap
+    at $1.30 on exactly this reasoning, but the ordering here did not know
+    about SC, so on a small model it still took the cheapest card and the
+    raised cap bought nothing.
     """
     from blockquant.providers.runpod.pricing import static_price
     import runpod
@@ -276,10 +361,10 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None) 
         if gid in _WEAK_FOR_QUANT:
             continue
         cards.append((mem, gid))
-    # Big model (> ~25 GB download, ~12B+) -> capable-first: sort by price (then
-    # VRAM) DESCENDING so the fastest allowed card is tried first, falling back
-    # to cheaper ones. Small model -> cheapest/smallest first.
-    big = bool(base_gb and base_gb > 25)
+    # Big model (> ~25 GB download, ~12B+) or a self-calibrated one -> capable-
+    # first: sort by price (then VRAM) DESCENDING so the fastest allowed card is
+    # tried first, falling back to cheaper ones. Otherwise cheapest/smallest.
+    big = _capable_first(base_gb, sc)
     cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
     return [gid for _, gid in cards]
 
@@ -434,6 +519,14 @@ def main():
     parser.add_argument("--hf-org", default="", help="HF org for upload")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="HF token")
     parser.add_argument("--runpod-api-key", default=os.environ.get("RUNPOD_API_KEY", ""), help="RunPod API key")
+    parser.add_argument("--sc", action="store_true",
+                        help="Self-calibrated quantization: measure this model's own "
+                             "sensitivity and convert from a per-tensor recipe. Needs "
+                             "--donor-repo and --head-bits. Dense models only.")
+    parser.add_argument("--donor-repo", default="",
+                        help="An existing quant OF THIS MODEL used to generate the "
+                             "calibration trace. Must be the same model: the probe walks "
+                             "both module trees together and the trace is tokenized by it.")
     parser.add_argument("--subfolder", default="",
                         help="Subdirectory inside the repo holding the model, for repos "
                              "that ship several formats (BF16/, FP8/, ...). Only that "
@@ -497,6 +590,18 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.sc:
+        if not args.donor_repo:
+            print("[joberror] --sc needs --donor-repo: a quant of this model to "
+                  "generate the calibration trace from. Make a plain quant first.",
+                  flush=True)
+            sys.exit(2)
+        if args.head_bits is None:
+            print("[joberror] --sc needs --head-bits. The recipe carries head bits "
+                  "and they go in the published name, so there is no default to take.",
+                  flush=True)
+            sys.exit(2)
+
     # Resolve the codebook before anything reads it: the summary, the [job]
     # header and the provider all want a concrete value, not "auto".
     if args.codebook == "auto":
@@ -533,7 +638,7 @@ def main():
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
         args.container_disk = RunPodProvider.recommend_container_gb(
-            args.model, _variants, args.hf_token)
+            args.model, _variants, args.hf_token, sc=args.sc)
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
@@ -549,10 +654,10 @@ def main():
     _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
     # A ceiling on the POD, not the card: it is compared against
     # get_cost_per_hour(), which is the card's rate times --gpu-count.
-    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count)
+    args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count, sc=args.sc)
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
           f"({args.gpu_count} GPU), "
-          f"{'capable-first' if (_base_gb and _base_gb > 25) else 'cheapest-first'}", flush=True)
+          f"{'capable-first' if _capable_first(_base_gb, args.sc) else 'cheapest-first'}", flush=True)
 
     # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
     # is rented and the weights are pulled. The image is whatever the bot pinned
@@ -590,6 +695,14 @@ def main():
         # Estimate walltime band: yesterday's run was ~3h41m on COMMUNITY
         # NVL with cal_rows=250 — use that as the baseline.
         baseline_h = 3.7
+        if args.sc:
+            # Self-calibration runs three whole extra passes over the model
+            # before the conversion starts: generating 250x2048 tokens from the
+            # donor, probing per-tensor error, then perturbing and re-running
+            # every quantizable tensor twice. The multiplier is a guess -- no SC
+            # job has been timed on a real model yet -- and it is deliberately
+            # wide rather than confidently wrong.
+            baseline_h *= 4.0
         # Not scaled by --gpu-count: the baseline is a single-card measurement
         # and nobody has timed a multi-GPU convert yet, so the band reads
         # pessimistic on a multi-GPU pod rather than promising a speedup.
@@ -635,11 +748,24 @@ def main():
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
-        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb)
+        _min_vram = _sc_min_vram(_base_gb, args.min_vram) if args.sc else args.min_vram
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
+                                       sc=args.sc)
+        if not gpu_candidates and _min_vram > args.min_vram:
+            # Nothing that big exists on the platform at all -- as opposed to
+            # being out of stock, which the launch sweep handles. Take the
+            # streaming path rather than refusing the job outright.
+            print(f"[gpu] no card holds {_base_gb:.0f}GB resident; "
+                  f"falling back to >= {args.min_vram}GB (sc_measure will stream)",
+                  flush=True)
+            _min_vram = args.min_vram
+            gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
+                                           sc=args.sc)
         if not gpu_candidates:
-            print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
+            print(f"ERROR: no GPUs with >= {_min_vram}GB VRAM found")
             sys.exit(1)
-        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, cheapest first")
+        _order = "capable first" if _capable_first(_base_gb, args.sc) else "cheapest first"
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {_min_vram}GB, {_order}")
     else:
         gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
@@ -829,6 +955,8 @@ def main():
             hf_org=args.hf_org,
             head_bits=args.head_bits,
             subfolder=args.subfolder,
+            sc=args.sc,
+            donor_repo=args.donor_repo,
             codebook=args.codebook,
             vision_bits=args.vision_bits,
             cal_rows=cal_rows,
@@ -842,14 +970,16 @@ def main():
         print(f"      Remote script started")
 
         print(f"[5/6] Polling progress every {args.poll_interval}s...")
-        last_tail = ""
+        last_lines: list[str] = []
 
         def _print_new(tail):
-            nonlocal last_tail
-            new = tail[len(last_tail):] if tail.startswith(last_tail) else tail
-            sys.stdout.write(new if new.endswith("\n") else new + "\n")
-            sys.stdout.flush()
-            last_tail = tail
+            nonlocal last_lines
+            cur = tail.splitlines()
+            new = _unseen_lines(last_lines, cur)
+            if new:
+                sys.stdout.write("\n".join(new) + "\n")
+                sys.stdout.flush()
+            last_lines = cur
 
         outcome = poll_remote(
             provider, instance_id,
@@ -869,9 +999,9 @@ def main():
         # poll skips most of these when the run wraps up between ticks.
         try:
             final_tail = provider.get_progress(instance_id, lines=500, raw=True)
-            if final_tail and final_tail != last_tail:
-                new = final_tail[len(last_tail):] if final_tail.startswith(last_tail) else final_tail
-                sys.stdout.write(new if new.endswith("\n") else new + "\n")
+            new = _unseen_lines(last_lines, final_tail.splitlines()) if final_tail else []
+            if new:
+                sys.stdout.write("\n".join(new) + "\n")
                 sys.stdout.flush()
         except Exception as e:
             print(f"      (final drain skipped: {e})", flush=True)

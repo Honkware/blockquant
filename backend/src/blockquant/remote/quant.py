@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import select
 import shutil
+import subprocess
 import sys
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 CONFIG_PATH = "/root/bq-config.json"
@@ -294,6 +298,383 @@ def _disable_missing_mtp(model_dir: Path) -> None:
         print(f"[config] no mtp.* weights present; disabled MTP: {', '.join(fixed)}", flush=True)
 
 
+def _rfn_count(rfn_path: Path) -> int:
+    """How many tensors sc_rfn_probe found, or 0 if unreadable."""
+    try:
+        d = json.loads(rfn_path.read_text(encoding="utf-8"))
+        if isinstance(d, dict):
+            # Key presence, not truthiness: an empty results list means the
+            # probe found nothing, which is 0 -- an `or` chain falls through it
+            # and returns the length of the wrapper dict instead.
+            for k in ("results", "tensors"):
+                if k in d:
+                    return len(d[k])
+        return len(d)
+    except Exception:
+        return 0
+
+
+def _measured_all(measure_path: Path, rfn_path: Path) -> bool:
+    """True once sc_measure has a result for EVERY tensor the probe found.
+
+    Non-empty is not enough. sc_measure streams results and resumes from a
+    partial file on its own, so a crash at tensor 50 of 151 leaves a file that
+    reads as finished and hands sc_optimize a measurement covering a third of
+    the model -- which it will happily build a recipe from. The probe walks the
+    same module tree immediately beforehand, so its entry count is the expected
+    total: 151 and 151 on the first real run.
+
+    Unreadable rfn.json means no expected count, so fall back to re-running the
+    stage rather than trusting a number we do not have.
+    """
+    exp = _rfn_count(rfn_path)
+    if not exp:
+        return False
+    try:
+        res = json.loads(measure_path.read_text(encoding="utf-8")).get("results") or []
+    except Exception:
+        return False
+    return len(res) >= exp
+
+
+def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
+    """Report a running stage into the log, and return its last lines.
+
+    These stages used to run under capture_output, which meant one line at the
+    start and silence until they exited -- and the controller's stall clock
+    advances on the progress text CHANGING, so a stage outliving stall_timeout
+    looked exactly like a hung pod and got a working one terminated.
+
+    Not a straight passthrough: these are turboderp's scripts and they write
+    tqdm bars, which are carriage returns rather than lines, so this reads raw
+    and splits on both. Every fragment would be the flood the progress filter
+    exists to keep out of the log, so it emits the newest one every `every`
+    seconds. The [sc] prefix is what gets it past _PROGRESS_MARKERS.
+    """
+    keep: deque[str] = deque(maxlen=12)
+    buf = ""
+    start = last = time.monotonic()
+    fd = proc.stdout.fileno()
+    while True:
+        # Wake on output OR on the clock. Reading straight off the pipe blocks
+        # until the child writes, so a stage that goes quiet -- the only case
+        # that actually looks like a hung pod -- would report nothing at all.
+        # That was the first version of this, and it emitted one line in three
+        # minutes while sc_trace loaded a model.
+        ready, _, _ = select.select([fd], [], [], max(0.0, every - (time.monotonic() - last)))
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+            parts = re.split(r"[\r\n]", buf)
+            buf = parts.pop()
+            for frag in parts:
+                if frag.strip():
+                    keep.append(frag.strip())
+        now = time.monotonic()
+        if now - last >= every:
+            # The live state of a tqdm bar is the UNTERMINATED fragment: it only
+            # gets a \r when the next update lands, so reporting completed ones
+            # meant reporting the previous update, or nothing on a stage sitting
+            # on a single bar.
+            cur = buf.strip() or (keep[-1] if keep else "working")
+            # Elapsed is not decoration. get_progress is `grep | tail`, so a
+            # repeated identical line leaves the controller's progress text
+            # unchanged and its stall clock frozen -- the same failure by a
+            # different route. This guarantees every beat differs.
+            print(f"[sc] {name}: {int(now - start)}s {cur[:150]}", flush=True)
+            last = now
+    if buf.strip():
+        keep.append(buf.strip())
+    return list(keep)
+
+
+# The self-calibration artifacts depend on the model and the donor, NOT on the
+# bitrate: trace/cal/rfn/measure are reused verbatim across every variant, and
+# only sc_optimize runs per bitrate. Within one job quant.py already shares
+# them. Across jobs they died with the pod, so asking for a 3.5bpw next week
+# regenerated 42 minutes of identical work -- 25.5 for sc_trace and 16.3 for
+# sc_measure, measured. They total ~10 MB and cal.safetensors is token ids, so
+# the size barely moves with the model.
+_SC_CACHE_FILES = ("trace.json", "cal.safetensors", "rfn.json", "measure.json")
+
+
+def _sc_cache_repo(owner: str, model_name: str) -> str:
+    """Deterministic, so a pod can ask for it before spending anything.
+
+    A dataset repo, and keyed on the base model rather than any one quant: the
+    artifacts outlive any particular bitrate, and filing them inside an SC repo
+    would mean deleting that repo takes the cache with it.
+    """
+    return f"{owner}/{model_name}-exl3-selfcal"
+
+
+def _sc_cache_key(model_id: str, model_rev: str, donor_repo: str,
+                  cal_rows: int, cal_cols: int) -> dict:
+    """Everything the artifacts actually depend on.
+
+    Reused under the wrong key this silently optimizes a quant against another
+    model's measurements, which no error would ever surface -- so the match is
+    exact and anything unrecognised regenerates. exllamav3's version is in here
+    because sc_measure's output is its format, not ours.
+    """
+    try:
+        import exllamav3
+        exl = getattr(exllamav3, "__version__", "?")
+    except Exception:
+        exl = "?"
+    return {
+        "model_id": model_id,
+        "model_rev": model_rev or "",
+        "donor_repo": donor_repo or "",
+        "cal_rows": int(cal_rows),
+        "cal_cols": int(cal_cols),
+        "exllamav3": exl,
+        # The noise model the measurement was taken under. measure.json from an
+        # iid run and one from a shaped run are not interchangeable -- the whole
+        # point of the change is that they disagree -- so a cache written before
+        # this must not be restored over it.
+        "noise": "shaped+rfn_ref",
+        "schema": 2,
+    }
+
+
+def _sc_cache_restore(api, repo_id: str, key: dict, work_root: Path) -> bool:
+    """Pull a matching cache into work_root. True if every artifact landed.
+
+    Nothing is changed in _run_sc_stages to use this: its stages already skip
+    what is on disk, so restoring the files IS the reuse. A partial restore is
+    no worse than none -- whatever is missing simply gets rebuilt.
+    """
+    from huggingface_hub import hf_hub_download
+    try:
+        man = hf_hub_download(repo_id=repo_id, filename="manifest.json",
+                              repo_type="dataset", token=api.token)
+        have = json.loads(Path(man).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if have != key:
+        diff = [k for k in key if have.get(k) != key.get(k)]
+        print(f"[sc] cache at {repo_id} does not match ({', '.join(diff)}); rebuilding",
+              flush=True)
+        return False
+    work_root.mkdir(parents=True, exist_ok=True)
+    got = 0
+    for name in _SC_CACHE_FILES:
+        try:
+            src = hf_hub_download(repo_id=repo_id, filename=name,
+                                  repo_type="dataset", token=api.token)
+            shutil.copyfile(src, work_root / name)
+            got += 1
+        except Exception as e:
+            print(f"[sc] cache miss for {name}: {type(e).__name__}", flush=True)
+    if got:
+        print(f"[sc] restored {got}/{len(_SC_CACHE_FILES)} artifacts from {repo_id}",
+              flush=True)
+    return got == len(_SC_CACHE_FILES)
+
+
+def _sc_cache_save(api, repo_id: str, key: dict, work_root: Path) -> None:
+    """Best-effort: the quant is what matters, the cache is an optimisation."""
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=False)
+        for name in _SC_CACHE_FILES:
+            f = work_root / name
+            if f.exists() and f.stat().st_size > 0:
+                api.upload_file(path_or_fileobj=str(f), path_in_repo=name,
+                                repo_id=repo_id, repo_type="dataset")
+        # Manifest last: it is the thing a later run trusts, so it must not
+        # appear before the files it vouches for.
+        api.upload_file(path_or_fileobj=json.dumps(key, indent=2).encode(),
+                        path_in_repo="manifest.json", repo_id=repo_id,
+                        repo_type="dataset")
+        print(f"[sc] cached calibration -> {repo_id}", flush=True)
+    except Exception as e:
+        print(f"[sc] WARN could not cache ({type(e).__name__}: {e})", flush=True)
+
+
+def _has_mtp(model_dir: Path) -> bool:
+    """Does this model carry usable multi-token-prediction weights?
+
+    Declaring mtp_* in config is not enough -- plenty of fine-tunes inherit the
+    keys and ship none of the tensors, which is what _disable_missing_mtp
+    exists to clean up. So look for the weights.
+    """
+    try:
+        idx = Path(model_dir) / "model.safetensors.index.json"
+        if idx.is_file():
+            w = json.loads(idx.read_text(encoding="utf-8")).get("weight_map") or {}
+            return any(k.startswith("mtp.") or ".mtp." in k for k in w)
+        from safetensors import safe_open
+        for f in sorted(Path(model_dir).glob("*.safetensors")):
+            with safe_open(str(f), framework="pt") as h:
+                if any(k.startswith("mtp.") or ".mtp." in k for k in h.keys()):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
+                   head_bits: int, cal_rows: int, cal_cols: int,
+                   timings: dict | None = None,
+                   gpu_count: int = 1) -> tuple[Path, Path]:
+    """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
+
+    Four of turboderp's scripts in order, each a subprocess so a crash in one
+    is a stage failure rather than something that takes this process with it.
+    Every coupling below cost a pod to discover -- see backend/scripts/
+    sc_chain_smoke.py, which runs the same sequence small:
+
+      - sc_measure's -tr takes sc_trace's -co (packed safetensors), NOT its -o
+        (the qbench trace JSON). Hand it the JSON and it falls back to the
+        bundled corpus without saying so, which optimizes the quant against the
+        wrong distribution.
+      - donor_dir must be a quant of THIS model. sc_rfn_probe walks both module
+        trees together, and sc_measure runs the donor's trace through this
+        model's embedding, so a foreign tokenizer indexes out of range.
+      - cal_rows/cal_cols must match what the conversion will ask for. convert
+        crops the file to its own --cal_rows x --cal_cols and refuses anything
+        smaller, so the caller passes one pair to both.
+      - A stage is judged on the artifact it leaves. sc_measure can write its
+        output and still exit non-zero.
+    """
+    sc = _selfcal_dir()
+    if sc is None:
+        raise RuntimeError("vendored selfcal scripts not found on this pod")
+    work_root.mkdir(parents=True, exist_ok=True)
+    trace = work_root / "trace.json"
+    cal = work_root / "cal.safetensors"
+    rfn = work_root / "rfn.json"
+    measure = work_root / "measure.json"
+    recipe = work_root / f"recipe-{bpw}.yaml"
+
+    def stage(name: str, args: list[str], produces: Path, done=None) -> None:
+        # Resume: every one of these is expensive and all of them can be
+        # re-entered, so a retried job does not redo what already landed.
+        # `done` is for a stage that creates its file up front and fills it in
+        # as it goes -- existence there means "started", not "finished".
+        ok = done or (lambda p: p.stat().st_size > 0)
+        if produces.exists() and ok(produces):
+            print(f"[sc] {name} already done -> {produces.name}", flush=True)
+            if timings is not None:
+                timings[name] = 0.0   # reused, not run
+            return
+        _t0 = time.monotonic()
+        print(f"[sc] {name} ...", flush=True)
+        # -u, because these scripts print without flush=True and their stdout
+        # here is a pipe: Python block-buffers it, so a quiet stage's output
+        # sits in an 8K buffer for the whole run and the heartbeat has nothing
+        # to report. sc_trace prints enough to keep filling the buffer and
+        # looked fine; sc_measure printed "Reference pass" and went dark for
+        # 13 minutes.
+        proc = subprocess.Popen([sys.executable, "-u", str(sc / f"{name}.py"), *args],
+                                cwd=str(sc), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        tail = _heartbeat(proc, name)
+        rc = proc.wait()
+        if not (produces.exists() and ok(produces)):
+            raise RuntimeError(f"sc stage {name} left no usable {produces.name} "
+                               f"(exit {rc}): " + " | ".join(tail))
+        _el = time.monotonic() - _t0
+        if timings is not None:
+            timings[name] = round(_el, 1)
+        # Timed because every estimate of this so far has been a guess, and each
+        # one was wrong: the cost band multiplies a 35B baseline by 4, which no
+        # measured SC run has ever justified. Recorded per run so the estimate
+        # can be fitted from real jobs instead.
+        print(f"[sc] {name} done -> {produces.name} ({_el / 60:.1f}m)", flush=True)
+
+    # sc_trace takes exllamav3's model_init options, so on a multi-GPU pod the
+    # donor can load tensor-parallel. Worth doing here and nowhere else in the
+    # chain: this stage is batched generation, which is bandwidth-bound, and TP
+    # splits the weight reads as well as the compute. sc_measure is single
+    # device by construction (torch.device("cuda", args.device)) and
+    # sc_rfn_probe streams a module at a time, so neither gains.
+    trace_argv = ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
+                  "-cr", str(cal_rows), "-cc", str(cal_cols)]
+    if gpu_count > 1:
+        trace_argv += ["-tp"]
+    # Self-speculative decoding off the model's own MTP head, where it has one.
+    # This stage is pure generation and the longest thing in the job, so it is
+    # the one place drafting pays. Speculative decoding samples from the same
+    # distribution, so the corpus stays on-policy -- it will not be the same
+    # token sequence for a given seed, but it is the same kind of text.
+    #
+    # Retried without it on failure rather than trusted: drafting is the most
+    # model-specific thing here, and losing a pod to it would cost more than
+    # the stage saves.
+    if _has_mtp(donor_dir):
+        try:
+            stage("sc_trace", trace_argv + ["-mtp"], cal)
+        except RuntimeError as e:
+            print(f"[sc] MTP drafting failed ({e}); retrying without it", flush=True)
+            stage("sc_trace", trace_argv, cal)
+    else:
+        stage("sc_trace", trace_argv, cal)
+    stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
+                           "-o", str(rfn)], rfn)
+    # --load-mode auto, NOT --streaming. Streaming walks one module at a time
+    # and keeps the cached states in system RAM, so it is bound by the CPU: a
+    # 0.8B measured that way ran 12-16 minutes at ~13 cores with the GPU at 7%,
+    # on a card it would have fit in several times over. Forcing it gave up the
+    # resident path on every model regardless of size. auto checks free VRAM
+    # first and still falls back to streaming -- on the estimate, and again if
+    # the load actually OOMs -- so this is faster where it fits and identical
+    # where it does not.
+    #
+    # The output file is written up front either way, with an empty "results",
+    # so it exists seconds in and keeps that shape for the whole stage. On size
+    # alone a resumed job would skip the measurement and a crash halfway would
+    # read as success, and sc_optimize would build the recipe from nothing.
+    # --shaped and -rr are not optional extras, they are how this is meant to
+    # be run. The script's own help calls shaped "recommended", and its header
+    # says the iid default carries a median 1.95x KL overestimate with strong
+    # per-type structure, up to 5.8x on v_proj -- "the bias is almost entirely
+    # the missing LDLQ error shaping". A recipe fitted to that bias protects
+    # the wrong tensors. Shaped noise reuses the quantizer's own Hessians, so
+    # damping, sign flips, block Hadamard and the block-16 LDL match conversion
+    # byte for byte.
+    #
+    # -rr is what sc_rfn_probe exists for: per-tensor noise anchored to the
+    # real error of an actual quant of this model, overriding the one global
+    # --rfn pair. We were generating rfn.json, handing it to sc_optimize, and
+    # never giving it to the measurement that needed it -- so every tensor was
+    # probed at the same 0.29/0.145 regardless of how it actually quantizes.
+    #
+    # Measured consequence, on Qwen3.5-0.8B at 3.0bpw against a plain quant of
+    # the same bitrate and head/vision bits: SC came out at 0.1200 median KL
+    # against plain's 0.0782. Worse, from a pipeline that ran clean.
+    stage("sc_measure", ["-m", str(model_dir), "-o", str(measure),
+                         "--load-mode", "auto", "-tr", str(cal),
+                         "--shaped", "-rr", str(rfn)], measure,
+          done=lambda p: _measured_all(p, rfn))
+    stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
+                          "-rr", str(rfn), "-o", str(recipe)], recipe)
+    return recipe, cal
+
+
+def _selfcal_dir() -> Path | None:
+    """Where the vendored selfcal tree is, whichever layout this is running in.
+
+    The pod flattens this file to /opt/blockquant/quant.py (baked, then
+    overwritten with the current one) or /root/quant.py, so the repo's
+    blockquant/remote/quant.py -> blockquant/selfcal relationship does not hold
+    there. Getting it wrong is silent: the import fails into a best-effort
+    handler and the number it was going to produce just never appears.
+    """
+    for cand in (Path(__file__).parent / "selfcal",
+                 Path(__file__).parent.parent / "selfcal",
+                 Path("/opt/blockquant/selfcal")):
+        if (cand / "sc_measure.py").is_file():
+            return cand
+    return None
+
+
 def _kl_kernel_usable() -> bool:
     """Whether exllamav3's CUDA compute_kl_div can be trusted on this image.
 
@@ -324,8 +705,38 @@ def _kl_kernel_usable() -> bool:
     return False
 
 
+def _trace_subset(trace_path, rows: int):
+    """A `rows`-row slice of a qbench trace, written beside it.
+
+    The full trace is every (context, response) pair sc_trace sampled --
+    hundreds of variable-length rows, more than the eval needs. Strided rather
+    than a prefix, because rows come out in conversation order and the seed set
+    is grouped by domain.
+    """
+    try:
+        trace_path = Path(trace_path)
+        if not trace_path.is_file():
+            return None
+        data = json.loads(trace_path.read_text(encoding="utf-8"))
+        all_rows = data.get("rows") or []
+        if not all_rows:
+            return None
+        if len(all_rows) > rows:
+            step = len(all_rows) / rows
+            data["rows"] = [all_rows[min(len(all_rows) - 1, int(i * step))]
+                            for i in range(rows)]
+        out = trace_path.with_name(f"{trace_path.stem}-eval{rows}.json")
+        out.write_text(json.dumps(data), encoding="utf-8")
+        return out
+    except Exception as e:
+        print(f"[kl] WARN trace unusable ({type(e).__name__}: {e}); using wiki2",
+              flush=True)
+        return None
+
+
 def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
-                 seq_len: int = 2048) -> tuple[dict | None, str]:
+                 seq_len: int = 2048,
+                 trace_path: Path | None = None) -> tuple[dict | None, str]:
     """KL(fp16 || quant) over held-out text, as qbench reports it.
 
     Returns (stats, method). stats carries kld, kld_median, the p10-p90 spread
@@ -346,20 +757,11 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
     try:
         import torch
         from exllamav3 import Config, Model, Cache, Tokenizer
-        # The pod flattens this file to /opt/blockquant/quant.py (baked) or
-        # /root/quant.py (SFTP'd), so the repo's blockquant/remote/quant.py ->
-        # blockquant/selfcal relationship does not hold there. Try the layouts
-        # rather than one of them: getting it wrong fails the import, which the
-        # handler below swallows, and a card just quietly loses its KL number.
-        for _cand in (Path(__file__).parent / "selfcal",
-                      Path(__file__).parent.parent / "selfcal",
-                      Path("/opt/blockquant/selfcal")):
-            if (_cand / "eval" / "qbench" / "measure.py").is_file():
-                sys.path.insert(0, str(_cand))
-                break
-        else:
+        _sc = _selfcal_dir()
+        if _sc is None:
             print("[kl] WARN vendored qbench not found; no KL this run", flush=True)
             return None, ""
+        sys.path.insert(0, str(_sc))
         from eval.qbench.measure import DiffStats, save_reference_row, print_stats
         from eval.qbench.data import QCache, get_test_rows, save_tensors
     except Exception as e:
@@ -374,21 +776,36 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         # It also applies the chat template (prepend_hf_chat_context) and
         # reports prefix_len, so metrics skip the framing rather than scoring it.
         project = {
-            "test_data": {"source": "wiki2", "rows": rows, "length": seq_len,
-                          "stride": seq_len},
             # The reference's tokenizer, as qbench's example does. Keying it on
             # the quant instead would re-tokenize per variant, since the cache
             # key is a hash of (dataset spec, tokenizer source).
             "tokenizer": {"source": str(fp16_dir), "template": True},
             "logit_cache": {"dir": str(fp16_dir.parent), "max_size_gb": 50},
         }
-        corpus = "wiki2"
+        # Prefer the model's own sampled output when there is a trace for it.
+        # turboderp's qbench_prompts.py says why: "evaluating quants on
+        # external corpora measures divergence on text the model may never
+        # produce itself ... raw web text is so far out of distribution that
+        # the noise floor inflates and KLD ordering degrades". Ordering is the
+        # whole job of the number on the card -- it is what says which of two
+        # quants is better. sc_trace writes a qbench-compatible trace on every
+        # self-calibrated run and we had been using it only as sc_measure's -tr
+        # and then deleting it with the pod.
+        sub = _trace_subset(trace_path, rows) if trace_path else None
+        if sub is not None:
+            project["test_trace"] = str(sub)
+            corpus = "self-sampled trace"
+        else:
+            project["test_data"] = {"source": "wiki2", "rows": rows,
+                                    "length": seq_len, "stride": seq_len}
+            corpus = "wiki2"
         qcache = QCache(project["logit_cache"])
         ids, ranges, trace_vocab = get_test_rows(project, qcache)
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
         vocab = trace_vocab or tokenizer.actual_vocab_size
-        method = f"qbench · {corpus} · {rows}×{seq_len}"
+        method = (f"qbench · {corpus} · {ids.shape[0]} rows" if corpus != "wiki2"
+                  else f"qbench · {corpus} · {rows}×{seq_len}")
         seqs = [ids[i:i + 1, :] for i in range(ids.shape[0])]
     except Exception as e:
         print(f"[kl] WARN test data failed: {type(e).__name__}: {e}", flush=True)
@@ -408,10 +825,25 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         model.load()
         try:
             for i, seq in enumerate(seqs):
+                # batch_shape is the cache's geometry, not the input's -- the
+                # real length comes from input_ids -- and attn.py asserts the
+                # seq len is a page multiple, so it takes the rounded value.
                 params = {"attn_mode": "flash_attn", "cache": cache,
-                          "past_len": 0, "batch_shape": (1, row_len)}
+                          "past_len": 0, "batch_shape": (1, cache_len)}
                 logits = model.forward(seq, params=params)
                 on_row(i, logits)
+                # A hybrid/linear-attn model takes a recurrent state slot per
+                # forward: with no "recurrent_states" in params, exllamav3
+                # allocates from the cache's pool and this fresh dict per row
+                # means it never comes back. The pool is max_batch_size, 16 by
+                # default, and kl_rows is 40 -- so row 17 died on "Cannot
+                # create new state: no available slots" and the job published
+                # with no KL number. Rows are independent (past_len 0), so
+                # hand the slots back after each one.
+                try:
+                    cache.reset_states()
+                except AttributeError:
+                    pass
         finally:
             try:
                 model.unload()
@@ -638,7 +1070,8 @@ def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
 
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                    head_bits, cal_rows, codebook, model_dir) -> None:
+                    head_bits, cal_rows, codebook, model_dir,
+                    name_parts: dict | None = None) -> None:
     """Render each variant's card with the full cross-variant table and push
     README.md to its repo. Runs after the serial upload+delete, so the out_dir
     is gone -- sizes/KL come from the recs and the card goes up via the API."""
@@ -655,18 +1088,24 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         "variant": o["variant"], "head_bits": o.get("_head_bits", head_bits),
         "cal_rows": o.get("_cal_rows", cal_rows),
         "vision_bits": o.get("_vision_bits"),
-        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"]),
+        # Without this the Mode column calls a self-calibrated quant "plain",
+        # which is the one distinction the column exists to draw.
+        "sc": bool((o.get("_name_parts") or {}).get("sc")),
+        "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "size_gb": o.get("_size_gb"),
-        "url": o.get("hf_url") or f"https://huggingface.co/{cards.exl3_repo_id(owner, model_name, o['variant'])}",
+        "url": o.get("hf_url") or "https://huggingface.co/" + cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "kl_div": o.get("kl_div"),
         "kl_method": o.get("kl_method"),
     } for o in outputs]
 
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(owner=owner, base_name=model_name, token=hf_token)
+    collection_url = cards.collection_url_for(owner=owner, base_name=model_name, token=hf_token)
 
     for o in outputs:
-        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"])
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(
+            owner, model_name, o["variant"], **(o.get("_name_parts") or name_parts or {}))
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
@@ -803,8 +1242,8 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
         model_config = {}
     rows_cal = int(cal_rows) if cal_rows else 250
     license_id = cards.fetch_license(model_id, hf_token or None)
-    collection_url = cards.ensure_collection(owner=owner, base_name=model_name,
-                                             token=hf_token)
+    collection_url = cards.collection_url_for(owner=owner, base_name=model_name,
+                                              token=hf_token)
     quant_rows = [{
         "variant": v, "head_bits": d.get("head_bits", head_bits), "cal_rows": rows_cal,
         "vision_bits": d.get("vision_bits"), "repo_id": d["repo"],
@@ -855,6 +1294,21 @@ def main() -> int:
         # that subtree is fetched: the one that prompted this had 433 GB across
         # BF16/FP8/GGUF/NVFP4 and we pulled all of it to quantize one.
         subfolder: str = (cfg.get("subfolder") or "").strip().strip("/")
+        # Self-calibration. donor_repo is a quant OF THIS MODEL at >= the
+        # bitrate being built -- sc_rfn_probe and sc_measure both fail on a
+        # foreign one, in two different ways. The bot resolves it before the
+        # job starts; nothing here goes looking.
+        sc: bool = bool(cfg.get("sc", False))
+        donor_repo: str = (cfg.get("donor_repo") or "").strip()
+        # One pair drives sc_trace and the conversion both, because convert
+        # crops the calibration file to its own and refuses a smaller one.
+        # What the published name carries, for anything that needs it before a
+        # conversion exists. Once one does, _name_parts_for reads it back off
+        # the written config instead -- see there.
+        name_parts = {"sc": sc, "head_bits": head_bits, "vision_bits": vision_bits} if sc \
+            else ({"vision_bits": vision_bits} if vision_bits else {})
+        sc_cal_rows: int = int(cfg.get("cal_rows") or 250)
+        sc_cal_cols: int = int(cfg.get("cal_cols") or 2048)
         # Calibration tunables — fewer rows trades quality for speed.
         # ExLlamaV3 defaults are 250 rows × 2048 cols when unset.
         cal_rows: int | None = cfg.get("cal_rows")
@@ -992,13 +1446,6 @@ def main() -> int:
                 )
             print(f"[download] model root -> {model_dir}", flush=True)
 
-        _sanitize_config(model_dir)
-        _disable_missing_mtp(model_dir)
-        _vision_preprocessor_config(model_dir)
-        _ensure_fast_tokenizer(model_dir)
-
-        from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
-
         api = owner = model_name = None
         repo_ids = []
         if hf_token:
@@ -1008,7 +1455,71 @@ def main() -> int:
             # bare slugs without a namespace.
             owner = hf_org or api.whoami()["name"]
 
+        # Self-calibration artifacts a previous job already built, fetched
+        # before the donor on purpose: a complete cache skips sc_trace and
+        # sc_rfn_probe, and those are the only two stages that read the donor.
+        # Downloading it anyway would be ~20 GB pulled for nothing on a 27B, on
+        # exactly the repeat runs the cache exists to make cheap.
+        sc_work = workspace / "selfcal"
+        sc_cached = False
+        if sc and api and owner:
+            sc_cache_repo = _sc_cache_repo(owner, model_name)
+            sc_cache_key = _sc_cache_key(model_id, cfg.get("model_revision", ""),
+                                         donor_repo, sc_cal_rows, sc_cal_cols)
+            sc_cached = _sc_cache_restore(api, sc_cache_repo, sc_cache_key, sc_work)
+
+        # The self-calibration donor: a quant of this model that generates the
+        # in-domain trace everything downstream is built on. Small next to the
+        # fp16, and fetched here so a failure lands before any GPU time.
+        donor_dir = workspace / "donor" if sc else None
+        if sc and not sc_cached:
+            if not donor_repo:
+                raise ValueError("self-calibration needs a donor quant; none was given")
+            print(f"[sc] donor {donor_repo} ...", flush=True)
+            snapshot_download(repo_id=donor_repo, local_dir=str(donor_dir),
+                              token=hf_token or None)
+            print(f"[sc] donor ready ({_dir_size_gb(donor_dir):.1f} GB)", flush=True)
+        elif sc:
+            print("[sc] calibration restored from cache; donor not needed", flush=True)
+
+        _sanitize_config(model_dir)
+        _disable_missing_mtp(model_dir)
+        _vision_preprocessor_config(model_dir)
+        _ensure_fast_tokenizer(model_dir)
+
+        from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
+
+
+        def _name_parts_for(rec: dict) -> dict:
+            import cards
+            """Name the artifact from what the converter wrote, not what we asked for.
+
+            The request is an intent and can be vague -- head bits unset means
+            "whatever exllamav3 picks", vision bits unset means "whatever the
+            arch does", and 16 means "copy the tower", which is not a tower
+            bitrate at all. The written quantization_config is the fact: it
+            carries head_bits always and vision_bits only when the tower was
+            quantized. Naming off the request published SC quants as -V16 for
+            towers that were copied, and dropped the -V6 off ones that were.
+
+            A plain quant still states nothing it did not choose, so it takes
+            the suffix only when the requester pinned the tower themselves.
+            """
+            if sc:
+                return {"sc": True,
+                        "head_bits": rec.get("_head_bits", head_bits),
+                        "vision_bits": rec.get("_vision_bits")}
+            vb = cards.quantized_vision_bits(vision_bits)
+            return {"vision_bits": vb} if vb else {}
+
         def _publish(variant, out_dir, work_dir, rec):
+            # Own import, like _finalize_cards and _backfill_sibling_kl. main()
+            # imports cards further down, which makes the name a local of main
+            # -- so a nested function reading it gets an unassigned free
+            # variable and NameErrors at the upload, after the whole quant is
+            # built. quant.py cannot import it at module scope: in the repo it
+            # is blockquant.cards, on the pod it is flat beside this file.
+            import cards
             # Serial: upload one variant and free its disk before the next, so
             # peak = model + one output + one work dir + one kl-stage, not the
             # sum over all variants. rmtree only AFTER a confirmed upload -- on
@@ -1020,9 +1531,15 @@ def main() -> int:
             rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
             # Present only when the tower was quantized; that is the signal.
             rec["_vision_bits"] = _qc.get("vision_bits")
+            # Settle the name here, where the conversion is on disk to read, so
+            # the card pass and the manifest cannot derive a different one.
+            rec["_name_parts"] = _name_parts_for(rec)
             if not hf_token:
                 return
-            repo_id = f"{owner}/{model_name}-exl3-{variant}bpw"
+            # Build the name, never format it here: an SC quant under the
+            # plain name would collide with the plain quant of the same
+            # bitrate, which is the one thing the suffixes exist to stop.
+            repo_id = cards.exl3_repo_id(owner, model_name, variant, **rec["_name_parts"])
             print(f"[upload] {variant} -> {repo_id} ...", flush=True)
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
             _upload_folder_hb(api, str(out_dir), repo_id, variant)
@@ -1054,7 +1571,33 @@ def main() -> int:
                 _publish(variant, out_dir, work_dir, rec)
                 outputs.append(rec)
                 continue
+            # Self-calibration runs before the conversion and hands it a
+            # per-tensor recipe plus the model's own calibration rows. The
+            # stages are shared across every bitrate in the job -- only
+            # sc_optimize is per-bitrate -- so the expensive part (trace,
+            # probe, measure) is paid once.
+            sc_recipe = sc_cal = None
+            sc_timings: dict = {}
+            if sc:
+                _sc_work = sc_work
+                _cache_repo = sc_cache_repo if (api and owner) else None
+                _cache_key = sc_cache_key if (api and owner) else None
+                sc_recipe, sc_cal = _run_sc_stages(
+                    model_dir, donor_dir, work_root=_sc_work,
+                    bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
+                    cal_cols=sc_cal_cols, timings=sc_timings,
+                    gpu_count=gpu_count)
+                # A stage that was skipped is recorded as 0.0, so this is
+                # "did this job build anything new". A run that restored
+                # everything has nothing to add and re-uploading would just
+                # churn the repo.
+                _built = any(sc_timings.get(n, 0) > 0
+                             for n in ("sc_trace", "sc_rfn_probe", "sc_measure"))
+                if _cache_repo and _built:
+                    _sc_cache_save(api, _cache_repo, _cache_key, _sc_work)
+
             print(f"[quantize] {variant} bpw ...", flush=True)
+            _t_quant = time.time()
             old_argv = sys.argv
             argv = [
                 "convert",
@@ -1073,16 +1616,27 @@ def main() -> int:
             # tower the arch declares validated to 6 bpw and copies the rest at
             # fp16, where <=1.4.2 copied every tower. Passing nothing therefore
             # tracks the image, and an explicit value is how a request pins it.
+            if sc_recipe is not None:
+                # -rcp replaces the budgeted allocation from --bits/--head_bits
+                # (the recipe carries head_bits), and -cd replaces the bundled
+                # corpus. cal_rows/cal_cols must match what sc_trace generated:
+                # convert crops to its own and refuses a smaller file.
+                argv += ["-rcp", str(sc_recipe), "-cd", str(sc_cal),
+                         "--cal_rows", str(sc_cal_rows),
+                         "--cal_cols", str(sc_cal_cols)]
             if gpu_count > 1:
                 argv += ["-d", ",".join(str(i) for i in range(gpu_count))]
             if head_bits is not None:
                 argv += ["--head_bits", str(int(head_bits))]
             if vision_bits is not None:
                 argv += ["-vb", str(int(vision_bits))]
-            if cal_rows is not None:
-                argv += ["--cal_rows", str(int(cal_rows))]
-            if cal_cols is not None:
-                argv += ["--cal_cols", str(int(cal_cols))]
+            # SC already set these to match its trace; a second pair would be
+            # argparse's last-wins and could quietly disagree with the file.
+            if not sc:
+                if cal_rows is not None:
+                    argv += ["--cal_rows", str(int(cal_rows))]
+                if cal_cols is not None:
+                    argv += ["--cal_cols", str(int(cal_cols))]
             sys.argv = argv
             try:
                 args = parser.parse_args()
@@ -1180,11 +1734,28 @@ def main() -> int:
                 sys.stdout = _old_stdout
                 _q_done.set()
                 _qt.join(timeout=2)
-            print(f"[quantize] {variant} complete", flush=True)
+            _quant_secs = round(time.time() - _t_quant, 1)
+            print(f"[quantize] {variant} complete ({_quant_secs / 60:.1f}m)", flush=True)
             rec = {"variant": variant, "path": str(out_dir)}
+            # Shipped in the result so the cost estimate has something to fit.
+            # A flat per-variant band cannot describe a job whose two longest
+            # stages are bound by different things -- sc_trace on the GPU,
+            # sc_measure on the CPU.
+            if sc:
+                rec["_sc_timings"] = dict(sc_timings)
+                rec["_sc_cal"] = {"rows": sc_cal_rows, "cols": sc_cal_cols}
+            rec["_quantize_secs"] = _quant_secs
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
-                stats, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                # Not `if sc`: a plain quant of a model whose trace is on
+                # disk -- restored from the cache, or left by an SC variant in
+                # the same job -- has to be scored on the same corpus, or the
+                # two numbers sit in one table looking comparable when they are
+                # measured against different distributions.
+                _trace = sc_work / "trace.json"
+                stats, kl_method = _kl_div_eval(
+                    out_dir, model_dir, rows=kl_rows,
+                    trace_path=_trace if _trace.is_file() else None)
                 if stats is not None:
                     # The median is what the card quotes. The mean is kept
                     # because turboderp's charts plot it, but his own note is
@@ -1209,16 +1780,12 @@ def main() -> int:
                         (out_dir / "bq_quality.json").write_text(payload, encoding="utf-8")
                     except Exception as e:
                         print(f"[kl] {variant} could not write bq_quality.json: {e}", flush=True)
-                    # KL is measured after the folder upload, so the file has to
-                    # be pushed on its own or it stays on a pod that is about to
-                    # be terminated -- which is why no published repo has one.
-                    rid = rec.get("hf_repo_id")
-                    if hf_token and rid:
-                        try:
-                            api.upload_file(path_or_fileobj=payload.encode(),
-                                            path_in_repo="bq_quality.json", repo_id=rid)
-                        except Exception as e:
-                            print(f"[kl] {variant} quality upload failed: {e}", flush=True)
+                    # Written into out_dir BEFORE _publish uploads the folder,
+                    # so it ships with the weights and needs no upload of its
+                    # own. There used to be one here, guarded on
+                    # rec["hf_repo_id"] -- which _publish does not set until
+                    # after this block, so it never once ran, under a comment
+                    # claiming KL was measured after the upload.
             if test_prompt:
                 print(f"[sample] {variant} generating reply ...", flush=True)
                 resp = _sample_generate(out_dir, test_prompt)
@@ -1237,7 +1804,8 @@ def main() -> int:
             # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
                 _finalize_cards(outputs, model_id, model_name, owner, hf_token,
-                                head_bits, cal_rows, codebook, model_dir)
+                                head_bits, cal_rows, codebook, model_dir,
+                                name_parts=name_parts)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an

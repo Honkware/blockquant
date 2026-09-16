@@ -99,19 +99,23 @@ def _quant_rows(api, repos, cal_rows, head_bits) -> list[dict]:
     rows = []
     for r in repos:
         v, repo_id = r["variant"], r["repo_id"]
-        kl = None
+        kl = kl_method = None
         try:
             from huggingface_hub import hf_hub_download
             qp = hf_hub_download(repo_id, "bq_quality.json",
                                  token=os.environ.get("HF_TOKEN") or None)
-            kl = json.loads(pathlib.Path(qp).read_text(encoding="utf-8")).get("kl_div")
+            _q = json.loads(pathlib.Path(qp).read_text(encoding="utf-8"))
+            kl = _q.get("kl_div")
+            # Carried so the table can name the corpus. Two quants measured on
+            # different ones are not comparable and the column must say so.
+            kl_method = _q.get("kl_method")
         except Exception:
             pass  # older quants predate the file; the column just stays empty
         rows.append({
             "variant": v, "head_bits": r.get("head_bits") or _repo_head_bits(repo_id, head_bits),
             "sc": r.get("sc", False), "vision_bits": r.get("vision_bits"),
             "repo_id": repo_id,
-            "cal_rows": cal_rows, "kl_div": kl,
+            "cal_rows": cal_rows, "kl_div": kl, "kl_method": kl_method,
             "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
         })

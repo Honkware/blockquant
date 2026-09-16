@@ -22,11 +22,25 @@ export const commands = [
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
     )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('sc')
+        .setDescription('Self-calibrated: measure this model and convert from a per-tensor recipe. Needs head_bits')
+        .setRequired(false)
+    )
     .addStringOption((opt) =>
       opt
         .setName('subfolder')
         .setDescription('Subdirectory holding the model, for repos that ship several formats (e.g. BF16)')
         .setRequired(false)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('gpu_count')
+        .setDescription('GPUs on the pod. The converter runs one worker thread per device. Default 1.')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(4)
     )
     .addIntegerOption((opt) =>
       opt

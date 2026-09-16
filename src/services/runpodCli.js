@@ -31,7 +31,84 @@ const RE = {
   // The controller's one-line reason for a run that produced nothing. Without
   // this the user gets "exited 1 with no uploads", which says nothing.
   jobError: /\[joberror\]\s*(.+)/,
+  // Self-calibration. Match only the vocabulary quant.py emits -- "[sc] <stage>
+  // ...", "[sc] <stage> done -> file", "[sc] <stage>: <elapsed>s <text>". The
+  // text after the colon is turboderp's and changes with every EXLLAMAV3_REF
+  // bump (the vendor manifest exists because those files move), so it is shown
+  // and never parsed.
+  scStageDone: /\[sc\]\s*(sc_\w+)\s+done\s*->/,
+  scBeat: /\[sc\]\s*(sc_\w+):\s*(?:(\d+)s\s*)?(.*)/,
+  scStage: /\[sc\]\s*(sc_\w+)\s*\.\.\./,
+  scDonor: /\[sc\]\s*donor\s*(.+)/,
+  // The controller's own numbered startup steps. 1-4 are pod create, SSH wait,
+  // bootstrap and launch -- about five minutes that used to sit on one number.
+  // 5 and 6 cover the whole run and are left to the phase markers.
+  step: /^\s*\[([1-4])\/6\]\s*(.+)/,
+  // upload_folder gives no percentage, so the bar holds at 95 -- but the
+  // elapsed keepalive at least keeps the message alive on a long push.
+  uploadBeat: /\[upload\]\s*([0-9.]+)\s*pushing\.\.\.\s*(\d+)s/,
 };
+
+// turboderp's scripts colour their output, and the heartbeat forwards whatever
+// fragment is newest -- so escape codes reach the embed, where they render as
+// literal junk and eat the message budget. Strip once here rather than in each
+// pattern: every line goes through this.
+// eslint-disable-next-line no-control-regex
+const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*[a-zA-Z]', 'g');
+export const stripAnsi = (s) => String(s).replace(ANSI, '');
+
+// What each self-calibration stage is worth, as a share of the SC band. Not
+// equal quarters: measured on a 0.8B, sc_trace ran 25.5 min and sc_measure
+// 16.3, while the probe took 12 seconds and sc_optimize 4. Weighting them
+// evenly would park the bar at 25% for most of an hour.
+const SC_WEIGHTS = { sc_trace: 0.60, sc_rfn_probe: 0.01, sc_measure: 0.38, sc_optimize: 0.01 };
+const SC_ORDER = ['sc_trace', 'sc_rfn_probe', 'sc_measure', 'sc_optimize'];
+
+// Fraction of the SC phase complete once `stage` has finished, plus whatever of
+// the running one we can claim. Stages report no internal percent, so a running
+// stage contributes nothing until it lands -- the elapsed counter in the message
+// is what shows it is alive.
+// sc_trace's default token budget: cal_rows x cal_cols, 250 x 2048 upstream.
+// Its heartbeat carries a running total, so the longest stage in the job can
+// report real progress instead of sitting on one number for 25 minutes.
+export const SC_TRACE_TOKENS = 250 * 2048;
+
+export function scProgress(doneStages, curStage = null, curFrac = 0) {
+  let f = 0;
+  for (const st of SC_ORDER) if (doneStages.has(st)) f += SC_WEIGHTS[st];
+  // Credit the running stage too, or the bar holds still for the whole of it.
+  // A stage with no readable progress contributes 0 and the elapsed counter in
+  // the message carries liveness instead.
+  if (curStage && !doneStages.has(curStage) && SC_WEIGHTS[curStage]) {
+    f += SC_WEIGHTS[curStage] * Math.min(1, Math.max(0, curFrac));
+  }
+  return Math.min(1, f);
+}
+
+// sc_measure walks modules within passes and says so:
+//   -- [pass 1/3] module 12/24: 3 pending, 2 new tensor(s)
+// 16.3 minutes on a 0.8B, and the second longest thing in the job, so it is
+// worth reading. Same deal as sc_trace: opportunistic, null on a miss.
+export function scMeasureFrac(message) {
+  const m = /pass\s+(\d+)\s*\/\s*(\d+)\].*?module\s+(\d+)\s*\/\s*(\d+)/.exec(message || '');
+  if (!m) return null;
+  const [pass, passes, mod, mods] = m.slice(1, 5).map(Number);
+  if (!passes || !mods || pass < 1) return null;
+  return Math.min(1, ((pass - 1) + mod / mods) / passes);
+}
+
+// Tokens generated so far, off sc_trace's own counter. Opportunistic: the text
+// is turboderp's and moves between releases, so a miss returns null and the
+// bar falls back to stage-completion rather than lying.
+export function scTraceFrac(message, target = SC_TRACE_TOKENS) {
+  const m = /total\s+([\d,]+)/.exec(message || '');
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ''));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // It overshoots: the stop is checked at wave boundaries, so the last wave
+  // runs past the target. Clamp rather than report over 100%.
+  return Math.min(1, n / target);
+}
 
 /**
  * Decide whether a failed controller run is worth re-spawning a pod for. ONLY a
@@ -103,7 +180,18 @@ export function runViaCli({
   visionBits = null,
   headBits = null,
   subfolder = null,
+  sc = false,
+  donorRepo = null,
   gpuCount = null,
+  // Leaves the pod up on BOTH paths, so a crash after the conversion keeps the
+  // finished quant reachable for rescue_upload.py. Not a Discord option: the
+  // controller normally terminates on failure, which is right for unattended
+  // jobs and wrong when you are watching one you expect to break.
+  keepPod = false,
+  // Hours before the controller gives up on a pod. The default is 8, which is
+  // ample for a conversion and thin for a big self-calibrated job: the trace
+  // and the measurement run before a single weight is quantized.
+  maxRuntimeH = null,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -143,10 +231,27 @@ export function runViaCli({
     // 8 while the bot recorded whatever the profile table said.
     if (headBits != null) args.push('--head-bits', String(headBits));
     if (subfolder) args.push('--subfolder', String(subfolder));
+    // The donor rides with the flag: run_runpod_job refuses --sc without it,
+    // because the probe and the measurement both need a quant of this model.
+    if (sc) {
+      // run_runpod_job refuses --sc without head bits, because the recipe
+      // carries them and the published name states them. Say so here instead
+      // of building an argv that dies a minute later on the launcher: the
+      // caller resolving head bits for the name but not passing them is what
+      // that looked like, and the error named the flag, not the caller.
+      if (headBits == null) {
+        reject(new Error('runViaCli: sc needs headBits -- the name states them, so they cannot be left to the converter'));
+        return;
+      }
+      args.push('--sc');
+      if (donorRepo) args.push('--donor-repo', String(donorRepo));
+    }
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.
     if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
+    if (keepPod) args.push('--keep-pod');
+    if (maxRuntimeH != null) args.push('--max-runtime', String(Math.round(maxRuntimeH * 3600)));
     // Unset sends no --cal-rows, so the converter uses its own 250x2048. This
     // passed 250 unconditionally, which is the same number but pinned it.
     if (calRows != null) args.push('--cal-rows', String(calRows));
@@ -185,7 +290,7 @@ export function runViaCli({
       return reject(err);
     }
 
-    resolve(attachToCli(handle, { variants, onProgress }));
+    resolve(attachToCli(handle, { variants, onProgress, sc }));
   });
 }
 
@@ -200,7 +305,9 @@ export function runViaCli({
  * is monotonic, so re-reading a log from the top replays to the right state
  * rather than jittering the bar backwards.
  */
-export function attachToCli(handle, { variants, onProgress }) {
+// `sc` only widens the progress bands; a resumed job that does not pass it
+// still renders, just on the plain split.
+export function attachToCli(handle, { variants, onProgress, sc = false }) {
   return new Promise((resolve, reject) => {
     const total = variants.length;
     const results = new Map(); // bpw -> url
@@ -211,6 +318,10 @@ export function attachToCli(handle, { variants, onProgress }) {
     let lastOverall = 0;      // overall bar never moves backward
     let podId = '';
     let stage = 'Provisioning';
+    const scDone = new Set();   // self-calibration stages that have landed
+    let provStep = 1;           // controller's [N/6] startup step
+    let scStage = null;         // the one running now
+    let scFrac = 0;             // how far into it, when it says
     let jobError = '';       // last [joberror] line, reported instead of the exit code
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
@@ -219,10 +330,18 @@ export function attachToCli(handle, { variants, onProgress }) {
     // ever knocking the bar backward.
     const report = (message) => {
       let overall;
+      // A self-calibrated job spends most of its life before the converter
+      // starts, so the quantize band has to make room for it. A plain quant
+      // keeps the old split -- it must not stall at 15 waiting for a phase
+      // that never comes.
+      const qLow = sc ? 55 : 25;
       switch (stage) {
-        case 'Provisioning': overall = 4; break;
-        case 'Downloading':  overall = 4 + Math.round((curDownloadPct / 100) * 21); break;
-        case 'Quantizing':   overall = 25 + Math.round((curQuantPct / 100) * 65); break;
+        // Renting, waiting for SSH and pulling the image is ~5 minutes of a
+        // 45-minute job, so it gets a band rather than a single number.
+        case 'Provisioning': overall = Math.round((provStep / 4) * 10); break;
+        case 'Downloading':  overall = 10 + Math.round((curDownloadPct / 100) * (sc ? 5 : 15)); break;
+        case 'Calibrating':  overall = 15 + Math.round(scProgress(scDone, scStage, scFrac) * 40); break;
+        case 'Quantizing':   overall = qLow + Math.round((curQuantPct / 100) * (90 - qLow)); break;
         case 'Uploading':    overall = 95; break;
         case 'Complete':     overall = 100; break;
         default:             overall = 0;
@@ -242,6 +361,17 @@ export function attachToCli(handle, { variants, onProgress }) {
 
     function handleLine(line) {
       let m;
+      if ((m = RE.step.exec(line))) {
+        provStep = Math.max(provStep, Number(m[1]));
+        // Only while still provisioning: [4/6] arrives after bootstrap, and the
+        // phase markers own the bar from there.
+        if (stage === 'Provisioning') return report(m[2].trim().slice(0, 60));
+        return;
+      }
+      if ((m = RE.uploadBeat.exec(line))) {
+        stage = 'Uploading';
+        return report(`pushing ${m[1]} bpw · ${Math.round(Number(m[2]) / 60)}m`);
+      }
       if ((m = RE.jobError.exec(line))) {
         jobError = m[1].trim().slice(0, 300);
         return;
@@ -255,6 +385,37 @@ export function attachToCli(handle, { variants, onProgress }) {
         try { samples.set(m[1], Buffer.from(m[2], 'base64').toString('utf8')); }
         catch { /* ignore a malformed marker */ }
         return;
+      }
+      if ((m = RE.scStageDone.exec(line))) {
+        scDone.add(m[1]);
+        scStage = null;
+        scFrac = 0;
+        stage = 'Calibrating';
+        return report(`${m[1]} done`);
+      }
+      if ((m = RE.scBeat.exec(line))) {
+        stage = 'Calibrating';
+        scStage = m[1];
+        const f = m[1] === 'sc_trace' ? scTraceFrac(m[3] || '')
+          : m[1] === 'sc_measure' ? scMeasureFrac(m[3] || '')
+            : null;
+        // Monotonic within the stage: the controller reprints its window, so an
+        // older line can arrive after a newer one.
+        if (f !== null) scFrac = Math.max(scFrac, f);
+        // Elapsed is the liveness signal and survives upstream changing its
+        // output; the tail is shown as-is and trimmed for the embed.
+        const el = m[2] ? `${Math.round(Number(m[2]) / 60)}m · ` : '';
+        return report(`${m[1]} · ${el}${(m[3] || '').trim().slice(0, 60)}`);
+      }
+      if ((m = RE.scStage.exec(line))) {
+        stage = 'Calibrating';
+        scStage = m[1];
+        scFrac = 0;
+        return report(`${m[1]} ...`);
+      }
+      if ((m = RE.scDonor.exec(line))) {
+        stage = 'Calibrating';
+        return report(`donor ${m[1].trim().slice(0, 60)}`);
       }
       if ((m = RE.quantProgress.exec(line))) {
         // pct is layer/total*100 (global, monotonic). "(preparing)" lines have
@@ -312,7 +473,7 @@ export function attachToCli(handle, { variants, onProgress }) {
       try { fs.readSync(fd, b, 0, b.length, readOffset); } finally { fs.closeSync(fd); }
       readOffset = stat.size;
       buf += b.toString('utf8');
-      const lines = buf.split('\n');
+      const lines = buf.split('\n').map(stripAnsi);
       buf = lines.pop();
       for (const line of lines) {
         if (process.env.BQ_DEBUG_RAW) log.info(`[raw] ${line.slice(0, 140)}`);

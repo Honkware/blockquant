@@ -31,6 +31,21 @@ def exl3_variant(bpw) -> str:
     return s + "0" if s.endswith(".") else s
 
 
+def quantized_vision_bits(vision_bits) -> int | None:
+    """The tower bits a name should carry, or None when it carries nothing.
+
+    A request says 16 to mean "copy the tower whole", and the converter records
+    no vision_bits at all for that -- two spellings of the same fact. Callers
+    got this wrong in both directions (a -V16 that claims a quantized tower it
+    does not have, an auto run that drops the -V6 it does), so normalize once
+    here instead of at each call site.
+    """
+    if vision_bits is None:
+        return None
+    n = int(vision_bits)
+    return n if 1 <= n <= 8 else None
+
+
 def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
                    head_bits: int | None = None, vision_bits: int | None = None) -> str:
     """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
@@ -50,7 +65,8 @@ def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
         raise ValueError("A self-calibrated quant must name its head bits")
     v = exl3_variant(variant)
     core = f"SC-{v}bpw-H{int(head_bits)}" if sc else f"{v}bpw"
-    vis = f"-V{int(vision_bits)}" if vision_bits else ""
+    vb = quantized_vision_bits(vision_bits)
+    vis = f"-V{vb}" if vb else ""
     return f"{base_name}-exl3-{core}{vis}"
 
 
@@ -211,6 +227,14 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
     return n_params_b * bpw / 8.0 + 1.5
 
 
+def _mode_label(row: dict) -> str:
+    """How one row differs from a plain quant at its bitrate."""
+    hb = row.get("head_bits")
+    mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
+    vb = quantized_vision_bits(row.get("vision_bits"))
+    return f"{mode}&nbsp;V{vb}" if vb else mode
+
+
 def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0,
                        current_repo_id: str | None = None) -> str:
     """Render the Quants table.
@@ -223,17 +247,41 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     # perturbation is amplified -- the median is what separates quantization
     # damage from that floor.
     has_kl = any(r.get("kl_div") is not None for r in rows)
+    # Name the corpus. It was left off while wiki2 was the only one, and the
+    # method was recorded in bq_quality.json instead -- fine then, a hazard now:
+    # the same quant measures 0.0000435 on its own sampled output and 0.1144 on
+    # wikitext-2, and those two numbers must never sit in tables looking
+    # comparable. Only shown when every scored row agrees, because a mixed
+    # table is the thing to avoid, not to label.
+    # On-distribution KL is two to three orders of magnitude below wiki2 -- the
+    # noise floor on text the model actually produces is that much lower -- and
+    # .4f turned the best result in the table into "0.0000". Pick the format
+    # from the smallest value present so one column stays internally consistent.
+    _kls = [r["kl_div"] for r in rows if r.get("kl_div") is not None]
+    _sci = bool(_kls) and min(_kls) < 1e-3
+    _fmt = (lambda v: f"{v:.2e}") if _sci else (lambda v: f"{v:.4f}")
+    _methods = {(r.get("kl_method") or "") for r in rows if r.get("kl_div") is not None}
+    kl_label = "median&nbsp;KL"
+    if len(_methods) == 1:
+        _m = next(iter(_methods))
+        if "trace" in _m:
+            kl_label = "median&nbsp;KL<br><sub>self-sampled</sub>"
+        elif "wiki2" in _m:
+            kl_label = "median&nbsp;KL<br><sub>wiki2</sub>"
     # Mode only earns a column once a family holds more than one kind. A plain
     # 4.0 and a self-calibrated 4.0 are different weights under the same number,
     # so without it the table would show two rows that look like duplicates.
-    has_mode = any(r.get("sc") or r.get("vision_bits") for r in rows)
+    # A VL family where every row reads "plain V6" is not more than one kind --
+    # that was a whole column restating one fact on every line.
+    modes = [_mode_label(r) for r in rows]
+    has_mode = any(r.get("sc") for r in rows) or len(set(modes)) > 1
     # Head bits and calibration rows are the same down every row and the recipe
     # table below states them for this repo, so the columns only added width.
     header = (
         "| BPW &nbsp; |"
         + (" &nbsp; Mode &nbsp; |" if has_mode else "")
         + " &nbsp; Size &nbsp; |"
-        + (" &nbsp; median&nbsp;KL &nbsp; |" if has_kl else "")
+        + (f" &nbsp; {kl_label} &nbsp; |" if has_kl else "")
         + " &nbsp; Status |\n"
         "| :---: |"
         + (" :---: |" if has_mode else "")
@@ -266,15 +314,12 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
         bpw_cell = f"**{v}**" if is_current else v
         mode_cell = ""
         if has_mode:
-            hb = row.get("head_bits")
-            mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
-            if row.get("vision_bits"):
-                mode += f"&nbsp;V{row['vision_bits']}"
+            mode = _mode_label(row)
             mode_cell = f" **{mode}** |" if is_current else f" {mode} |"
         kl_cell = ""
         if has_kl:
             kl = row.get("kl_div")
-            kl_str = f"{kl:.4f}" if kl is not None else "&mdash;"
+            kl_str = _fmt(kl) if kl is not None else "&mdash;"
             if is_current and kl is not None:
                 kl_str = f"**{kl_str}**"
             kl_cell = f" {kl_str} |"
@@ -402,6 +447,16 @@ def add_to_collection(slug: str, repo_id: str, token: str) -> None:
         )
     except Exception:
         pass
+
+
+def collection_url_for(*, owner: str, base_name: str, token: str) -> str:
+    """The model's collection URL, creating the collection if it is not there.
+
+    Adds nothing to it. The card needs a URL at render time and the callers that
+    only want one were calling ensure_collection with no item_repo_ids, which
+    reads as though it files the repos and does not.
+    """
+    return ensure_collection(owner=owner, base_name=base_name, token=token)
 
 
 def ensure_collection(
