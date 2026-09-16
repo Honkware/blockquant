@@ -499,7 +499,8 @@ def _sc_cache_save(api, repo_id: str, key: dict, work_root: Path) -> None:
 
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int,
-                   timings: dict | None = None) -> tuple[Path, Path]:
+                   timings: dict | None = None,
+                   gpu_count: int = 1) -> tuple[Path, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
 
     Four of turboderp's scripts in order, each a subprocess so a crash in one
@@ -566,8 +567,17 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
         # can be fitted from real jobs instead.
         print(f"[sc] {name} done -> {produces.name} ({_el / 60:.1f}m)", flush=True)
 
-    stage("sc_trace", ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
-                       "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
+    # sc_trace takes exllamav3's model_init options, so on a multi-GPU pod the
+    # donor can load tensor-parallel. Worth doing here and nowhere else in the
+    # chain: this stage is batched generation, which is bandwidth-bound, and TP
+    # splits the weight reads as well as the compute. sc_measure is single
+    # device by construction (torch.device("cuda", args.device)) and
+    # sc_rfn_probe streams a module at a time, so neither gains.
+    trace_argv = ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
+                  "-cr", str(cal_rows), "-cc", str(cal_cols)]
+    if gpu_count > 1:
+        trace_argv += ["-tp"]
+    stage("sc_trace", trace_argv, cal)
     stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
                            "-o", str(rfn)], rfn)
     # --load-mode auto, NOT --streaming. Streaming walks one module at a time
@@ -1537,7 +1547,8 @@ def main() -> int:
                 sc_recipe, sc_cal = _run_sc_stages(
                     model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
-                    cal_cols=sc_cal_cols, timings=sc_timings)
+                    cal_cols=sc_cal_cols, timings=sc_timings,
+                    gpu_count=gpu_count)
                 # A stage that was skipped is recorded as 0.0, so this is
                 # "did this job build anything new". A run that restored
                 # everything has nothing to add and re-uploading would just
@@ -1698,9 +1709,15 @@ def main() -> int:
             rec["_quantize_secs"] = _quant_secs
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
+                # Not `if sc`: a plain quant of a model whose trace is on
+                # disk -- restored from the cache, or left by an SC variant in
+                # the same job -- has to be scored on the same corpus, or the
+                # two numbers sit in one table looking comparable when they are
+                # measured against different distributions.
+                _trace = sc_work / "trace.json"
                 stats, kl_method = _kl_div_eval(
                     out_dir, model_dir, rows=kl_rows,
-                    trace_path=(sc_work / "trace.json") if sc else None)
+                    trace_path=_trace if _trace.is_file() else None)
                 if stats is not None:
                     # The median is what the card quotes. The mean is kept
                     # because turboderp's charts plot it, but his own note is

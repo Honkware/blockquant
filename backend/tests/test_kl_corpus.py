@@ -88,8 +88,22 @@ def test_the_eval_prefers_a_trace_and_keeps_wiki2_as_the_fallback():
     assert "self-sampled trace" in body
 
 
-def test_a_self_calibrated_job_passes_its_trace():
-    src = SRC.read_text()
-    assert "trace_path=(sc_work" in src, (
-        "the SC job still evaluates on wiki2 despite having just written a "
-        "qbench-compatible trace of the model's own output")
+def test_any_variant_with_a_trace_on_disk_is_scored_on_it():
+    """Not only the self-calibrated ones.
+
+    A plain quant of a model whose trace is present -- restored from the cache,
+    or written by an SC variant earlier in the same job -- has to be scored on
+    the same corpus. Otherwise both land in one card table looking comparable
+    while being measured against different distributions, which is the exact
+    mistake that made SC look worse than plain.
+    """
+    calls = [n for n in ast.walk(ast.parse(SRC.read_text()))
+             if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_kl_div_eval"]
+    assert calls, "no _kl_div_eval call in quant.py"
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        if "trace_path" not in kw:
+            continue
+        expr = ast.unparse(kw["trace_path"])
+        assert "is_file" in expr, f"the trace is not chosen by whether it exists: {expr}"
+        assert "sc" not in expr.split("."), f"still gated on the job being SC: {expr}"
