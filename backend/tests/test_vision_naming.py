@@ -14,6 +14,11 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# _name_parts_for imports cards by bare name, the way the pod lays it out
+# flat beside quant.py. Without this the module only passes when another
+# test file has already put that directory on the path -- which one did, so
+# the dependency went unnoticed until this file was run on its own.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "blockquant"))
 from blockquant import cards  # noqa: E402
 
 SRC = Path(__file__).resolve().parent.parent / "src/blockquant/remote/quant.py"
@@ -103,3 +108,60 @@ def test_the_card_rows_carry_the_sc_flag_the_column_reads():
             assert "sc" in keys, f"quant_rows builds {sorted(keys)} -- no sc"
             return
     pytest.fail("no quant_rows in quant.py")
+
+
+TRACE = "qbench · self-sampled trace · 40 rows"
+WIKI2 = "qbench · wiki2 · 40×2048"
+
+
+def _row(v, sc, kl, method, rid=None):
+    return {"variant": v, "head_bits": 6, "vision_bits": 6, "sc": sc,
+            "repo_id": rid or f"o/m-exl3-{v}bpw", "size_gb": 1.0, "url": "u",
+            "kl_div": kl, "kl_method": method}
+
+
+def test_a_tiny_kl_is_not_rounded_away():
+    """The measured SC result is 4.35e-05 and .4f renders it as 0.0000.
+
+    On-distribution KL sits two to three orders of magnitude below wiki2, so
+    the format that suited one corpus erases the other -- and it erases the
+    better number, which is the one the table exists to show.
+    """
+    t = cards.build_quants_table(
+        [_row("3.0", False, 0.0001644, TRACE),
+         _row("3.0", True, 0.00004346, TRACE, "o/m-exl3-SC-3.0bpw-H6-V6")],
+        "3.0", n_params_b=0.8)
+    assert "0.0000" not in t
+    assert "4.35e-05" in t and "1.64e-04" in t
+
+
+def test_wiki2_scale_numbers_stay_readable():
+    t = cards.build_quants_table([_row("4.0", False, 0.0164, WIKI2)], "4.0", n_params_b=0.8)
+    assert "0.0164" in t and "e-" not in t
+
+
+def test_one_column_uses_one_format():
+    # Mixing 0.0164 and 4.35e-05 in a column invites reading them as the same
+    # kind of number.
+    t = cards.build_quants_table(
+        [_row("3.0", True, 0.00004346, TRACE), _row("4.0", False, 0.0164, TRACE)],
+        "3.0", n_params_b=0.8)
+    body = [l for l in t.splitlines() if l.startswith("|") and "BPW" not in l and ":--" not in l]
+    assert all("e-" in l for l in body), body
+
+
+def test_the_column_names_the_corpus_when_the_rows_agree():
+    t = cards.build_quants_table([_row("3.0", True, 0.00004346, TRACE)], "3.0", n_params_b=0.8)
+    assert "self-sampled" in t
+    t2 = cards.build_quants_table([_row("4.0", False, 0.0164, WIKI2)], "4.0", n_params_b=0.8)
+    assert "wiki2" in t2
+
+
+def test_a_mixed_table_claims_neither_corpus():
+    # The same quant measures 0.0000435 on its own output and 0.1144 on
+    # wikitext-2. A table holding both must not label itself either way.
+    t = cards.build_quants_table(
+        [_row("3.0", True, 0.00004346, TRACE), _row("4.0", False, 0.0164, WIKI2)],
+        "3.0", n_params_b=0.8)
+    header = t.splitlines()[0]
+    assert "self-sampled" not in header and "wiki2" not in header
