@@ -129,3 +129,40 @@ def test_sc_never_gets_less_card_than_the_same_model_plain(rj):
 def test_an_unknown_size_does_not_reach_for_the_top(rj):
     # preflight can fail to read it; that must not silently rent an H200.
     assert rj._recommend_max_price(None, sc=True) <= 1.50
+
+
+def test_a_big_sc_job_will_not_settle_for_a_card_it_does_not_fit_in(rj):
+    """Falling back is a worse trade than waiting, for this one stage.
+
+    sc_measure runs a different algorithm depending on whether the fp16
+    weights fit: resident on the GPU, or one module at a time with the states
+    in system RAM. Landing on a 40 GB card with a 52 GB model is not "slower",
+    it is the CPU-bound path -- so the smaller card leaves the sweep entirely
+    rather than acting as a fallback.
+    """
+    assert rj._sc_min_vram(51.75, 24) > 40
+    assert rj._sc_min_vram(51.75, 24) <= 80
+
+
+def test_the_floor_leaves_small_jobs_alone(rj):
+    # They fit anywhere; raising it would only shrink the candidate pool.
+    for gb in (1.63, 15.3):
+        assert rj._sc_min_vram(gb, 24) == 24
+
+
+def test_the_floor_only_ever_rises(rj):
+    for gb in (0, 1.63, 51.75, 140):
+        assert rj._sc_min_vram(gb, 24) >= 24
+    assert rj._sc_min_vram(51.75, 96) == 96      # caller asked for more
+
+
+def test_an_unknown_size_does_not_invent_a_floor(rj):
+    assert rj._sc_min_vram(None, 24) == 24
+    assert rj._sc_min_vram(0, 24) == 24
+
+
+def test_it_leaves_headroom_above_the_weights(rj):
+    # The measurement rows need activations on top of the weights, so the
+    # floor has to sit above the raw model size or the load OOMs and drops
+    # back to streaming anyway.
+    assert rj._sc_min_vram(51.75, 24) > 51.75

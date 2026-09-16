@@ -283,6 +283,27 @@ def _unseen_lines(prev: list[str], cur: list[str]) -> list[str]:
     return cur
 
 
+def _sc_min_vram(base_gb: float | None, floor: int) -> int:
+    """VRAM a self-calibrated job should insist on, not merely prefer.
+
+    sc_measure keeps the fp16 weights resident when they fit and otherwise
+    walks one module at a time with the states in system RAM -- the CPU-bound
+    path, 13 cores for 16 minutes on a model 30x smaller than this floor is
+    aimed at. So a card too small to hold the model does not just run slower,
+    it runs a different algorithm.
+
+    That makes falling back to a smaller card a bad trade rather than a partial
+    one: better to keep sweeping for a big one, which is what raising the floor
+    does -- small cards stop being candidates at all. 1.25x covers activations
+    for the measurement rows on top of the weights.
+
+    Only ever raises the floor, and only when the size is known.
+    """
+    if not base_gb:
+        return floor
+    return max(floor, int(base_gb * 1.25) + 1)
+
+
 def _capable_first(base_gb: float | None, sc: bool = False) -> bool:
     """Whether to try the fastest allowed card first rather than the cheapest.
 
@@ -727,13 +748,24 @@ def main():
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
-        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, args.min_vram, _base_gb,
+        _min_vram = _sc_min_vram(_base_gb, args.min_vram) if args.sc else args.min_vram
+        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
                                        sc=args.sc)
+        if not gpu_candidates and _min_vram > args.min_vram:
+            # Nothing that big exists on the platform at all -- as opposed to
+            # being out of stock, which the launch sweep handles. Take the
+            # streaming path rather than refusing the job outright.
+            print(f"[gpu] no card holds {_base_gb:.0f}GB resident; "
+                  f"falling back to >= {args.min_vram}GB (sc_measure will stream)",
+                  flush=True)
+            _min_vram = args.min_vram
+            gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
+                                           sc=args.sc)
         if not gpu_candidates:
-            print(f"ERROR: no GPUs with >= {args.min_vram}GB VRAM found")
+            print(f"ERROR: no GPUs with >= {_min_vram}GB VRAM found")
             sys.exit(1)
         _order = "capable first" if _capable_first(_base_gb, args.sc) else "cheapest first"
-        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {args.min_vram}GB, {_order}")
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {_min_vram}GB, {_order}")
     else:
         gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order
