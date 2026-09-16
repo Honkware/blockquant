@@ -1,10 +1,15 @@
 """RunPod GPU catalogue lookups — price, and how many fit in one pod."""
 
 # Fallback prices used only when the live lookup fails. Values are the SECURE
-# rate (the higher of the two clouds) so the --max-price cap fails safe. Any
-# card not listed defaults to 2.00, which keeps the cap from accidentally
-# grabbing an unknown high-end card on a price-lookup hiccup. Keep the cheap
-# VRAM-appropriate tier listed so that same hiccup never wrongly EXCLUDES them.
+# rate (the higher of the two clouds) so the --max-price cap fails safe. Keep
+# the cheap VRAM-appropriate tier listed so a lookup hiccup never wrongly
+# EXCLUDES them.
+#
+# An unlisted card is treated as expensive, not as $2.00. The old default did
+# the opposite of what this comment claimed: "NVIDIA H200 NVL" is not the same
+# id as "NVIDIA H200", so it fell through to 2.00, cleared a $2.10 cap, and
+# billed its real $3.79. A default below the high-end tier cannot fail safe --
+# it is exactly the case it was meant to guard.
 STATIC_PRICES = {
     # Cheap consumer / workstation tier (what auto-select targets).
     "NVIDIA RTX 4000 Ada Generation": 0.26,
@@ -29,10 +34,15 @@ STATIC_PRICES = {
     "NVIDIA A100-SXM4-80GB": 1.89,
     "NVIDIA A100-SXM4-40GB": 1.29,
     "NVIDIA H100 PCIe": 2.39,
-    "NVIDIA H100 80GB HBM3": 1.99,
+    "NVIDIA H100 80GB HBM3": 3.49,
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H200": 3.99,
+    "NVIDIA H200 NVL": 3.79,
 }
+
+# What an unlisted card costs, for capping purposes. High on purpose: skipping
+# a cheap new card wastes nothing, taking an expensive one bills for hours.
+UNKNOWN_PRICE = 9.99
 
 
 def lookup_live_price(runpod_sdk, api_key: str, gpu_type: str, cloud_type: str) -> float | None:
@@ -54,7 +64,7 @@ def lookup_live_price(runpod_sdk, api_key: str, gpu_type: str, cloud_type: str) 
 
 
 def static_price(gpu_type: str) -> float:
-    return STATIC_PRICES.get(gpu_type, 2.00)
+    return STATIC_PRICES.get(gpu_type, UNKNOWN_PRICE)
 
 
 def lookup_max_gpu_count(runpod_sdk, api_key: str, gpu_type: str) -> int | None:
