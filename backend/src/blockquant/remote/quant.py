@@ -657,8 +657,38 @@ def _kl_kernel_usable() -> bool:
     return False
 
 
+def _trace_subset(trace_path, rows: int):
+    """A `rows`-row slice of a qbench trace, written beside it.
+
+    The full trace is every (context, response) pair sc_trace sampled --
+    hundreds of variable-length rows, more than the eval needs. Strided rather
+    than a prefix, because rows come out in conversation order and the seed set
+    is grouped by domain.
+    """
+    try:
+        trace_path = Path(trace_path)
+        if not trace_path.is_file():
+            return None
+        data = json.loads(trace_path.read_text(encoding="utf-8"))
+        all_rows = data.get("rows") or []
+        if not all_rows:
+            return None
+        if len(all_rows) > rows:
+            step = len(all_rows) / rows
+            data["rows"] = [all_rows[min(len(all_rows) - 1, int(i * step))]
+                            for i in range(rows)]
+        out = trace_path.with_name(f"{trace_path.stem}-eval{rows}.json")
+        out.write_text(json.dumps(data), encoding="utf-8")
+        return out
+    except Exception as e:
+        print(f"[kl] WARN trace unusable ({type(e).__name__}: {e}); using wiki2",
+              flush=True)
+        return None
+
+
 def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
-                 seq_len: int = 2048) -> tuple[dict | None, str]:
+                 seq_len: int = 2048,
+                 trace_path: Path | None = None) -> tuple[dict | None, str]:
     """KL(fp16 || quant) over held-out text, as qbench reports it.
 
     Returns (stats, method). stats carries kld, kld_median, the p10-p90 spread
@@ -698,21 +728,36 @@ def _kl_div_eval(quant_dir: Path, fp16_dir: Path, rows: int = 10,
         # It also applies the chat template (prepend_hf_chat_context) and
         # reports prefix_len, so metrics skip the framing rather than scoring it.
         project = {
-            "test_data": {"source": "wiki2", "rows": rows, "length": seq_len,
-                          "stride": seq_len},
             # The reference's tokenizer, as qbench's example does. Keying it on
             # the quant instead would re-tokenize per variant, since the cache
             # key is a hash of (dataset spec, tokenizer source).
             "tokenizer": {"source": str(fp16_dir), "template": True},
             "logit_cache": {"dir": str(fp16_dir.parent), "max_size_gb": 50},
         }
-        corpus = "wiki2"
+        # Prefer the model's own sampled output when there is a trace for it.
+        # turboderp's qbench_prompts.py says why: "evaluating quants on
+        # external corpora measures divergence on text the model may never
+        # produce itself ... raw web text is so far out of distribution that
+        # the noise floor inflates and KLD ordering degrades". Ordering is the
+        # whole job of the number on the card -- it is what says which of two
+        # quants is better. sc_trace writes a qbench-compatible trace on every
+        # self-calibrated run and we had been using it only as sc_measure's -tr
+        # and then deleting it with the pod.
+        sub = _trace_subset(trace_path, rows) if trace_path else None
+        if sub is not None:
+            project["test_trace"] = str(sub)
+            corpus = "self-sampled trace"
+        else:
+            project["test_data"] = {"source": "wiki2", "rows": rows,
+                                    "length": seq_len, "stride": seq_len}
+            corpus = "wiki2"
         qcache = QCache(project["logit_cache"])
         ids, ranges, trace_vocab = get_test_rows(project, qcache)
         tcfg = Config.from_directory(str(quant_dir))
         tokenizer = Tokenizer.from_config(tcfg)
         vocab = trace_vocab or tokenizer.actual_vocab_size
-        method = f"qbench · {corpus} · {rows}×{seq_len}"
+        method = (f"qbench · {corpus} · {ids.shape[0]} rows" if corpus != "wiki2"
+                  else f"qbench · {corpus} · {rows}×{seq_len}")
         seqs = [ids[i:i + 1, :] for i in range(ids.shape[0])]
     except Exception as e:
         print(f"[kl] WARN test data failed: {type(e).__name__}: {e}", flush=True)
@@ -1653,7 +1698,9 @@ def main() -> int:
             rec["_quantize_secs"] = _quant_secs
             if kl_eval:
                 print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
-                stats, kl_method = _kl_div_eval(out_dir, model_dir, rows=kl_rows)
+                stats, kl_method = _kl_div_eval(
+                    out_dir, model_dir, rows=kl_rows,
+                    trace_path=(sc_work / "trace.json") if sc else None)
                 if stats is not None:
                     # The median is what the card quotes. The mean is kept
                     # because turboderp's charts plot it, but his own note is
