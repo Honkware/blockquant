@@ -393,6 +393,105 @@ def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
     return list(keep)
 
 
+# The self-calibration artifacts depend on the model and the donor, NOT on the
+# bitrate: trace/cal/rfn/measure are reused verbatim across every variant, and
+# only sc_optimize runs per bitrate. Within one job quant.py already shares
+# them. Across jobs they died with the pod, so asking for a 3.5bpw next week
+# regenerated 42 minutes of identical work -- 25.5 for sc_trace and 16.3 for
+# sc_measure, measured. They total ~10 MB and cal.safetensors is token ids, so
+# the size barely moves with the model.
+_SC_CACHE_FILES = ("trace.json", "cal.safetensors", "rfn.json", "measure.json")
+
+
+def _sc_cache_repo(owner: str, model_name: str) -> str:
+    """Deterministic, so a pod can ask for it before spending anything.
+
+    A dataset repo, and keyed on the base model rather than any one quant: the
+    artifacts outlive any particular bitrate, and filing them inside an SC repo
+    would mean deleting that repo takes the cache with it.
+    """
+    return f"{owner}/{model_name}-exl3-selfcal"
+
+
+def _sc_cache_key(model_id: str, model_rev: str, donor_repo: str,
+                  cal_rows: int, cal_cols: int) -> dict:
+    """Everything the artifacts actually depend on.
+
+    Reused under the wrong key this silently optimizes a quant against another
+    model's measurements, which no error would ever surface -- so the match is
+    exact and anything unrecognised regenerates. exllamav3's version is in here
+    because sc_measure's output is its format, not ours.
+    """
+    try:
+        import exllamav3
+        exl = getattr(exllamav3, "__version__", "?")
+    except Exception:
+        exl = "?"
+    return {
+        "model_id": model_id,
+        "model_rev": model_rev or "",
+        "donor_repo": donor_repo or "",
+        "cal_rows": int(cal_rows),
+        "cal_cols": int(cal_cols),
+        "exllamav3": exl,
+        "schema": 1,
+    }
+
+
+def _sc_cache_restore(api, repo_id: str, key: dict, work_root: Path) -> bool:
+    """Pull a matching cache into work_root. True if every artifact landed.
+
+    Nothing is changed in _run_sc_stages to use this: its stages already skip
+    what is on disk, so restoring the files IS the reuse. A partial restore is
+    no worse than none -- whatever is missing simply gets rebuilt.
+    """
+    from huggingface_hub import hf_hub_download
+    try:
+        man = hf_hub_download(repo_id=repo_id, filename="manifest.json",
+                              repo_type="dataset", token=api.token)
+        have = json.loads(Path(man).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if have != key:
+        diff = [k for k in key if have.get(k) != key.get(k)]
+        print(f"[sc] cache at {repo_id} does not match ({', '.join(diff)}); rebuilding",
+              flush=True)
+        return False
+    work_root.mkdir(parents=True, exist_ok=True)
+    got = 0
+    for name in _SC_CACHE_FILES:
+        try:
+            src = hf_hub_download(repo_id=repo_id, filename=name,
+                                  repo_type="dataset", token=api.token)
+            shutil.copyfile(src, work_root / name)
+            got += 1
+        except Exception as e:
+            print(f"[sc] cache miss for {name}: {type(e).__name__}", flush=True)
+    if got:
+        print(f"[sc] restored {got}/{len(_SC_CACHE_FILES)} artifacts from {repo_id}",
+              flush=True)
+    return got == len(_SC_CACHE_FILES)
+
+
+def _sc_cache_save(api, repo_id: str, key: dict, work_root: Path) -> None:
+    """Best-effort: the quant is what matters, the cache is an optimisation."""
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=False)
+        for name in _SC_CACHE_FILES:
+            f = work_root / name
+            if f.exists() and f.stat().st_size > 0:
+                api.upload_file(path_or_fileobj=str(f), path_in_repo=name,
+                                repo_id=repo_id, repo_type="dataset")
+        # Manifest last: it is the thing a later run trusts, so it must not
+        # appear before the files it vouches for.
+        api.upload_file(path_or_fileobj=json.dumps(key, indent=2).encode(),
+                        path_in_repo="manifest.json", repo_id=repo_id,
+                        repo_type="dataset")
+        print(f"[sc] cached calibration -> {repo_id}", flush=True)
+    except Exception as e:
+        print(f"[sc] WARN could not cache ({type(e).__name__}: {e})", flush=True)
+
+
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int,
                    timings: dict | None = None) -> tuple[Path, Path]:
@@ -1340,10 +1439,28 @@ def main() -> int:
             sc_recipe = sc_cal = None
             sc_timings: dict = {}
             if sc:
+                _sc_work = workspace / "selfcal"
+                _cache_repo = _cache_key = None
+                if api and owner:
+                    _cache_repo = _sc_cache_repo(owner, model_name)
+                    _cache_key = _sc_cache_key(model_id, cfg.get("model_revision", ""),
+                                               donor_repo, sc_cal_rows, sc_cal_cols)
+                    # Only worth asking once: after the first variant the
+                    # artifacts are on disk and the stages skip regardless.
+                    if not (_sc_work / "measure.json").exists():
+                        _sc_cache_restore(api, _cache_repo, _cache_key, _sc_work)
                 sc_recipe, sc_cal = _run_sc_stages(
-                    model_dir, donor_dir, work_root=workspace / "selfcal",
+                    model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
                     cal_cols=sc_cal_cols, timings=sc_timings)
+                # A stage that was skipped is recorded as 0.0, so this is
+                # "did this job build anything new". A run that restored
+                # everything has nothing to add and re-uploading would just
+                # churn the repo.
+                _built = any(sc_timings.get(n, 0) > 0
+                             for n in ("sc_trace", "sc_rfn_probe", "sc_measure"))
+                if _cache_repo and _built:
+                    _sc_cache_save(api, _cache_repo, _cache_key, _sc_work)
 
             print(f"[quantize] {variant} bpw ...", flush=True)
             _t_quant = time.time()
