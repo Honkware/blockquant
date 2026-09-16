@@ -36,6 +36,14 @@ export const commands = [
     )
     .addIntegerOption((opt) =>
       opt
+        .setName('gpu_count')
+        .setDescription('GPUs on the pod. The converter runs one worker thread per device. Default 1.')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(4)
+    )
+    .addIntegerOption((opt) =>
+      opt
         .setName('vision_bits')
         .setDescription('Bits for the vision tower. 1-8, or 16 to copy it unquantized. Default depends on the arch.')
         .setRequired(false)

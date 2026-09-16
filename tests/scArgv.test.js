@@ -45,3 +45,12 @@ describe("keep-pod passthrough", () => {
     expect(h.args).toContain("--keep-pod");
   });
 });
+
+describe("gpu count passthrough", () => {
+  it("sends the flag only when asked", () => {
+    runViaCli({ modelId: "o/m", variants: ["4.0"] });
+    expect(h.args).not.toContain("--gpu-count");
+    runViaCli({ modelId: "o/m", variants: ["4.0"], gpuCount: 2 });
+    expect(flag(h.args, "--gpu-count")).toBe("2");
+  });
+});

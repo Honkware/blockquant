@@ -112,6 +112,11 @@ export async function handleQuant(interaction) {
   // appeared; older builds copied every tower, so the same request gives a
   // different artifact now, and 16 is the way back. preflight resolves which
   // off the generated table, so the name can say -V6 without asking.
+  // exllamav3's converter runs one worker thread per device and tile-splits
+  // large tensors across them, so more cards really do convert faster -- but
+  // the price cap multiplies by the count, and nothing has timed a multi-GPU
+  // convert yet, so it stays opt-in rather than scaling with model size.
+  const gpuCount = interaction.options.getInteger('gpu_count');
   const visionBits = interaction.options.getInteger('vision_bits');
   // Only for repos that keep their model in a subdirectory. Preflight picks it
   // on its own when there is exactly one unquantized candidate, so this is the
@@ -399,6 +404,7 @@ export async function handleQuant(interaction) {
       donorRepo,
       visionBits: towerBits,
       headBits: effHeadBits,
+      gpuCount,
       subfolder,
       categories: [category],
       provider,
@@ -518,6 +524,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     visionBits = null,
     // Older records predate the option; null keeps exllamav3's default.
     headBits = null,
+    gpuCount = null,
     subfolder = null,
     sc = false,
     donorRepo = null,
@@ -783,6 +790,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               codebook,
               visionBits,
               headBits,
+              gpuCount,
               subfolder,
               sc,
               donorRepo,
