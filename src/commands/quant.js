@@ -90,6 +90,19 @@ function visionSummary(flight, bits) {
 // Fanning out meant N pods each generating the same 512,000 calibration
 // tokens: measured at ~25 min and ~16 min on a 0.8B, so three bitrates paid
 // for that twice over and got nothing back.
+// What to quantize as a donor when none exists. sc_trace samples the model
+// through it and sc_rfn_probe walks its module tree, so it has to be at least
+// the target bitrate -- and no more than that, because it is generated through
+// on every calibration row and a fatter donor is a slower trace for no gain.
+// Rounded up to a half-bit so the donor is a sensible artifact in its own
+// right rather than, say, a 3.6bpw oddity nobody asked for.
+export function donorBitrateFor(targetBpw) {
+  const t = Number(targetBpw);
+  if (!Number.isFinite(t)) throw new TypeError(`Invalid target bpw: ${targetBpw}`);
+  const half = Math.ceil(t * 2) / 2;
+  return Math.min(8, Math.max(4, half)).toFixed(1);
+}
+
 export function podGroups(variants, sc) {
   return sc ? [variants.slice()] : variants.map((v) => [v]);
 }
@@ -324,6 +337,7 @@ export async function handleQuant(interaction) {
   // for one already on the hub rather than making the requester find it, and
   // refuse clearly when there is none -- a plain quant has to exist first.
   let donorRepo = null;
+  let donorBpw = null;
   if (sc) {
     const wanted = Math.max(...bpws);
     try {
@@ -333,19 +347,15 @@ export async function handleQuant(interaction) {
         embeds: [embeds.error('Could not look for a donor', toUserMessage(err))],
       });
     }
+    // No donor yet: build one first rather than making the requester run a
+    // separate command and watch for it to finish. The donor requirement is an
+    // implementation detail of self-calibration, not something to hand back.
     if (!donorRepo) {
-      return interaction.editReply({
-        embeds: [
-          embeds.error(
-            'No donor quant to calibrate from',
-            `Self-calibration samples the model through one of its own quants, at least ` +
-              `as many bits as the target. Nothing at \`${wanted}\`bpw or above exists for ` +
-              `\`${modelName}\` yet — run a plain \`/quant\` first, then ask for SC.`
-          ),
-        ],
-      });
+      donorBpw = donorBitrateFor(wanted);
+      log.info(`SC has no donor for ${modelId}; will build ${donorBpw}bpw first`);
+    } else {
+      log.info(`SC donor for ${modelId}: ${donorRepo}`);
     }
-    log.info(`SC donor for ${modelId}: ${donorRepo}`);
   }
 
   // ── Cost gate: refuse if RunPod can't even afford the optimistic estimate ─
@@ -402,6 +412,7 @@ export async function handleQuant(interaction) {
       codebook,
       sc,
       donorRepo,
+      donorBpw,
       visionBits: towerBits,
       headBits: effHeadBits,
       gpuCount,
@@ -528,6 +539,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     subfolder = null,
     sc = false,
     donorRepo = null,
+    donorBpw = null,
     categories,
     provider,
     precheckedRepos = {},
@@ -702,10 +714,17 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     variants.forEach((v) => {
       pstate[v] = { stage: 'Provisioning', overall: 0, message: 'waiting for a GPU', startedAt: Date.now() };
     });
+    // The rows the embed draws. Normally the requested bitrates, but a job that
+    // has to build its own donor first shows that too -- otherwise the embed
+    // sits on "Queued" for the whole donor conversion, which is the frozen
+    // embed this spent a long night getting rid of.
+    let renderVariants = variants;
     renderParallel = throttle(async () => {
       try {
         await progressMsg.edit({
-          embeds: [embeds.jobProgressParallel({ url: modelId, userId, variants, state: pstate })],
+          embeds: [embeds.jobProgressParallel({
+            url: modelId, userId, variants: renderVariants, state: pstate,
+          })],
         });
       } catch (err) {
         log.debug(`parallel embed edit failed: ${err.message}`);
@@ -758,7 +777,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       renderParallel();
     }
 
-    async function runGroup(vs) {
+    async function runGroup(vs, over = {}) {
       const v = vs[0];
       // Resuming: the controller is already running and owns the pod. Attach to
       // its log instead of spawning a second one, and do not retry -- a retry
@@ -794,6 +813,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               subfolder,
               sc,
               donorRepo,
+              ...over,
               onProgress: onGroupProgress(vs),
             });
             markComplete(vs, res);
@@ -815,13 +835,44 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       }
     }
 
+    // Self-calibration with no donor: build one first, on its own pod, and hand
+    // it to the run that needs it. Two pods rather than one -- the saving from
+    // merging them is about seven minutes on a job of several hours, and
+    // splitting keeps each side clear of the 8h max_runtime, which is the
+    // failure that actually costs something. The donor publishes either way, so
+    // a later SC failure still leaves a usable quant behind.
+    let effDonorRepo = donorRepo;
+    let donorResult = null;
+    if (sc && !effDonorRepo && donorBpw) {
+      renderVariants = [donorBpw, ...variants];
+      pstate[donorBpw] = { stage: 'Queued', overall: 0, message: 'donor for self-calibration' };
+      renderParallel();
+      const res = await runGroup([donorBpw], { sc: false, donorRepo: null });
+      effDonorRepo = res?.[0]?.url
+        ? res[0].url.replace('https://huggingface.co/', '')
+        : null;
+      if (!effDonorRepo) {
+        const why = res?.[0]?.error || 'no upload URL';
+        await handleError(new Error(
+          `Could not build the ${donorBpw}bpw donor self-calibration needs: ${why}`));
+        return { thread };
+      }
+      // It is a real published quant, not scaffolding, so it belongs in the
+      // completion embed alongside the variant that was asked for.
+      donorResult = res[0];
+      log.info(`built SC donor ${effDonorRepo} for ${modelId}`);
+      await db.patchJob(jobId, { donorRepo: effDonorRepo })
+        .catch((err) => log.debug(`could not record donor: ${err.message}`));
+    }
+
     const groups = podGroups(variants, sc);
     let settled;
     try {
       settled = await Promise.all(
         // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
         groups.map((g, i) =>
-          new Promise((r) => setTimeout(r, i * 4000)).then(() => runGroup(g))
+          new Promise((r) => setTimeout(r, i * 4000))
+            .then(() => runGroup(g, { donorRepo: effDonorRepo }))
         )
       );
     } finally {
@@ -837,7 +888,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         .edit({ embeds: [stoppedEmbed(after)], components: [] })
         .catch((err) => log.debug(`stopped embed edit failed: ${err.message}`));
     } else {
-      await handleComplete(settled.flat());
+      await handleComplete([...(donorResult ? [donorResult] : []), ...settled.flat()]);
     }
     return { thread };
   }
