@@ -565,13 +565,21 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
                        "-cr", str(cal_rows), "-cc", str(cal_cols)], cal)
     stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
                            "-o", str(rfn)], rfn)
-    # --streaming writes the header and an empty "results" before it measures
-    # anything, so the file exists seconds in and stays that way for the whole
-    # stage. On size alone a resumed job skips the measurement entirely and a
-    # crash halfway reads as success -- either way sc_optimize builds a recipe
-    # from nothing and the quant is silently optimized against it.
-    stage("sc_measure", ["-m", str(model_dir), "-o", str(measure), "--streaming",
-                         "-tr", str(cal)], measure,
+    # --load-mode auto, NOT --streaming. Streaming walks one module at a time
+    # and keeps the cached states in system RAM, so it is bound by the CPU: a
+    # 0.8B measured that way ran 12-16 minutes at ~13 cores with the GPU at 7%,
+    # on a card it would have fit in several times over. Forcing it gave up the
+    # resident path on every model regardless of size. auto checks free VRAM
+    # first and still falls back to streaming -- on the estimate, and again if
+    # the load actually OOMs -- so this is faster where it fits and identical
+    # where it does not.
+    #
+    # The output file is written up front either way, with an empty "results",
+    # so it exists seconds in and keeps that shape for the whole stage. On size
+    # alone a resumed job would skip the measurement and a crash halfway would
+    # read as success, and sc_optimize would build the recipe from nothing.
+    stage("sc_measure", ["-m", str(model_dir), "-o", str(measure),
+                         "--load-mode", "auto", "-tr", str(cal)], measure,
           done=lambda p: _measured_all(p, rfn))
     stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
                           "-rr", str(rfn), "-o", str(recipe)], recipe)

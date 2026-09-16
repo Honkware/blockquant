@@ -104,3 +104,24 @@ def test_sc_measure_is_the_stage_that_gets_the_content_check():
                 "sc_measure is judged on file size again"
             return
     pytest.fail("no sc_measure stage() call in quant.py")
+
+
+def test_sc_measure_is_not_forced_onto_the_streaming_path():
+    """Streaming is the CPU-bound fallback, not the default.
+
+    It walks one module at a time and keeps cached states in system RAM: a
+    0.8B measured that way took 12-16 minutes at ~13 cores with the GPU at 7%,
+    on a card many times larger than the model. --load-mode auto checks free
+    VRAM first and still falls back to streaming, both on the estimate and if
+    the load OOMs, so forcing it only ever gave up speed.
+    """
+    src = SRC.read_text()
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "stage"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "sc_measure"):
+            argv = [a.value for a in node.args[1].elts if isinstance(a, ast.Constant)]
+            assert "--streaming" not in argv, "sc_measure pinned to the CPU-bound path"
+            assert "auto" in argv, f"sc_measure should pick its load mode: {argv}"
+            return
+    pytest.fail("no sc_measure stage() call in quant.py")
