@@ -224,7 +224,20 @@ def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
         # Self-calibration is long enough that a slow cheap card costs more in
         # hours than a fast one costs per hour. Same reasoning the size tiers
         # already use, applied because the work is bigger rather than the model.
-        return max(1.30, _recommend_max_price(base_gb))
+        #
+        # Above the small tier it buys two specific things. sc_trace generates
+        # cal_rows x cal_cols tokens through the donor and is bound by memory
+        # bandwidth; sc_measure falls back to a CPU-bound streaming path unless
+        # the fp16 model fits resident in VRAM, which on the 0.8B run meant 13
+        # cores for 16 minutes. $2.10 is what reaches an H100 80GB HBM3 ($1.99)
+        # or an H200 NVL ($2.00, 143 GB) at today's prices -- roughly twice the
+        # bandwidth of the A100 the $1.80 tier topped out at, and enough VRAM to
+        # keep a 50 GB model off the streaming path. About 11% more per hour for
+        # a stage that should take appreciably less than half as long.
+        base = _recommend_max_price(base_gb)
+        if not base_gb or base_gb <= 20:
+            return max(1.30, base)
+        return max(2.10, base)
     if base_gb <= 20:
         return 0.80   # <= ~10B: cheap cards are fast enough
     if base_gb <= 50:

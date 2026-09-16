@@ -83,3 +83,49 @@ def test_sc_sorts_capable_first_so_the_raised_cap_means_something(rj, monkeypatc
     capable = rj._auto_gpu_ids("k", 24, 3.6, sc=True)
     assert cheap[0] == "NVIDIA GeForce RTX 3090"
     assert capable[0] == "NVIDIA A100-SXM4-40GB"
+
+
+# Real RunPod prices at the time this was written. The SC cap exists to clear
+# the top two, which both hold a 50 GB model resident -- the difference between
+# sc_measure running on the GPU and falling back to its CPU-bound streaming
+# path, measured at ~13 cores for 16 minutes on a model 30x smaller.
+HIGH_VRAM = {
+    "NVIDIA A100-SXM4-40GB": 1.29,
+    "NVIDIA A100 80GB PCIe": 1.64,
+    "NVIDIA A100-SXM4-80GB": 1.89,
+    "NVIDIA H100 80GB HBM3": 1.99,
+    "NVIDIA H200 NVL": 2.00,
+}
+
+
+def test_a_big_sc_job_can_reach_an_h100_or_h200(rj):
+    cap = rj._recommend_max_price(51.75, sc=True)
+    reachable = {g for g, p in HIGH_VRAM.items() if p <= cap}
+    assert "NVIDIA H100 80GB HBM3" in reachable
+    assert "NVIDIA H200 NVL" in reachable
+
+
+def test_the_old_cap_could_not(rj):
+    # The plain tier for this size is $1.80 and both cards sit at $1.99-2.00,
+    # so a 20-cent cap was all that stood between a 52 GB model and a 143 GB
+    # card. Documents why the SC branch is not just max(1.30, tier).
+    plain = rj._recommend_max_price(51.75)
+    assert plain < 1.99
+    assert rj._recommend_max_price(51.75, sc=True) > 2.00
+
+
+def test_a_small_sc_job_stays_on_the_cheap_tier(rj):
+    # Nothing to gain: the model fits resident on anything, and scarce H200
+    # stock should not go to a 0.8B.
+    for gb in (1.63, 15.3, 20):
+        assert rj._recommend_max_price(gb, sc=True) == 1.30
+
+
+def test_sc_never_gets_less_card_than_the_same_model_plain(rj):
+    for gb in (0, 1.63, 15.3, 30, 51.75, 72, 150):
+        assert rj._recommend_max_price(gb, sc=True) >= rj._recommend_max_price(gb)
+
+
+def test_an_unknown_size_does_not_reach_for_the_top(rj):
+    # preflight can fail to read it; that must not silently rent an H200.
+    assert rj._recommend_max_price(None, sc=True) <= 1.50

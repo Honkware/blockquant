@@ -56,8 +56,12 @@ export function maxPricePerHour(sizeGb, sc = false) {
   else if (gb <= 50) cap = 1.30;
   else if (gb <= 100) cap = 1.80;
   else cap = 2.80;
-  // Self-calibration floors the cap so a faster card is reachable at all.
-  return sc ? Math.max(1.30, cap) : cap;
+  // Self-calibration is allowed more card than a plain convert of the same
+  // model: sc_trace is bandwidth-bound and sc_measure drops to a CPU-bound
+  // streaming path unless the fp16 weights fit resident. $2.10 reaches an
+  // H100 80GB or an H200 NVL, which do both.
+  if (!sc) return cap;
+  return !gb || gb <= 20 ? Math.max(1.30, cap) : Math.max(2.10, cap);
 }
 
 /** Hours and dollars for converting one variant of a model this size. */
