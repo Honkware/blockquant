@@ -36,16 +36,24 @@ export async function terminatePod(id) {
   }
 }
 
-// The conversion itself, anchored on the one baseline the repo actually
-// measured: ~3.7 h for a 35B (~72 GB) at cal_rows 250, the same figure
-// run_runpod_job's ETA uses. Conversion is roughly linear in weights, so
-// scale from there rather than quoting one number for every model -- a 0.8B
-// and a 70B were being given the same $1.50-3.00.
-const CONVERT_H_AT_72GB = 3.7;
-const CONVERT_REF_GB = 72;
-// Renting, image pull and the download, before a single layer is quantized.
-const OVERHEAD_H_LOW = 0.25;
-const OVERHEAD_H_HIGH = 0.40;
+// Everything below is calibrated on runs measured on 2026-09-16 rather than
+// guessed, and quotes a band from community rates to secure ones because a job
+// can land in either pool.
+//
+//   conversion   an 8B (15.3 GB) took 31.0 min on one RTX 3090
+//   sc_trace     30,500 tok/min through a 1.1 GB donor on an L40S (864 GB/s)
+//   sc_measure   0.5-0.8x of sc_trace on the one model where both were timed
+//
+// What is NOT measured: sc_measure on a large model, and how tensor-parallel
+// generation scales. The band is wide on purpose where the data is thin.
+const CONVERT_MIN_PER_GB = 31.0 / 15.26;      // measured, one 3090
+const BIG_CARD_SPEEDUP = 1.8;                 // A100-class vs a 3090, convert
+const CONVERT_H_AT_72GB = 3.7;                // the older 35B anchor, kept as the ceiling
+const TRACE_TOK_MIN_REF = 30500;              // measured
+const TRACE_REF_BW = 864;                     // L40S, GB/s
+const TRACE_REF_DONOR_GB = 1.1;
+const BIG_CARD_BW = 1935;                     // A100 80GB, GB/s
+const TRACE_TOKENS = 250 * 2048 * 1.2;        // target plus the wave-sizing pool
 
 /** Mirrors _recommend_max_price in backend/scripts/run_runpod_job.py. */
 export function maxPricePerHour(sizeGb, sc = false) {
@@ -58,63 +66,62 @@ export function maxPricePerHour(sizeGb, sc = false) {
   else cap = 2.80;
   // Self-calibration is allowed more card than a plain convert of the same
   // model: sc_trace is bandwidth-bound and sc_measure drops to a CPU-bound
-  // streaming path unless the fp16 weights fit resident. $2.10 reaches an
-  // H100 80GB or an H200 NVL, which do both.
+  // streaming path unless the fp16 weights fit resident.
   if (!sc) return cap;
   return !gb || gb <= 20 ? Math.max(1.30, cap) : Math.max(2.10, cap);
 }
 
-/** Hours and dollars for converting one variant of a model this size. */
-export function convertCost(sizeGb, sc = false) {
-  const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
-  const h = CONVERT_H_AT_72GB * (gb / CONVERT_REF_GB);
-  const cap = maxPricePerHour(gb, sc);
-  // A plain small model goes cheapest-first and a big one capable-first, so
-  // the rate lands somewhere between half the cap and the cap itself.
-  return {
-    low: (OVERHEAD_H_LOW + h * 0.85) * (cap * 0.5),
-    high: (OVERHEAD_H_HIGH + h * 1.30) * cap,
-  };
+/** Community and secure rates for the card a job this size will land on. */
+export function rateBand(sizeGb, sc = false) {
+  const cap = maxPricePerHour(sizeGb, sc);
+  // Community runs 25-30% under secure on every card checked, and a job can
+  // land in either pool, so the quote spans both rather than picking one.
+  return { low: cap * 0.66, high: cap };
 }
 
-// Self-calibration, paid ONCE per job: sc_trace, sc_rfn_probe and sc_measure
-// depend on the model rather than the bitrate, and an SC job now runs every
-// variant on one pod, so this does not multiply by variant count. Only the
-// conversions do.
-//
-// One measured run: Qwen3.5-0.8B (1.6 GB) took 42 minutes of calibration on an
-// L40S at $1.09/hr, about $0.77. How that grows is NOT known -- the two long
-// stages are bound by different things (sc_trace by GPU bandwidth through the
-// donor, sc_measure by CPU), so a single scale factor cannot describe both,
-// and one point across a 40x size range is not a curve. So this is a
-// deliberately wide band anchored on that measurement and flagged as an
-// estimate. quant.py now records per-stage durations in the job result; fit
-// this from those once a few SC jobs have run, and delete the apology.
-const SC_CAL_LOW_PER_GB = 0.35;
-const SC_CAL_HIGH_PER_GB = 1.60;
-const SC_CAL_FLOOR_LOW = 0.75;
-const SC_CAL_FLOOR_HIGH = 2.50;
+/** Hours to convert one variant of a model this size. */
+export function convertHours(sizeGb, isMoe = false) {
+  const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
+  const measured = (gb * CONVERT_MIN_PER_GB) / 60 / (gb > 20 ? BIG_CARD_SPEEDUP : 1);
+  // The 3.7h-at-72GB anchor is a 35B MoE on a community NVL. Our own timing --
+  // 8B in 31 min on a 3090, a far slower card -- implies ~2.4h at that size,
+  // and both cannot describe the same work: a MoE has many times the tensors
+  // to quantize. So the anchor is the ceiling for MoE and irrelevant to a
+  // dense model, where carrying it doubled the width of a term we have
+  // measured directly.
+  const anchor = CONVERT_H_AT_72GB * (gb / 72);
+  const high = isMoe ? Math.max(measured, anchor) : measured * 1.6;
+  // Renting, image pull and the download, before a single layer is quantized.
+  return { low: 0.25 + measured, high: 0.4 + high };
+}
 
-// A pod cannot outlive max_runtime (8h in poll.py) -- the controller kills it
-// -- and --max-price auto caps a big model's card at $2.80/hr. So no single
-// pod can bill past this no matter what the size scaling says, and quoting a
-// number the system would never let happen is its own kind of wrong. Extrapo-
-// lating 1.6 GB to 70 GB put the ceiling at $124, or 57 hours.
-const MAX_RUNTIME_H = 8;
+/** Hours of self-calibration -- trace, probe, measure -- paid once per job. */
+export function calibrationHours(sizeGb) {
+  const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
+  if (!gb) return { low: 0.75, high: 3.0 };
+  // sc_trace generates through the DONOR, which is a ~4bpw quant of the model.
+  const donorGb = Math.max(0.2, gb / 4);
+  const tokMin = TRACE_TOK_MIN_REF * (BIG_CARD_BW / TRACE_REF_BW) * (TRACE_REF_DONOR_GB / donorGb);
+  const traceH = TRACE_TOKENS / tokMin / 60;
+  // Low end assumes MTP drafting engages (it needs the weights) and that
+  // sc_measure lands at the fast end of the one ratio we have; high end
+  // assumes neither.
+  return { low: (traceH / 2) * 1.5, high: traceH * 1.8 };
+}
 
 /** The one-off calibration cost band for a self-calibrated job. */
 export function scCalibrationCost(sizeGb) {
-  const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
-  // A pod cannot outlive max_runtime (8h in poll.py) at a rate above its own
-  // size tier's cap, so nothing can bill past this however the size scaling
-  // extrapolates -- and quoting a figure the system would never permit is its
-  // own kind of wrong. This used to use the top tier's $2.80 for every model,
-  // which overstated the ceiling for anything under 100 GB.
-  const ceiling = MAX_RUNTIME_H * maxPricePerHour(gb, true);
-  return {
-    low: Math.min(ceiling, Math.max(SC_CAL_FLOOR_LOW, gb * SC_CAL_LOW_PER_GB)),
-    high: Math.min(ceiling, Math.max(SC_CAL_FLOOR_HIGH, gb * SC_CAL_HIGH_PER_GB)),
-  };
+  const h = calibrationHours(sizeGb);
+  const r = rateBand(sizeGb, true);
+  const ceiling = 8 * maxPricePerHour(sizeGb, true);   // a pod cannot outlive max_runtime
+  return { low: Math.min(ceiling, h.low * r.low), high: Math.min(ceiling, h.high * r.high) };
+}
+
+/** Hours and dollars for converting one variant of a model this size. */
+export function convertCost(sizeGb, sc = false, isMoe = false) {
+  const h = convertHours(sizeGb, isMoe);
+  const r = rateBand(sizeGb, sc);
+  return { low: h.low * r.low, high: h.high * r.high };
 }
 
 /**
@@ -153,15 +160,25 @@ export async function getBalance() {
 }
 
 /** Conservative cost band for N variants, e.g. { low: 4.5, high: 9 }. */
-export function estimateCost(variantCount, { sc = false, sizeGb = 0 } = {}) {
+export function estimateCost(variantCount,
+                             { sc = false, sizeGb = 0, needsDonor = false, isMoe = false } = {}) {
   const n = Math.max(0, variantCount || 0);
-  const per = convertCost(sizeGb, sc);
-  const low = n * per.low;
-  const high = n * per.high;
+  const per = convertCost(sizeGb, sc, isMoe);
+  let low = n * per.low;
+  let high = n * per.high;
   if (!sc) return { low, high, sc: false };
   // Once for the job, not once per bitrate.
   const cal = scCalibrationCost(sizeGb);
-  return { low: low + cal.low, high: high + cal.high, sc: true, calibration: cal };
+  low += cal.low;
+  high += cal.high;
+  // The donor is another whole conversion, and the job builds it itself now,
+  // so quoting without it would understate what the requester is agreeing to.
+  if (needsDonor) {
+    const donor = convertCost(sizeGb, false, isMoe);
+    low += donor.low;
+    high += donor.high;
+  }
+  return { low, high, sc: true, calibration: cal, donor: needsDonor };
 }
 
 /** One-line preflight string for the approval embed; '' if balance unknown. */
@@ -171,7 +188,8 @@ export async function costPreflightLine(variantCount, opts = {}) {
   // Whole dollars hide the difference between $0.40 and $1.40 on a small job,
   // which is most of what a self-calibrated 0.8B costs.
   const fmt = (v) => (v < 10 ? v.toFixed(2) : v.toFixed(0));
-  const costStr = `~$${fmt(est.low)}-${fmt(est.high)}${est.sc ? ' (incl. calibration)' : ''}`;
+  const parts = est.sc ? [est.donor ? 'donor + calibration' : 'calibration'] : [];
+  const costStr = `~$${fmt(est.low)}-${fmt(est.high)}${parts.length ? ` (incl. ${parts[0]})` : ''}`;
   if (!bal) {
     return `**Est. RunPod cost:** ${costStr} (balance unavailable)`;
   }

@@ -432,7 +432,9 @@ export async function handleQuant(interaction) {
   }
 
   const costLine = provider === 'runpod'
-    ? await costPreflightLine(variants.length, { sc, sizeGb: flight.sizeGb })
+    ? await costPreflightLine(variants.length, {
+        sc, sizeGb: flight.sizeGb, needsDonor: !!donorBpw, isMoe: !!flight.isMoe,
+      })
     : '';
 
   const requestEmbed = embeds.info(

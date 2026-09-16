@@ -4,7 +4,8 @@ process.env.CLIENT_ID ??= 'test';
 process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
 
-const { estimateCost, scCalibrationCost, convertCost, maxPricePerHour } =
+const { estimateCost, scCalibrationCost, convertCost, maxPricePerHour,
+        rateBand, convertHours, calibrationHours } =
   await import('../src/services/runpod.js');
 
 describe('what the requester is quoted', () => {
@@ -26,7 +27,10 @@ describe('what the requester is quoted', () => {
   it('lands near the one conversion baseline the repo measured', () => {
     // run_runpod_job's ETA uses 3.7 h for a 35B at cal_rows 250; at that
     // size's $1.80/hr cap the band has to contain the resulting ~$6.7.
-    const c = convertCost(72);
+    // The anchor is a 35B A3B -- a MoE -- so that is the shape it describes.
+    // A dense model of the same size converts faster, which is why the anchor
+    // is no longer carried as the ceiling for one.
+    const c = convertCost(72, false, true);
     expect(c.low).toBeLessThan(6.7);
     expect(c.high).toBeGreaterThan(6.7);
   });
@@ -100,6 +104,65 @@ describe('what the requester is quoted', () => {
         const e = estimateCost(n, { sc: true, sizeGb: gb });
         expect(e.low).toBeLessThan(e.high);
       }
+    }
+  });
+});
+
+
+describe('what the quote is calibrated on', () => {
+  const GB = 51.75;   // Swift-Qwen3.8-27b
+
+  it('spans community to secure rather than picking a pool', () => {
+    // A job can land in either; community ran 25-30% under secure on every
+    // card checked, and every pod that week landed on secure.
+    const r = rateBand(GB, true);
+    expect(r.low).toBeLessThan(r.high);
+    expect(r.low / r.high).toBeGreaterThan(0.6);
+    expect(r.low / r.high).toBeLessThan(0.8);
+  });
+
+  it('puts the measured conversion inside the band', () => {
+    // An 8B (15.26 GB) converted in 31.0 min on one 3090, measured.
+    const h = convertHours(15.26);
+    expect(h.low).toBeGreaterThan(31 / 60 * 0.8);
+    expect(h.high).toBeGreaterThan(31 / 60);
+  });
+
+  it('scales calibration off the measured generation rate', () => {
+    // 30,500 tok/min through a 1.1 GB donor on an L40S. A 27B donor is ~12x
+    // bigger, so the trace is slower even on a faster card -- the band has to
+    // be hours here, not minutes.
+    const h = calibrationHours(GB);
+    expect(h.low).toBeGreaterThan(0.5);
+    expect(h.high).toBeLessThan(8);
+    expect(h.low).toBeLessThan(h.high);
+  });
+
+  it('bigger models calibrate for longer', () => {
+    expect(calibrationHours(72).high).toBeGreaterThan(calibrationHours(15).high);
+  });
+
+  it('includes the donor when the job has to build one', () => {
+    // The job builds it now, so leaving it out understates what is being
+    // agreed to -- it is a whole extra conversion.
+    const withDonor = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true });
+    const without = estimateCost(1, { sc: true, sizeGb: GB });
+    expect(withDonor.low).toBeGreaterThan(without.low);
+    expect(withDonor.low - without.low).toBeCloseTo(convertCost(GB, false).low, 6);
+    expect(withDonor.donor).toBe(true);
+  });
+
+  it('contains the bottom-up figure for the 27B job', () => {
+    // Worked by hand from the measured rates: ~$5.60-7.70 on a community
+    // A100 80GB. A band that excluded it would mean one of the two is wrong.
+    const e = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true });
+    expect(e.low).toBeLessThan(7.70);
+    expect(e.high).toBeGreaterThan(5.60);
+  });
+
+  it('still cannot exceed what a pod may bill', () => {
+    for (const gb of [70, 200, 1000]) {
+      expect(scCalibrationCost(gb).high).toBeLessThanOrEqual(8 * maxPricePerHour(gb, true));
     }
   });
 });
