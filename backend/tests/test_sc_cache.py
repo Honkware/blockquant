@@ -163,3 +163,36 @@ def test_a_save_failure_is_not_fatal(mod, tmp_path):
     work.mkdir()
     (work / "trace.json").write_text("x")
     mod["_sc_cache_save"](_Broken(), "o/r", dict(KEY), work)   # must not raise
+
+
+def _main_src() -> str:
+    return SRC.read_text()
+
+
+def test_the_cache_is_consulted_before_the_donor_is_fetched():
+    """Order is the whole saving here.
+
+    A complete cache skips sc_trace and sc_rfn_probe, and those are the only
+    two stages that read the donor -- so fetching it first means pulling ~20 GB
+    on a 27B for a file nothing opens, on exactly the repeat runs the cache
+    exists to make cheap.
+    """
+    src = _main_src()
+    restore = src.index("_sc_cache_restore(api, sc_cache_repo")
+    fetch = src.index("snapshot_download(repo_id=donor_repo")
+    assert restore < fetch, "the donor is fetched before the cache is checked"
+
+
+def test_the_donor_fetch_is_conditional_on_a_cache_miss():
+    src = _main_src()
+    i = src.index("if sc and not sc_cached:")
+    j = src.index("snapshot_download(repo_id=donor_repo", i)
+    # Nothing but the guard's own body between them.
+    assert "def " not in src[i:j], "the donor fetch drifted out of the miss branch"
+
+
+def test_a_cached_run_still_has_a_donor_path_for_the_skipped_stages():
+    # _run_sc_stages builds its argv eagerly, so donor_dir must stay a path
+    # even when nothing downloads to it -- the stages that name it are skipped.
+    src = _main_src()
+    assert 'donor_dir = workspace / "donor" if sc else None' in src

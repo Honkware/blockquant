@@ -1329,26 +1329,6 @@ def main() -> int:
                 )
             print(f"[download] model root -> {model_dir}", flush=True)
 
-        # The self-calibration donor: a quant of this model that generates the
-        # in-domain trace everything downstream is built on. Small next to the
-        # fp16, and fetched here so a failure lands before any GPU time.
-        donor_dir = None
-        if sc:
-            if not donor_repo:
-                raise ValueError("self-calibration needs a donor quant; none was given")
-            donor_dir = workspace / "donor"
-            print(f"[sc] donor {donor_repo} ...", flush=True)
-            snapshot_download(repo_id=donor_repo, local_dir=str(donor_dir),
-                              token=hf_token or None)
-            print(f"[sc] donor ready ({_dir_size_gb(donor_dir):.1f} GB)", flush=True)
-
-        _sanitize_config(model_dir)
-        _disable_missing_mtp(model_dir)
-        _vision_preprocessor_config(model_dir)
-        _ensure_fast_tokenizer(model_dir)
-
-        from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
-
         api = owner = model_name = None
         repo_ids = []
         if hf_token:
@@ -1357,6 +1337,41 @@ def main() -> int:
             # Resolve the user portion when no org was supplied -- HF rejects
             # bare slugs without a namespace.
             owner = hf_org or api.whoami()["name"]
+
+        # Self-calibration artifacts a previous job already built, fetched
+        # before the donor on purpose: a complete cache skips sc_trace and
+        # sc_rfn_probe, and those are the only two stages that read the donor.
+        # Downloading it anyway would be ~20 GB pulled for nothing on a 27B, on
+        # exactly the repeat runs the cache exists to make cheap.
+        sc_work = workspace / "selfcal"
+        sc_cached = False
+        if sc and api and owner:
+            sc_cache_repo = _sc_cache_repo(owner, model_name)
+            sc_cache_key = _sc_cache_key(model_id, cfg.get("model_revision", ""),
+                                         donor_repo, sc_cal_rows, sc_cal_cols)
+            sc_cached = _sc_cache_restore(api, sc_cache_repo, sc_cache_key, sc_work)
+
+        # The self-calibration donor: a quant of this model that generates the
+        # in-domain trace everything downstream is built on. Small next to the
+        # fp16, and fetched here so a failure lands before any GPU time.
+        donor_dir = workspace / "donor" if sc else None
+        if sc and not sc_cached:
+            if not donor_repo:
+                raise ValueError("self-calibration needs a donor quant; none was given")
+            print(f"[sc] donor {donor_repo} ...", flush=True)
+            snapshot_download(repo_id=donor_repo, local_dir=str(donor_dir),
+                              token=hf_token or None)
+            print(f"[sc] donor ready ({_dir_size_gb(donor_dir):.1f} GB)", flush=True)
+        elif sc:
+            print("[sc] calibration restored from cache; donor not needed", flush=True)
+
+        _sanitize_config(model_dir)
+        _disable_missing_mtp(model_dir)
+        _vision_preprocessor_config(model_dir)
+        _ensure_fast_tokenizer(model_dir)
+
+        from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
+
 
         def _name_parts_for(rec: dict) -> dict:
             import cards
@@ -1447,16 +1462,9 @@ def main() -> int:
             sc_recipe = sc_cal = None
             sc_timings: dict = {}
             if sc:
-                _sc_work = workspace / "selfcal"
-                _cache_repo = _cache_key = None
-                if api and owner:
-                    _cache_repo = _sc_cache_repo(owner, model_name)
-                    _cache_key = _sc_cache_key(model_id, cfg.get("model_revision", ""),
-                                               donor_repo, sc_cal_rows, sc_cal_cols)
-                    # Only worth asking once: after the first variant the
-                    # artifacts are on disk and the stages skip regardless.
-                    if not (_sc_work / "measure.json").exists():
-                        _sc_cache_restore(api, _cache_repo, _cache_key, _sc_work)
+                _sc_work = sc_work
+                _cache_repo = sc_cache_repo if (api and owner) else None
+                _cache_key = sc_cache_key if (api and owner) else None
                 sc_recipe, sc_cal = _run_sc_stages(
                     model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
