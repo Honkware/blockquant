@@ -36,11 +36,42 @@ export async function terminatePod(id) {
   }
 }
 
-// Rough per-variant cost band for an EXL3 quant on the cheap auto-selected
-// GPUs (~$0.16-0.69/hr, ~2.5-3 h each). Deliberately conservative so the
-// admin sees a realistic ceiling, not a best case.
-const COST_PER_VARIANT_LOW = 1.5;
-const COST_PER_VARIANT_HIGH = 3.0;
+// The conversion itself, anchored on the one baseline the repo actually
+// measured: ~3.7 h for a 35B (~72 GB) at cal_rows 250, the same figure
+// run_runpod_job's ETA uses. Conversion is roughly linear in weights, so
+// scale from there rather than quoting one number for every model -- a 0.8B
+// and a 70B were being given the same $1.50-3.00.
+const CONVERT_H_AT_72GB = 3.7;
+const CONVERT_REF_GB = 72;
+// Renting, image pull and the download, before a single layer is quantized.
+const OVERHEAD_H_LOW = 0.25;
+const OVERHEAD_H_HIGH = 0.40;
+
+/** Mirrors _recommend_max_price in backend/scripts/run_runpod_job.py. */
+export function maxPricePerHour(sizeGb, sc = false) {
+  const gb = Number(sizeGb) || 0;
+  let cap;
+  if (!gb) cap = 1.5;
+  else if (gb <= 20) cap = 0.80;
+  else if (gb <= 50) cap = 1.30;
+  else if (gb <= 100) cap = 1.80;
+  else cap = 2.80;
+  // Self-calibration floors the cap so a faster card is reachable at all.
+  return sc ? Math.max(1.30, cap) : cap;
+}
+
+/** Hours and dollars for converting one variant of a model this size. */
+export function convertCost(sizeGb, sc = false) {
+  const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
+  const h = CONVERT_H_AT_72GB * (gb / CONVERT_REF_GB);
+  const cap = maxPricePerHour(gb, sc);
+  // A plain small model goes cheapest-first and a big one capable-first, so
+  // the rate lands somewhere between half the cap and the cap itself.
+  return {
+    low: (OVERHEAD_H_LOW + h * 0.85) * (cap * 0.5),
+    high: (OVERHEAD_H_HIGH + h * 1.30) * cap,
+  };
+}
 
 // Self-calibration, paid ONCE per job: sc_trace, sc_rfn_probe and sc_measure
 // depend on the model rather than the bitrate, and an SC job now runs every
@@ -66,15 +97,19 @@ const SC_CAL_FLOOR_HIGH = 2.50;
 // number the system would never let happen is its own kind of wrong. Extrapo-
 // lating 1.6 GB to 70 GB put the ceiling at $124, or 57 hours.
 const MAX_RUNTIME_H = 8;
-const MAX_PRICE_PER_HOUR = 2.80;
-const MAX_POD_COST = MAX_RUNTIME_H * MAX_PRICE_PER_HOUR;
 
 /** The one-off calibration cost band for a self-calibrated job. */
 export function scCalibrationCost(sizeGb) {
   const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
+  // A pod cannot outlive max_runtime (8h in poll.py) at a rate above its own
+  // size tier's cap, so nothing can bill past this however the size scaling
+  // extrapolates -- and quoting a figure the system would never permit is its
+  // own kind of wrong. This used to use the top tier's $2.80 for every model,
+  // which overstated the ceiling for anything under 100 GB.
+  const ceiling = MAX_RUNTIME_H * maxPricePerHour(gb, true);
   return {
-    low: Math.min(MAX_POD_COST, Math.max(SC_CAL_FLOOR_LOW, gb * SC_CAL_LOW_PER_GB)),
-    high: Math.min(MAX_POD_COST, Math.max(SC_CAL_FLOOR_HIGH, gb * SC_CAL_HIGH_PER_GB)),
+    low: Math.min(ceiling, Math.max(SC_CAL_FLOOR_LOW, gb * SC_CAL_LOW_PER_GB)),
+    high: Math.min(ceiling, Math.max(SC_CAL_FLOOR_HIGH, gb * SC_CAL_HIGH_PER_GB)),
   };
 }
 
@@ -116,8 +151,9 @@ export async function getBalance() {
 /** Conservative cost band for N variants, e.g. { low: 4.5, high: 9 }. */
 export function estimateCost(variantCount, { sc = false, sizeGb = 0 } = {}) {
   const n = Math.max(0, variantCount || 0);
-  const low = n * COST_PER_VARIANT_LOW;
-  const high = n * COST_PER_VARIANT_HIGH;
+  const per = convertCost(sizeGb, sc);
+  const low = n * per.low;
+  const high = n * per.high;
   if (!sc) return { low, high, sc: false };
   // Once for the job, not once per bitrate.
   const cal = scCalibrationCost(sizeGb);
