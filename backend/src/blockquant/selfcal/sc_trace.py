@@ -6,6 +6,7 @@ import sys, os
 
 import argparse
 import json
+import math
 import random
 import zlib
 
@@ -634,6 +635,12 @@ def main(args):
             TEMPLATE_VARS = {}
 
     target_tokens = args.target_tokens or args.cal_rows * args.cal_cols
+    # BLOCKQUANT LOCAL PATCH: how much surplus to generate for the shuffle to
+    # draw on. Upstream gets whatever the last wave happens to add, measured at
+    # 1.56x; this asks for a deliberate 1.15x.
+    _POOL_FACTOR = 1.15
+    _avg_conv_tokens = 0.0
+    _conv_count = 0
     rows = []
     total_in = total_out = 0
 
@@ -655,8 +662,41 @@ def main(args):
                 if total_packed() >= target_tokens:
                     break
                 pending = {}    # c_idx -> {"input_ids", "chunks", "eos_reason"}
+                # BLOCKQUANT LOCAL PATCH -- see VENDOR_MANIFEST.json.
+                # The target is only checked at wave boundaries, and a wave is
+                # every live conversation at once, so crossing it early in a
+                # wave still runs the whole wave. Measured on a 0.8B: 798,117
+                # tokens generated for a 512,000 target, the last wave almost
+                # entirely surplus, at ~30k tok/min.
+                #
+                # Those tokens are not wasted -- rows are pooled, shuffled and
+                # sliced to cal_rows x cal_cols at the end, so a bigger pool
+                # means more mixing. But 1.56x is what wave granularity handed
+                # us, not a chosen number. Aim at a deliberate pool instead:
+                # enough slack for the shuffle, without paying for half a wave
+                # of generation nobody asked for.
+                eligible = [i for i, c in enumerate(convs)
+                            if c["alive"] and t_idx < len(c["turns"])]
+                want = int(target_tokens * _POOL_FACTOR) - total_packed()
+                if _avg_conv_tokens and want > 0 and eligible:
+                    # Round up, and over-provision, because falling short means
+                    # another whole wave -- far dearer than a little surplus.
+                    n = min(len(eligible),
+                            max(1, math.ceil(want / _avg_conv_tokens * 1.25)))
+                    if n < len(eligible):
+                        # Stride, not a prefix: the seed set is ordered by
+                        # domain and a prefix would sample only the first few.
+                        step = len(eligible) / n
+                        keep = {eligible[min(len(eligible) - 1, int(i * step))]
+                                for i in range(n)}
+                        eligible = [i for i in eligible if i in keep]
+                        print(f" -- Pool at {total_packed():,}/{int(target_tokens * _POOL_FACTOR):,}; "
+                              f"{len(eligible)} of the wave's conversations this turn")
+                _wave_set = set(eligible)
                 for c_idx, conv in enumerate(convs):
                     if not conv["alive"] or t_idx >= len(conv["turns"]):
+                        continue
+                    if c_idx not in _wave_set:
                         continue
                     conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
                     input_ids = tokenizer.hf_chat_template(
@@ -710,6 +750,13 @@ def main(args):
                     })
                     total_in += p["input_ids"].shape[-1]
                     total_out += response_ids.numel()
+                    # BLOCKQUANT LOCAL PATCH: running mean, so the wave sizing
+                    # above uses this model's real output length rather than a
+                    # guess at max_new_tokens.
+                    _conv_count += 1
+                    _avg_conv_tokens = ((_avg_conv_tokens * (_conv_count - 1)
+                                         + p["input_ids"].shape[-1] + response_ids.numel())
+                                        / _conv_count)
                     conv["messages"].append({
                         "role": "assistant",
                         "content": clean_response_for_context(tokenizer, response_ids),
