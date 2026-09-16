@@ -13,7 +13,7 @@
  * (head bits went unpinned there and every SC job died at launch), so a green
  * run here still needs /quant sc:true before anything is trusted.
  *
- *   node scripts/sc_smoke.mjs Qwen/Qwen3.5-0.8B 3.0 [--gpus N] [--keep-pod]
+ *   node scripts/sc_smoke.mjs Qwen/Qwen3.5-0.8B 3.0 [--gpus N] [--hours H] [--keep-pod]
  *
  * --gpus N is worth having on a big model: sc_trace loads the donor
  * tensor-parallel and the converter runs a worker thread per device, so the
@@ -31,11 +31,14 @@ const hf = await import(path.join(ROOT, 'src/services/huggingface.js'));
 const { defaultHeadBits } = await import(path.join(ROOT, 'src/utils/archSupport.js'));
 
 const argv = process.argv.slice(2);
-const positional = argv.filter((a, i) => a[0] !== '-' && argv[i - 1] !== '--gpus');
+const positional = argv.filter(
+  (a, i) => a[0] !== '-' && argv[i - 1] !== '--gpus' && argv[i - 1] !== '--hours');
 const [modelId = 'Qwen/Qwen3.5-0.8B', bpw = '3.0'] = positional;
 const keepPod = process.argv.includes('--keep-pod');
 const gi = process.argv.indexOf('--gpus');
 const gpuCount = gi === -1 ? null : Number(process.argv[gi + 1]);
+const hi = process.argv.indexOf('--hours');
+const maxRuntimeH = hi === -1 ? null : Number(process.argv[hi + 1]);
 
 const flight = await hf.preflight(modelId);
 if (!flight.modelExists) {
@@ -69,6 +72,7 @@ const res = await runViaCli({
   donorRepo: donor,
   headBits,
   gpuCount,
+  maxRuntimeH,
   keepPod,
   onProgress: (d) => process.stdout.write(
     `[${String(d.overall).padStart(3)}%] ${String(d.stage).padEnd(12)} ${d.message ?? ''}\n`

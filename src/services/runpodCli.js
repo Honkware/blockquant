@@ -188,6 +188,10 @@ export function runViaCli({
   // controller normally terminates on failure, which is right for unattended
   // jobs and wrong when you are watching one you expect to break.
   keepPod = false,
+  // Hours before the controller gives up on a pod. The default is 8, which is
+  // ample for a conversion and thin for a big self-calibrated job: the trace
+  // and the measurement run before a single weight is quantized.
+  maxRuntimeH = null,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -247,6 +251,7 @@ export function runViaCli({
     // together rather than sneaking past it.
     if (gpuCount != null) args.push('--gpu-count', String(gpuCount));
     if (keepPod) args.push('--keep-pod');
+    if (maxRuntimeH != null) args.push('--max-runtime', String(Math.round(maxRuntimeH * 3600)));
     // Unset sends no --cal-rows, so the converter uses its own 250x2048. This
     // passed 250 unconditionally, which is the same number but pinned it.
     if (calRows != null) args.push('--cal-rows', String(calRows));

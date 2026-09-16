@@ -497,6 +497,28 @@ def _sc_cache_save(api, repo_id: str, key: dict, work_root: Path) -> None:
         print(f"[sc] WARN could not cache ({type(e).__name__}: {e})", flush=True)
 
 
+def _has_mtp(model_dir: Path) -> bool:
+    """Does this model carry usable multi-token-prediction weights?
+
+    Declaring mtp_* in config is not enough -- plenty of fine-tunes inherit the
+    keys and ship none of the tensors, which is what _disable_missing_mtp
+    exists to clean up. So look for the weights.
+    """
+    try:
+        idx = Path(model_dir) / "model.safetensors.index.json"
+        if idx.is_file():
+            w = json.loads(idx.read_text(encoding="utf-8")).get("weight_map") or {}
+            return any(k.startswith("mtp.") or ".mtp." in k for k in w)
+        from safetensors import safe_open
+        for f in sorted(Path(model_dir).glob("*.safetensors")):
+            with safe_open(str(f), framework="pt") as h:
+                if any(k.startswith("mtp.") or ".mtp." in k for k in h.keys()):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int,
                    timings: dict | None = None,
@@ -577,7 +599,23 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
                   "-cr", str(cal_rows), "-cc", str(cal_cols)]
     if gpu_count > 1:
         trace_argv += ["-tp"]
-    stage("sc_trace", trace_argv, cal)
+    # Self-speculative decoding off the model's own MTP head, where it has one.
+    # This stage is pure generation and the longest thing in the job, so it is
+    # the one place drafting pays. Speculative decoding samples from the same
+    # distribution, so the corpus stays on-policy -- it will not be the same
+    # token sequence for a given seed, but it is the same kind of text.
+    #
+    # Retried without it on failure rather than trusted: drafting is the most
+    # model-specific thing here, and losing a pod to it would cost more than
+    # the stage saves.
+    if _has_mtp(donor_dir):
+        try:
+            stage("sc_trace", trace_argv + ["-mtp"], cal)
+        except RuntimeError as e:
+            print(f"[sc] MTP drafting failed ({e}); retrying without it", flush=True)
+            stage("sc_trace", trace_argv, cal)
+    else:
+        stage("sc_trace", trace_argv, cal)
     stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
                            "-o", str(rfn)], rfn)
     # --load-mode auto, NOT --streaming. Streaming walks one module at a time

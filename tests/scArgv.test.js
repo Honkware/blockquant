@@ -54,3 +54,17 @@ describe("gpu count passthrough", () => {
     expect(flag(h.args, "--gpu-count")).toBe("2");
   });
 });
+
+describe("max runtime passthrough", () => {
+  it("is left at the launcher default unless asked", () => {
+    runViaCli({ modelId: "o/m", variants: ["4.0"] });
+    expect(h.args).not.toContain("--max-runtime");
+  });
+
+  it("goes over in seconds, because that is what the CLI takes", () => {
+    // 8h is ample for a conversion and thin for a big SC job, where the trace
+    // and the measurement both run before any weight is quantized.
+    runViaCli({ modelId: "o/m", variants: ["4.0"], maxRuntimeH: 12 });
+    expect(flag(h.args, "--max-runtime")).toBe(String(12 * 3600));
+  });
+});
