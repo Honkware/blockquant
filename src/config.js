@@ -99,6 +99,11 @@ const config = Object.freeze({
   // HuggingFace
   HF_TOKEN: required('HF_TOKEN'),
   HF_ORG: process.env.HF_ORG || '',
+  // Every org the bot has published under, for /quants with no model. Storage
+  // ran out on blockblockblock and later quants went to Honkware, so one org
+  // is half the history.
+  LEDGER_ORGS: (process.env.BLOCKQUANT_LEDGER_ORGS || process.env.HF_ORG || '')
+    .split(',').map((s) => s.trim()).filter(Boolean),
 
   // RunPod pod image. Empty = the in-pod bootstrap path (installs the latest
   // ExLlamaV3 fresh; ~5 min slower start but always current). Set to a

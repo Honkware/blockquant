@@ -22,6 +22,7 @@ import {
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
+import { findExl3Quants } from '../services/exl3Index.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
 
 const log = getLogger('cmd:quant');
@@ -547,6 +548,23 @@ export async function handleQuant(interaction) {
     ? await costPreflightLine(variants.length, costOpts)
     : '';
 
+  // Someone else may already have made it. Said on the card so an admin is not
+  // paying for a copy by accident -- #quant-bot has had two people uploading the
+  // same model the same week. Best-effort: a slow HF search costs one line.
+  const ourOrgs = config.LEDGER_ORGS.map((o) => `${o.toLowerCase()}/`);
+  const community = await Promise.race([
+    findExl3Quants(modelId),
+    new Promise((r) => setTimeout(() => r([]), 5000)),
+  ]).then((qs) => qs.filter((q) => q.bpw != null
+      && !ourOrgs.some((o) => q.id.toLowerCase().startsWith(o))
+      && bpws.some((b) => Math.abs(q.bpw - b) < 0.051)))
+    .catch(() => []);
+  const pinned = [
+    mtpBits != null ? `-mb ${mtpBits}` : '',
+    ngramBits != null ? `-ngb ${ngramBits}` : '',
+    hq ? `-hq ${hq}` : '',
+  ].filter(Boolean).join(' · ');
+
   const requestEmbed = embeds.info(
     slot.quanter ? 'Quantization request · starting' : 'Quantization request · awaiting approval',
     [
@@ -554,10 +572,18 @@ export async function handleQuant(interaction) {
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
       subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
       `**Head bits:** ${effHeadBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
+      sc ? `**Self-calibration:** ${scLite ? 'trace only (no measurement)' : 'full'}  ·  **Donor:** ${
+        donorRepo ? `\`${donorRepo}\`` : `builds ${donorBpw}bpw first`}` : '',
+      pinned ? `**Pinned:** \`${pinned}\`` : '',
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
       alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
+      community.length
+        ? `**Already on HF from others:** ${community.slice(0, 3)
+          .map((q) => `[${q.id}](https://huggingface.co/${q.id}) (${q.bpw}${q.kind ? ` ${q.kind}` : ''})`).join(', ')}`
+          + (community.length > 3 ? ` +${community.length - 3} more, see \`/quants\`` : '')
+        : '',
       `**Job:** \`${jobId.slice(0, 8)}\``,
       '',
       slot.quanter

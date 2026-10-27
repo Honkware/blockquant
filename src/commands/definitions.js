@@ -159,6 +159,15 @@ export const commands = [
         )
     ),
 
+  new SlashCommandBuilder()
+    .setName('quants')
+    .setDescription('Every EXL3 quant of a model on Hugging Face, ours and the community\'s')
+    .addStringOption((opt) =>
+      opt
+        .setName('model')
+        .setDescription('HuggingFace URL or ID. Leave empty for the bot\'s latest quants.')
+        .setRequired(false)
+    ),
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),
   new SlashCommandBuilder().setName('health').setDescription('Check bot/service health summary'),
 
