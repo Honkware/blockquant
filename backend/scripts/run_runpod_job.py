@@ -971,6 +971,11 @@ def main():
 
         print(f"[5/6] Polling progress every {args.poll_interval}s...")
         last_lines: list[str] = []
+        # Every line already written, for the final drain. That drain reads the
+        # RAW tail while the polls read a FILTERED one, so an overlap search
+        # between the two finds nothing and reprints the lot -- 670 duplicate
+        # lines at the end of the 27B donor log, [done] included twice.
+        printed: set[str] = set()
 
         def _print_new(tail):
             nonlocal last_lines
@@ -979,6 +984,7 @@ def main():
             if new:
                 sys.stdout.write("\n".join(new) + "\n")
                 sys.stdout.flush()
+                printed.update(new)
             last_lines = cur
 
         outcome = poll_remote(
@@ -999,7 +1005,7 @@ def main():
         # poll skips most of these when the run wraps up between ticks.
         try:
             final_tail = provider.get_progress(instance_id, lines=500, raw=True)
-            new = _unseen_lines(last_lines, final_tail.splitlines()) if final_tail else []
+            new = [l for l in (final_tail or "").splitlines() if l not in printed]
             if new:
                 sys.stdout.write("\n".join(new) + "\n")
                 sys.stdout.flush()
@@ -1007,10 +1013,16 @@ def main():
             print(f"      (final drain skipped: {e})", flush=True)
 
         print(f"\n[6/6] Fetching result...")
+        # A pod that is already gone cannot be read, however many times we
+        # retry: the result file was on its disk. The first 27B SC job lost its
+        # pod in sc_measure, poll_remote returned on "pod gone" (which is also
+        # what a clean finish looks like), and this then spent 70 minutes on
+        # SSH retries before saying anything. Go straight to what is left.
+        pod_gone = provider.pod_is_gone(instance_id)      # False on an API error
         # Reading the result is over SSH and can hit a transient reset right at
         # the end; retry a few times before giving up.
         result = None
-        for _attempt in range(5):
+        for _attempt in range(0 if pod_gone else 5):
             try:
                 result = provider.get_result()
                 if result is not None:
@@ -1027,7 +1039,13 @@ def main():
                 print("      result unreadable over SSH, but the variant is on HF "
                       "-> treating as complete", flush=True)
                 sys.exit(0)
-            print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result')}", flush=True)
+            if pod_gone:
+                seen = next((l.strip() for l in reversed(last_lines) if l.strip()), "nothing")
+                print("[joberror] the pod disappeared before finishing and nothing reached "
+                      f"HF; last progress seen: {seen[:200]}", flush=True)
+            else:
+                print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result')}",
+                      flush=True)
             sys.exit(1)
         status = result.get("status", "unknown")
         print(f"      Status: {status}")
