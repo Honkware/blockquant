@@ -16,7 +16,9 @@ import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
-import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
+import {
+  costPreflightLine, getBalance, estimateCost, convertHours, calibrationHours,
+} from '../services/runpod.js';
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
@@ -133,6 +135,36 @@ export function donorBitrateFor(targetBpw) {
   return Math.min(8, Math.max(DONOR_FLOOR_BPW, half)).toFixed(1);
 }
 
+// The sets #quant-bot keeps asking for by hand: 2.05-ish through 3.5 for
+// 16-24 GB cards, and the usual 4-6. Anything else is still typed out.
+export const BPW_PRESETS = {
+  low: ['2.0', '2.5', '3.0', '3.5'],
+  mid: ['4.0', '4.5', '5.0'],
+  high: ['6.0', '8.0'],
+  ladder: ['2.0', '2.5', '3.0', '3.5', '4.0', '5.0', '6.0'],
+};
+
+/** Presets expanded in place, numbers left as typed, duplicates dropped. */
+export function expandBpw(input) {
+  const out = [];
+  for (const tok of String(input).split(',').map((t) => t.trim().toLowerCase()).filter(Boolean)) {
+    out.push(...(BPW_PRESETS[tok] ?? [tok]));
+  }
+  return [...new Set(out)];
+}
+
+// How long a pod may run before the controller kills it. The launcher default
+// is 8h, which is a conversion with room to spare and not an SC ladder: those
+// run every bitrate on one pod after the calibration, and a 27B low ladder is
+// ~3.5h of calibration plus four conversions. Killed at 8h it has billed the
+// lot and published part. This is the high estimate with a quarter on top --
+// the backstop for a hung pod, not a budget.
+export function podRuntimeHours({ sc = false, scLite = false, sizeGb = 0, isMoe = false, nVariants = 1 }) {
+  const conv = convertHours(sizeGb, isMoe).high;
+  const h = sc ? calibrationHours(sizeGb, { traceOnly: scLite }).high + nVariants * conv : conv;
+  return Math.min(24, Math.max(8, Math.ceil(h * 1.25)));
+}
+
 export function podGroups(variants, sc) {
   return sc ? [variants.slice()] : variants.map((v) => [v]);
 }
@@ -187,14 +219,28 @@ export async function handleQuant(interaction) {
   const provider = 'runpod';
 
   // ── Parse & validate variant list ─────────────────────────────────────────
-  let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
+  let variants = expandBpw(bpwInput);
   if (variants.length === 0) {
     return interaction.editReply({
       embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0`')],
     });
   }
+  // A typo used to be filtered out as NaN and the rest ran without it.
+  const unknown = variants.filter((t) => Number.isNaN(Number(t)));
+  if (unknown.length) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error(
+          'Invalid BPW',
+          `Not a number or a preset: ${unknown.join(', ')}. Presets: ` +
+            Object.entries(BPW_PRESETS).map(([k, v]) => `\`${k}\` (${v.join(', ')})`).join(', ')
+        ),
+      ],
+    });
+  }
 
-  const bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
+  // By value, so 4 and 4.0 are one variant, not two pods.
+  const bpws = [...new Set(variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n)))];
   if (bpws.length === 0) {
     return interaction.editReply({
       embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
@@ -479,6 +525,9 @@ export async function handleQuant(interaction) {
       visionBits: towerBits,
       headBits: effHeadBits,
       gpuCount,
+      // For sizing each pod's runtime limit at launch.
+      sizeGb: flight.sizeGb || 0,
+      isMoe: !!flight.isMoe,
       subfolder,
       categories: [category],
       provider,
@@ -607,6 +656,8 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     hq = null,
     donorRepo = null,
     donorBpw = null,
+    sizeGb = 0,
+    isMoe = false,
     categories,
     provider,
     precheckedRepos = {},
@@ -891,6 +942,9 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               ngramBits,
               hq,
               donorRepo,
+              maxRuntimeH: podRuntimeHours({
+                sc: over.sc ?? sc, scLite: over.scLite ?? scLite, sizeGb, isMoe, nVariants: vs.length,
+              }),
               ...over,
               onProgress: onGroupProgress(vs),
             });

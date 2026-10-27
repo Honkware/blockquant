@@ -13,7 +13,7 @@ export const commands = [
     .addStringOption((opt) =>
       opt
         .setName('bpw')
-        .setDescription('Bits per weight, comma-separated (e.g. 3.0,4.0,5.0)')
+        .setDescription('Bits per weight, comma-separated (e.g. 3.0,4.0,5.0), or low / mid / high / ladder')
         .setRequired(true)
     )
     .addStringOption((opt) =>
