@@ -29,7 +29,7 @@ for stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod import RunPodProvider
 from blockquant.poll import poll_remote
 from blockquant.providers.runpod.constants import REMOTE_LOG, REMOTE_RESULT
 # Same GPU catalogue, orphan sweep, arch registry and failure-line parser /quant

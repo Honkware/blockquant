@@ -8,8 +8,6 @@ Implementation lives in:
 backend/src/blockquant/providers/runpod/
 ```
 
-The old `backend/src/blockquant/providers/runpod_provider.py` file is only a compatibility import.
-
 ## Required environment
 
 ```dotenv

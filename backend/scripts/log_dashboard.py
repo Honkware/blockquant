@@ -440,8 +440,8 @@ def parse_log(text: str, tail_n: int = 60, file_mtime: float | None = None) -> P
 
     # Derived URLs — visible the moment we know the model_id; the predicted
     # output URL is a best-guess that lights up "live" only after upload.
-    # Convention: {org}/{basename}-{variant}bpw-{format} — one repo per bpw,
-    # matches the upload slug in runpod_provider._QUANT_SCRIPT.
+    # One repo per bpw, {org}/{basename}-exl3-{variant}bpw for a plain quant;
+    # cards.exl3_repo_slug is the full rule, SC and suffixes included.
     if state["model_id"]:
         state["source_hf_url"] = f"https://huggingface.co/{state['model_id']}"
         basename = state["model_id"].split("/")[-1]

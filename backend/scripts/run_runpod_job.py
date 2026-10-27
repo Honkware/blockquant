@@ -26,7 +26,7 @@ for stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod import RunPodProvider
 from blockquant.poll import poll_remote, DEFAULT_MAX_RUNTIME_S, DEFAULT_STALL_TIMEOUT_S
 from dotenv import load_dotenv
 
