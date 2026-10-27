@@ -86,6 +86,19 @@ describe('attachToCli', () => {
     await expect(p).rejects.toMatchObject({ podCost: { cost: 10.18, gpu: 'NVIDIA A100-SXM4-80GB x2' } });
   });
 
+  it("links the pinned commit, not the moving branch", async () => {
+    const handle = fakeHandle();
+    const p = attachToCli(handle, { variants: ["4.0"], onProgress: () => {} });
+    const sha = "a".repeat(40);
+    fs.appendFileSync(handle.logPath, "[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n"
+      + `[upload] 4.0 pinned o/m-exl3-4.0bpw@${sha}\n`);
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    const out = await p;
+    expect(out[0].commit).toBe(sha);
+    expect(out[0].treeUrl).toBe(`https://huggingface.co/o/m-exl3-4.0bpw/tree/${sha}`);
+  });
+
   it('reports the controller error when it dies with no upload', async () => {
     const handle = fakeHandle();
     const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });

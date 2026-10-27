@@ -1013,6 +1013,7 @@ class RunPodProvider(Provider):
         ngram_bits: int | None = None,
         hq: int | None = None,
         draft_model: str = "",
+        job_id: str = "",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1055,6 +1056,7 @@ class RunPodProvider(Provider):
             "ngram_bits": ngram_bits,
             "hq": hq,
             "draft_model": draft_model or "",
+            "job_id": job_id or "",
             "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,

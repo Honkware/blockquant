@@ -1142,7 +1142,82 @@ _UPLOAD_TRIES = 4
 _UPLOAD_TERMINAL = {400, 401, 403, 404, 413}
 
 
-def _upload_folder_hb(api, path, repo_id, variant) -> None:
+def _exllamav3_source() -> dict:
+    """The exllamav3 this conversion ran on: version, and the commit pip
+    installed it from. The image installs from git at a pinned ref, and pip
+    records that ref in direct_url.json, so this needs nothing from the image.
+    """
+    import importlib.metadata as md
+    out = {"version": None, "commit": None}
+    try:
+        dist = md.distribution("exllamav3")
+        out["version"] = dist.version
+        du = json.loads(dist.read_text("direct_url.json") or "{}")
+        out["commit"] = (du.get("vcs_info") or {}).get("commit_id")
+    except Exception:
+        pass
+    return out
+
+
+def _provenance(*, repo_id: str, variant: str, rec: dict, name_parts: dict, base_repo: str,
+                base_revision: str | None, subfolder: str, codebook: str, cal_rows, cal_cols,
+                donor_repo: str, exllamav3: dict, job_id: str | None) -> dict:
+    """blockquant.json: what a quant is and how it was made, shipped with the
+    weights so it travels with any commit of them.
+
+    Built field by field, never from the job config, which holds the HF token
+    and the RunPod key. It cannot name its own commit -- that does not exist
+    until it is uploaded -- so the pinned quant commit is reported beside it.
+    """
+    sc = bool(name_parts.get("sc") or name_parts.get("sc_lite"))
+    return {
+        "schema": 1,
+        "job_id": job_id or None,
+        "quant": {
+            "repo_id": repo_id,
+            "bits": float(variant),
+            "head_bits": rec.get("_head_bits"),
+            "vision_bits": rec.get("_vision_bits"),
+            "mtp_bits": name_parts.get("mtp_bits"),
+            "ngram_bits": name_parts.get("ngram_bits"),
+            "hq": name_parts.get("hq"),
+            "codebook": rec.get("_codebook", codebook),
+            "cal_rows": rec.get("_cal_rows", cal_rows),
+            "cal_cols": cal_cols,
+            "calibration": ("self-sampled, trace only" if name_parts.get("sc_lite")
+                            else "self-sampled, measured" if sc else "exllamav3 bundled"),
+            "donor_repo": donor_repo if sc else None,
+        },
+        "base_model": {"repo_id": base_repo, "revision": base_revision, "subfolder": subfolder or None},
+        "exllamav3": exllamav3,
+        "quality": ({"kl_median": rec["kl_div"], "method": rec.get("kl_method"),
+                     "file": "bq_quality.json"} if rec.get("kl_div") is not None else None),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def _pin_heads(api, outputs) -> None:
+    """Record each repo's head once its card is up: the commit to offer
+    anyone who needs one that will not move. It holds the same weights as the
+    upload commit plus the card and chart. Asked of the Hub rather than taken
+    from the last upload_file, because several files went up after the
+    weights and the order is not worth depending on.
+    """
+    for o in outputs:
+        repo_id = o.get("hf_repo_id")
+        if not repo_id:
+            continue
+        try:
+            sha = api.model_info(repo_id).sha
+        except Exception as e:
+            print(f"[upload] {o['variant']} WARN could not read the head ({type(e).__name__})",
+                  flush=True)
+            continue
+        o["hf_pinned"] = sha
+        print(f"[upload] {o['variant']} pinned {repo_id}@{sha}", flush=True)
+
+
+def _upload_folder_hb(api, path, repo_id, variant):
     """upload_folder on a worker thread with a 20s heartbeat -- pushing tens of
     GB is silent for minutes, the last quiet phase that could trip the
     controller's stall watchdog. Raises on failure (after join).
@@ -1151,6 +1226,9 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
     to throw away a conversion that had already succeeded. upload_folder asks
     the remote what it already has and pushes only the rest, so a retry resumes
     a part-uploaded repo rather than starting it again.
+
+    Returns the CommitInfo of the attempt that succeeded, so the caller records
+    the commit that holds these weights rather than a branch name.
     """
     import threading
     for attempt in range(1, _UPLOAD_TRIES + 1):
@@ -1158,7 +1236,8 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
 
         def _do():
             try:
-                api.upload_folder(folder_path=path, repo_id=repo_id, repo_type="model")
+                err["commit"] = api.upload_folder(folder_path=path, repo_id=repo_id,
+                                                  repo_type="model")
             except Exception as exc:
                 err["exc"] = exc
             finally:
@@ -1173,7 +1252,7 @@ def _upload_folder_hb(api, path, repo_id, variant) -> None:
         t.join()
         exc = err.get("exc")
         if exc is None:
-            return
+            return err.get("commit")
         code = getattr(getattr(exc, "response", None), "status_code", None)
         if code in _UPLOAD_TERMINAL or attempt == _UPLOAD_TRIES:
             raise exc
@@ -1513,6 +1592,9 @@ def main() -> int:
         test_prompt: str = (cfg.get("test_prompt") or "").strip()
         # A drafter to quantize beside the model, e.g. a DFlash2 head.
         draft_model: str = (cfg.get("draft_model") or "").strip()
+        # The bot's job id, so a published quant can be traced back to it.
+        job_id = cfg.get("job_id") or None
+        exllamav3_src = _exllamav3_source()
 
         t0 = time.time()
 
@@ -1581,14 +1663,19 @@ def main() -> int:
         import threading
         # Total repo size up front so the heartbeat can report a percent.
         _want = f"{subfolder}/" if subfolder else ""
+        # The base model's commit, resolved once and downloaded at, so what was
+        # quantized is a fixed revision and not whatever main was at the time.
+        # A push to the base mid-download would otherwise mix two of them.
+        base_revision = None
         try:
             _info = HfApi(token=hf_token or None).model_info(model_id, files_metadata=True)
             _total_gb = sum((s.size or 0) for s in (_info.siblings or [])
                             if s.rfilename.startswith(_want)) / 1e9
+            base_revision = getattr(_info, "sha", None)
         except Exception:
             _total_gb = 0.0
         _what = f"{model_id}/{subfolder}" if subfolder else model_id
-        print(f"[download] {_what} ({_total_gb:.1f} GB) ...", flush=True)
+        print(f"[download] {_what} ({_total_gb:.1f} GB) at {base_revision or 'main'} ...", flush=True)
         _dl_done = threading.Event()
         _dl_err: dict = {}
 
@@ -1596,6 +1683,7 @@ def main() -> int:
             try:
                 snapshot_download(
                     repo_id=model_id,
+                    revision=base_revision,
                     local_dir=str(model_dir),
                     token=hf_token or None,
                     allow_patterns=[f"{subfolder}/*"] if subfolder else None,
@@ -1650,7 +1738,7 @@ def main() -> int:
         sc_cached = False
         if sc and api and owner:
             sc_cache_repo = _sc_cache_repo(owner, model_name)
-            sc_cache_key = _sc_cache_key(model_id, cfg.get("model_revision", ""),
+            sc_cache_key = _sc_cache_key(model_id, base_revision or "",
                                          donor_repo, sc_cal_rows, sc_cal_cols)
             sc_cached = _sc_cache_restore(api, sc_cache_repo, sc_cache_key, sc_work)
 
@@ -1737,11 +1825,23 @@ def main() -> int:
             # plain name would collide with the plain quant of the same
             # bitrate, which is the one thing the suffixes exist to stop.
             repo_id = cards.exl3_repo_id(owner, model_name, variant, **rec["_name_parts"])
+            (out_dir / "blockquant.json").write_text(json.dumps(_provenance(
+                repo_id=repo_id, variant=variant, rec=rec, name_parts=rec["_name_parts"],
+                base_repo=model_id, base_revision=base_revision, subfolder=subfolder,
+                codebook=codebook, cal_rows=cal_rows, cal_cols=cal_cols,
+                donor_repo=donor_repo, exllamav3=exllamav3_src, job_id=job_id), indent=2),
+                encoding="utf-8")
             print(f"[upload] {variant} -> {repo_id} ...", flush=True)
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
-            _upload_folder_hb(api, str(out_dir), repo_id, variant)
+            commit = _upload_folder_hb(api, str(out_dir), repo_id, variant)
             rec["hf_repo_id"] = repo_id
-            rec["hf_revision"] = "main"
+            # The commit that holds these weights, not "main", which moves with
+            # every card re-render and every later push to the repo.
+            rec["hf_revision"] = getattr(commit, "oid", None)
+            if rec["hf_revision"]:
+                print(f"[upload] {variant} commit {rec['hf_revision']}", flush=True)
+            else:
+                print(f"[upload] {variant} WARN upload returned no commit id", flush=True)
             rec["hf_url"] = f"https://huggingface.co/{repo_id}"
             repo_ids.append(repo_id)
             # Echo the URL so the dashboard's HF_URL parser rule can populate
@@ -2030,6 +2130,7 @@ def main() -> int:
                                         token=hf_token, item_repo_ids=repo_ids)
             except Exception as exc:
                 print(f"[collection] WARN skipped ({type(exc).__name__}: {exc})", flush=True)
+            _pin_heads(api, outputs)
             print("[upload] complete", flush=True)
 
             # Retroactive KL for existing siblings, reusing the fp16 on disk.

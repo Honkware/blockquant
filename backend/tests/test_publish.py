@@ -72,6 +72,11 @@ def _ns(api, *, sc, vision_bits=None, head_bits=6, hf_token="t", sc_lite=False,
         "ngram_bits": (pinned or {}).get("ngram_bits"),
         "model_dir": Path("/nonexistent"),
         "_model_has_tensor_substring": lambda d, part: has_ngram,
+        # Provenance: written beside the weights before the upload.
+        "_provenance": lambda **kw: {"repo_id": kw["repo_id"]},
+        "model_id": "Qwen/Qwen3.5-0.8B", "base_revision": "a" * 40, "subfolder": "",
+        "cal_cols": None, "donor_repo": "", "job_id": "job-1",
+        "exllamav3_src": {"version": "1.6.5", "commit": None},
         "hf_token": hf_token, "owner": "Honkware", "model_name": "Qwen3.5-0.8B",
         "api": api, "repo_ids": [],
     }

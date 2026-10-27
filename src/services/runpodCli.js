@@ -25,6 +25,8 @@ const RE = {
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
   drafterDone: /\[drafter\]\s*done\s*->\s*(https?:\/\/\S+)/,
+  // The commit each repo holds once its card is up: what a registry pins.
+  pinned: /\[upload\]\s*([0-9.]+)\s+pinned\s+(\S+)@([0-9a-f]{40})/,
   // The launcher's last word on what the pod cost, success or not.
   podCost: /\[cost\]\s*(\d+)s on (.+?) \((\w+)\) at \$([0-9.]+)\/h = \$([0-9.]+)/,
   // Optional smoke-test reply, base64 so newlines/quotes survive the log relay.
@@ -260,6 +262,7 @@ export function runViaCli({
     if (ngramBits != null) args.push('--ngram-bits', String(ngramBits));
     if (hq != null) args.push('--hq', String(hq));
     if (draftModel) args.push('--draft-model', String(draftModel));
+    if (jobId) args.push('--job-id', String(jobId));
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.
@@ -327,6 +330,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
     const results = new Map(); // bpw -> url
     let drafterUrl = null;
     let podCost = null;
+    const pins = new Map(); // bpw -> 40-hex commit
     const samples = new Map(); // bpw -> decoded smoke-test reply
     let curBpw = variants[0];
     let curDownloadPct = 0;   // from [download] N% (monotonic)
@@ -390,6 +394,10 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
       }
       if ((m = RE.jobError.exec(line))) {
         jobError = m[1].trim().slice(0, 300);
+        return;
+      }
+      if ((m = RE.pinned.exec(line))) {
+        pins.set(m[1], m[3]);
         return;
       }
       if ((m = RE.podCost.exec(line))) {
@@ -515,7 +523,10 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
           bpw: v,
           variant: v,
           url,
-          treeUrl: url,
+          // The pinned commit when there is one, so the link stays the
+          // artifact that was built even after later pushes to the repo.
+          treeUrl: url && pins.get(v) ? `${url}/tree/${pins.get(v)}` : url,
+          commit: pins.get(v) || null,
           pushed: !!url,
           reused: false,
           duration: '',

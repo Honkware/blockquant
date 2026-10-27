@@ -629,6 +629,8 @@ def main():
     parser.add_argument("--ngram-bits", type=int, default=None,
                         help="Bits for hashed n-gram embedding tables (PLE models): 1-8. "
                              "Omitted: --bits rounded")
+    parser.add_argument("--job-id", default="",
+                        help="The bot's job id, recorded in each quant's blockquant.json.")
     parser.add_argument("--draft-model", default="",
                         help="HF id of a drafter (DFlash2, MTP head, ...) to quantize at 4bpw "
                              "on the same pod and publish beside the model.")
@@ -1066,6 +1068,7 @@ def main():
             ngram_bits=args.ngram_bits,
             hq=args.hq,
             draft_model=args.draft_model,
+            job_id=args.job_id,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
