@@ -1,0 +1,159 @@
+{
+  "_about": "RunPod cards as the launcher sees them: the secure rate it falls back to when a live lookup fails (high, so the cap fails safe), and conversion speed against an RTX 3090. Read by backend/scripts/run_runpod_job.py to rank candidates and by src/services/gpuQuote.js to quote a job, so the two pick the same card. Speeds are measured where 'measured' says so; the rest are placed by architecture beside the nearest measured card.",
+  "base_min_per_gb": 1.89,
+  "base_note": "RTX 3090: Qwen3-8B 4.0, 31.0 min converting 16.4 GB",
+  "gpu_scaling": 0.79,
+  "gpu_scaling_note": "speedup = gpus ** this; 1.73x for two 3090s, ~1.65x for two A100s",
+  "exclude": {
+    "no_kernels": [
+      "B200",
+      "B300"
+    ],
+    "non_cuda": [
+      "AMD",
+      "Instinct",
+      "Radeon"
+    ],
+    "weak": [
+      "NVIDIA L4"
+    ]
+  },
+  "cards": {
+    "NVIDIA A100 80GB PCIe": {
+      "price": 1.64,
+      "speed": 0.95,
+      "measured": "Qwen3.8-27B 3.8, a 7143 s pod"
+    },
+    "NVIDIA A100-SXM4-40GB": {
+      "price": 1.29,
+      "speed": 1.1
+    },
+    "NVIDIA A100-SXM4-80GB": {
+      "price": 1.89,
+      "speed": 1.1,
+      "measured": "Qwen3.8-27B, 5748-6135 s pods"
+    },
+    "NVIDIA A40": {
+      "price": 0.47,
+      "speed": 0.9
+    },
+    "NVIDIA GeForce RTX 3090": {
+      "price": 0.46,
+      "speed": 1.0,
+      "measured": "Qwen3-8B 4.0, 1.89 min/GB"
+    },
+    "NVIDIA GeForce RTX 3090 Ti": {
+      "price": 0.46,
+      "speed": 1.1
+    },
+    "NVIDIA GeForce RTX 4090": {
+      "price": 0.69,
+      "speed": 2.0
+    },
+    "NVIDIA GeForce RTX 5080": {
+      "price": 0.59,
+      "speed": 1.8
+    },
+    "NVIDIA GeForce RTX 5090": {
+      "price": 1.19,
+      "speed": 3.0
+    },
+    "NVIDIA H100 80GB HBM3": {
+      "price": 3.49,
+      "speed": 2.5
+    },
+    "NVIDIA H100 NVL": {
+      "price": 2.79,
+      "speed": 2.3
+    },
+    "NVIDIA H100 PCIe": {
+      "price": 2.39,
+      "speed": 2.0
+    },
+    "NVIDIA H200": {
+      "price": 3.99,
+      "speed": 2.5
+    },
+    "NVIDIA H200 NVL": {
+      "price": 3.79,
+      "speed": 2.5
+    },
+    "NVIDIA L4": {
+      "price": 0.44
+    },
+    "NVIDIA L40": {
+      "price": 0.99,
+      "speed": 1.8
+    },
+    "NVIDIA L40S": {
+      "price": 0.86,
+      "speed": 2.0,
+      "measured": "Qwen3.5-0.8B 3.0, 2.8 min against the 3090's 5.6"
+    },
+    "NVIDIA RTX 2000 Ada Generation": {
+      "price": 0.28,
+      "speed": 0.4
+    },
+    "NVIDIA RTX 4000 Ada Generation": {
+      "price": 0.26,
+      "speed": 0.7
+    },
+    "NVIDIA RTX 4000 SFF Ada Generation": {
+      "price": 0.26,
+      "speed": 0.6
+    },
+    "NVIDIA RTX 5000 Ada Generation": {
+      "price": 0.83,
+      "speed": 1.3
+    },
+    "NVIDIA RTX 6000 Ada Generation": {
+      "price": 0.77,
+      "speed": 2.0
+    },
+    "NVIDIA RTX A4000": {
+      "price": 0.32,
+      "speed": 0.55
+    },
+    "NVIDIA RTX A4500": {
+      "price": 0.44,
+      "speed": 0.7
+    },
+    "NVIDIA RTX A5000": {
+      "price": 0.46,
+      "speed": 0.8
+    },
+    "NVIDIA RTX A6000": {
+      "price": 0.79,
+      "speed": 1.0
+    },
+    "NVIDIA RTX PRO 4000 Blackwell": {
+      "price": 0.57,
+      "speed": 1.4
+    },
+    "NVIDIA RTX PRO 4500 Blackwell": {
+      "price": 0.72,
+      "speed": 1.8
+    },
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": {
+      "price": 0.72,
+      "speed": 1.8
+    },
+    "NVIDIA RTX PRO 5000 Blackwell": {
+      "price": 0.96,
+      "speed": 2.4
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": {
+      "price": 2.59,
+      "speed": 3.2
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+      "price": 2.49,
+      "speed": 4.2
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": {
+      "price": 2.59,
+      "speed": 4.2,
+      "measured": "Qwen3.8-27B 4.0, ~25 min converting in a 1905 s pod"
+    }
+  }
+}

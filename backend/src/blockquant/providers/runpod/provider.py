@@ -37,9 +37,11 @@ logger = get_logger(__name__)
 
 # Minimum ExLlamaV3 a pre-baked image must ship. Older bakes are rejected at
 # boot so they can't silently quantize with outdated kernels or fail on newer
-# model architectures. Keep in sync with EXLLAMAV3_VERSION in
-# docker/Dockerfile.runpod.
-_MIN_EXLLAMAV3 = (1, 4, 9)
+# model architectures. Keep in sync with EXLLAMAV3_REF in
+# docker/Dockerfile.runpod. quant.py passes -mb/-ngb and a leveled -hq, which
+# 1.5 rejects outright, so an older bake has to fail here rather than at
+# convert time with the pod already billing.
+_MIN_EXLLAMAV3 = (1, 6, 5)
 
 
 class RunPodProvider(Provider):
@@ -121,13 +123,19 @@ class RunPodProvider(Provider):
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     @staticmethod
-    def _base_download_gb(model_id: str, token: str = "") -> float | None:
-        """Total HF download size of the base model in GB, or None on lookup
-        failure."""
+    def _base_download_gb(model_id: str, token: str = "", subfolder: str = "") -> float | None:
+        """What the pod will actually download, in GB, or None on lookup failure.
+
+        Only the subfolder when there is one. Summing the whole repo priced and
+        floored the nerkyor job as a 434 GB model and sized its disk to match,
+        when it pulled the 57 GB BF16 folder and nothing else.
+        """
+        want = f"{subfolder.strip('/')}/" if subfolder else ""
         try:
             from huggingface_hub import HfApi
             info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
-            base_gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
+            base_gb = sum((s.size or 0) for s in (info.siblings or [])
+                          if s.rfilename.startswith(want)) / 1e9
         except Exception:
             return None
         return base_gb if base_gb > 0 else None
@@ -149,7 +157,8 @@ class RunPodProvider(Provider):
 
     @staticmethod
     def recommend_container_gb(
-        model_id: str, variants, token: str = "", floor_gb: int = 120
+        model_id: str, variants, token: str = "", floor_gb: int = 120,
+        sc: bool = False, subfolder: str = "",
     ) -> int:
         """Size the local-NVMe container disk for the SERIAL pipeline. remote/
         quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
@@ -163,10 +172,16 @@ class RunPodProvider(Provider):
           + kl_rows*seq_len*vocab*2        fp16 logits staged for the KL eval
           + 30                             OS + torch/deps + scratch
 
+        Self-calibration adds a donor quant (another output-sized download) and
+        its working set -- the packed calibration rows, the measurement JSON and
+        a recipe per bitrate. The measurement is the big one: it is a per-tensor
+        record, tens of MB, but the trace at 250x2048 tokens and the donor are
+        real. Budget the donor plus 20 GB rather than pretend the stages are free.
+
         Falls back generously when the HF lookups fail; never below floor_gb.
         """
         import math
-        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        base_gb = RunPodProvider._base_download_gb(model_id, token, subfolder)
         if base_gb is None:
             return max(floor_gb, 200)
         bpws = []
@@ -180,6 +195,10 @@ class RunPodProvider(Provider):
         vocab = RunPodProvider._base_vocab(model_id, token) or 200000
         kl = 32 * 2048 * vocab * 2 / 1024**3
         needed = base_gb + out + work + kl + 30.0
+        if sc:
+            # Donor is a quant of this model, so it is output-sized; the trace,
+            # measurement and recipes are small next to it but not nothing.
+            needed += out + 20.0
         return max(floor_gb, int(math.ceil(needed / 10.0) * 10))
 
     # ------------------------------------------------------------------
@@ -981,12 +1000,20 @@ class RunPodProvider(Provider):
         hf_org: str = "",
         head_bits: int | None = None,
         subfolder: str = "",
+        sc: bool = False,
+        donor_repo: str = "",
         vision_bits: int | None = None,
         cal_rows: int | None = None,
         cal_cols: int | None = None,
         keep_pod: bool = False,
         test_prompt: str | None = None,
         codebook: str = "mul1",
+        sc_lite: bool = False,
+        mtp_bits: float | None = None,
+        ngram_bits: int | None = None,
+        hq: int | None = None,
+        draft_model: str = "",
+        job_id: str = "",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1019,7 +1046,17 @@ class RunPodProvider(Provider):
             "hf_org": hf_org,
             "head_bits": head_bits,
             "subfolder": subfolder or "",
+            # Self-calibration, and the quant of this model it calibrates
+            # through. quant.py refuses --sc without the donor.
+            "sc": bool(sc),
+            "donor_repo": donor_repo or "",
             "vision_bits": vision_bits,
+            "sc_lite": bool(sc_lite),
+            "mtp_bits": mtp_bits,
+            "ngram_bits": ngram_bits,
+            "hq": hq,
+            "draft_model": draft_model or "",
+            "job_id": job_id or "",
             "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
@@ -1027,9 +1064,8 @@ class RunPodProvider(Provider):
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
-            # Carried for the remote side, which does not read it yet:
-            # exllamav3's convert defaults to --devices 0, so the extra cards on
-            # a multi-GPU pod sit idle until quant.py passes this through.
+            # exllamav3's convert defaults to --devices 0, so without this the
+            # extra cards on a multi-GPU pod sit idle and bill.
             "gpu_count": self.gpu_count,
         }
         if cal_rows is not None:
@@ -1090,8 +1126,14 @@ class RunPodProvider(Provider):
     # [progress] heartbeat or overwhelm the controller->bot stream, which left
     # the embed frozen on a 35B MoE. The [progress] line already carries the
     # quantize stage + percent, so we don't need the per-layer flood.
+    # Every phase that can run for minutes has to be in here, and not only so
+    # the embed moves: poll_remote's stall clock is driven by this string
+    # changing. A phase whose lines are all filtered out looks identical to a
+    # hung pod, so the controller terminates a healthy one at stall_timeout.
+    # Self-calibration is four such stages and the longest part of an SC job.
     _PROGRESS_MARKERS = (
         r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
+        r"\[sc\]|\[kl\]|\[backfill\]|\[card\]|\[fatal\]|\[drafter\]|"
         r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
     )
 

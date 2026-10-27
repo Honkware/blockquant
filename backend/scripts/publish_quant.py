@@ -99,19 +99,25 @@ def _quant_rows(api, repos, cal_rows, head_bits) -> list[dict]:
     rows = []
     for r in repos:
         v, repo_id = r["variant"], r["repo_id"]
-        kl = None
+        kl = kl_method = None
         try:
             from huggingface_hub import hf_hub_download
             qp = hf_hub_download(repo_id, "bq_quality.json",
                                  token=os.environ.get("HF_TOKEN") or None)
-            kl = json.loads(pathlib.Path(qp).read_text(encoding="utf-8")).get("kl_div")
+            _q = json.loads(pathlib.Path(qp).read_text(encoding="utf-8"))
+            kl = _q.get("kl_div")
+            # Carried so the table can name the corpus. Two quants measured on
+            # different ones are not comparable and the column must say so.
+            kl_method = _q.get("kl_method")
         except Exception:
             pass  # older quants predate the file; the column just stays empty
         rows.append({
             "variant": v, "head_bits": r.get("head_bits") or _repo_head_bits(repo_id, head_bits),
             "sc": r.get("sc", False), "vision_bits": r.get("vision_bits"),
+            "sc_lite": r.get("sc_lite", False), "mtp_bits": r.get("mtp_bits"),
+            "ngram_bits": r.get("ngram_bits"), "hq": r.get("hq"),
             "repo_id": repo_id,
-            "cal_rows": cal_rows, "kl_div": kl,
+            "cal_rows": cal_rows, "kl_div": kl, "kl_method": kl_method,
             "size_gb": _real_size_gb(api, repo_id),
             "url": f"https://huggingface.co/{repo_id}",
         })
@@ -241,8 +247,16 @@ def main():
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
             quantized_by=hf_org, codebook=args.codebook, title_override=args.title,
+            **{k: row.get(k) for k in ("sc", "sc_lite", "mtp_bits", "ngram_bits", "hq")
+               if row.get(k) is not None},
         )
         _push_card(repo_id, args.base, v, rendered)
+        # The card links kl.svg whenever build_kl_svg draws one.
+        svg = cards.build_kl_svg(quant_rows, repo_id)
+        if svg:
+            api.upload_file(path_or_fileobj=svg.encode(), path_in_repo="kl.svg",
+                            repo_id=repo_id, repo_type="model",
+                            commit_message="Update KL chart")
         cards.add_to_collection(slug, repo_id, token)
         print(f"[publish] {v} bpw done -> https://huggingface.co/{repo_id}", flush=True)
     if slug:

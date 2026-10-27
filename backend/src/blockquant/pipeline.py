@@ -119,7 +119,6 @@ def _run_remote_pipeline(
             hf_token=config.hf_token,
             hf_org=config.hf_org,
             head_bits=config.head_bits,
-            use_imatrix=config.use_imatrix,
             codebook=config.codebook,
         )
 

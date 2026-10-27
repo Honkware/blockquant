@@ -13,12 +13,17 @@ import * as quantizer from '../services/quantizer.js';
 import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
+import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
-import { costPreflightLine, getBalance, estimateCost } from '../services/runpod.js';
+import {
+  costPreflightLine, getBalance, quoteCost, convertHours, calibrationHours,
+} from '../services/runpod.js';
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
+import { findExl3Quants } from '../services/exl3Index.js';
+import { notifyAdmins, cardUrl } from '../services/approvalNotify.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
 
 const log = getLogger('cmd:quant');
@@ -74,8 +79,120 @@ function approvalButtons(jobId) {
  * running immediately. The actual quantization runs from runApprovedJob once
  * an admin clicks Approve (see approval.js).
  */
+// What the tower gets, in the terms the requester cares about -- a bitrate or
+// an untouched copy. Which of the two came from the arch and which they typed
+// is not interesting once it is settled.
+function visionSummary(flight, bits) {
+  if (!flight.hasVision) return 'none';
+  return bits >= 1 && bits <= 8 ? `${bits} bpw` : 'fp16, copied';
+}
+
+// One pod per bitrate is right for plain quants: the work is independent and
+// they finish in parallel. Under SC it is not -- sc_trace, sc_rfn_probe and
+// sc_measure depend on the model, not the bitrate, and quant.py already shares
+// them across every variant in a job (only sc_optimize is per-bitrate).
+// Fanning out meant N pods each generating the same 512,000 calibration
+// tokens: measured at ~25 min and ~16 min on a 0.8B, so three bitrates paid
+// for that twice over and got nothing back.
+// What a finished job achieved, judged on the variants that were asked for.
+// A self-calibrated job's own donor lands in `results` too, and on the first
+// 27B run it was the only thing that did: the 3.6bpw SC variant died in
+// sc_measure, the 4.0 donor pushed, the note read "partial upload success
+// (1/2)" without saying which, and the job was recorded as completed.
+// The donor is flagged rather than told apart by bitrate: a 4.0 SC target gets
+// a 4.0 donor, and by label alone the donor would pass for the SC variant.
+export function jobOutcome(variants, results) {
+  const asked = new Set(variants.map(String));
+  const label = (r) => String(r.variant ?? r.bpw);
+  const wanted = (r) => !r.donor && !r.drafter && asked.has(label(r));
+  const requested = results.filter(wanted);
+  const failed = requested.filter((r) => !r.pushed);
+  const extras = results.filter((r) => !wanted(r) && r.pushed);
+  return {
+    status: requested.length && failed.length === requested.length ? 'failed' : 'completed',
+    allDone: requested.length > 0 && failed.length === 0,
+    failed: failed.map(label),
+    reason: failed.map((r) => r.error).find(Boolean) || null,
+    extras: extras.map((r) => r.url || label(r)),
+  };
+}
+
+/** What the job's pods cost in total, and on what, from the [cost] lines. */
+export function jobSpend(results) {
+  const pods = (results || []).flatMap((r) => r.podCost?.pods || []);
+  if (!pods.length) return null;
+  const cards = [...new Set(pods.map((p) => `${p.gpu} (${p.cloud.toLowerCase()})`))].join(', ');
+  return { cost: pods.reduce((a, p) => a + p.cost, 0), cards, pods };
+}
+
+// The least a donor may be. sc_trace generates the whole calibration set
+// through it, so its errors are what the quant gets calibrated toward. This
+// used to be the target rounded up, floored at 4.0 for speed -- a 3.6 SC was
+// traced through a 4.0 -- while turboderp's SC branches and ezexl3 both trace
+// through 6bpw or better, and sharkwipf measured a 6bpw teacher against a full
+// bf16 one on Gemma 4 26B-A4B and found no difference outside noise. Nothing
+// says 4.0 is that close.
+export const DONOR_FLOOR_BPW = 6;
+
+// What to quantize as a donor when none exists: at least the floor, at least
+// the target (sc_rfn_probe walks its module tree against it), and rounded up to
+// a half-bit so it is a sensible artifact in its own right. A 6.0 is also the
+// quant people ask for most once there is an SC family.
+export function donorBitrateFor(targetBpw) {
+  const t = Number(targetBpw);
+  if (!Number.isFinite(t)) throw new TypeError(`Invalid target bpw: ${targetBpw}`);
+  const half = Math.ceil(t * 2) / 2;
+  return Math.min(8, Math.max(DONOR_FLOOR_BPW, half)).toFixed(1);
+}
+
+// The sets #quant-bot keeps asking for by hand: 2.05-ish through 3.5 for
+// 16-24 GB cards, and the usual 4-6. Anything else is still typed out.
+export const BPW_PRESETS = {
+  low: ['2.0', '2.5', '3.0', '3.5'],
+  mid: ['4.0', '4.5', '5.0'],
+  high: ['6.0', '8.0'],
+  ladder: ['2.0', '2.5', '3.0', '3.5', '4.0', '5.0', '6.0'],
+};
+
+/** Presets expanded in place, numbers left as typed, duplicates dropped. */
+export function expandBpw(input) {
+  const out = [];
+  for (const tok of String(input).split(',').map((t) => t.trim().toLowerCase()).filter(Boolean)) {
+    out.push(...(BPW_PRESETS[tok] ?? [tok]));
+  }
+  return [...new Set(out)];
+}
+
+// How long a pod may run before the controller kills it. The launcher default
+// is 8h, which is a conversion with room to spare and not an SC ladder: those
+// run every bitrate on one pod after the calibration, and a 27B low ladder is
+// ~3.5h of calibration plus four conversions. Killed at 8h it has billed the
+// lot and published part. This is the high estimate with a quarter on top --
+// the backstop for a hung pod, not a budget.
+export function podRuntimeHours({ sc = false, scLite = false, sizeGb = 0, isMoe = false, nVariants = 1 }) {
+  const conv = convertHours(sizeGb, isMoe).high;
+  const h = sc ? calibrationHours(sizeGb, { traceOnly: scLite }).high + nVariants * conv : conv;
+  return Math.min(24, Math.max(8, Math.ceil(h * 1.25)));
+}
+
+export function podGroups(variants, sc) {
+  return sc ? [variants.slice()] : variants.map((v) => [v]);
+}
+
 export async function handleQuant(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Every early return below is a reply only the requester sees, and none was
+  // logged. From 09-18 to 10-25 five /quant's ended between preflight and the
+  // job write with nothing on our side to say why, and "Quant bot is dead :("
+  // in #quant-bot was the only report of it. One line per reply says where
+  // each request ended.
+  const editReply = interaction.editReply.bind(interaction);
+  interaction.editReply = (payload) => {
+    const title = payload?.embeds?.[0]?.data?.title;
+    if (title) log.info(`/quant ${interaction.options.getString('url')} by ${interaction.user.username}: ${title}`);
+    return editReply(payload);
+  };
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
@@ -85,18 +202,35 @@ export async function handleQuant(interaction) {
   // Trellis codebook. Recorded in the quant itself, so it decides which
   // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
   const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
-  // 1.4.9 quantizes a validated tower to 6 bpw where older builds copied every
-  // tower whole, so the same request gives a different artifact now. fp16 is
-  // the way back.
+  // sc_mode implies sc: nobody picks a calibration depth for a quant they did
+  // not want calibrated. trace is turboderp's advice for big models -- the
+  // model's own sampled output as calibration plus -hq 2, without measuring.
+  const scMode = interaction.options.getString('sc_mode');
+  const sc = (interaction.options.getBoolean('sc') ?? false) || !!scMode;
+  const scLite = sc && scMode === 'trace';
+  const mtpBits = interaction.options.getNumber('mtp_bits');
+  const ngramBits = interaction.options.getInteger('ngram_bits');
+  // sc_mode:trace without it means -hq 2, and the name has to say so up front.
+  const hqOpt = interaction.options.getInteger('hq');
+  const hq = hqOpt ?? (scLite ? 2 : null);
+  const draftInput = (interaction.options.getString('draft_model') || '').trim();
+  // Omitted means exllamav3 decides, and its default is NOT a flat 6: it is the
+  // tower's own declared default_vision_bits, 6 on the arches with a validated
+  // tower and 16 -- copy it whole -- everywhere else. 1.4.9 is where that split
+  // appeared; older builds copied every tower, so the same request gives a
+  // different artifact now, and 16 is the way back. preflight resolves which
+  // off the generated table, so the name can say -V6 without asking.
+  // exllamav3's converter runs one worker thread per device and tile-splits
+  // large tensors across them, and it shows: an 8B took 31.0 min on one 3090
+  // and 17.9 on two, a 27B ~95 min on one A100 and 57.7 on two. Not linear,
+  // so a second card is ~15-20% more per job for ~40% less wait. Opt-in.
+  const gpuCount = interaction.options.getInteger('gpu_count');
   const visionBits = interaction.options.getInteger('vision_bits');
   // Only for repos that keep their model in a subdirectory. Preflight picks it
   // on its own when there is exactly one unquantized candidate, so this is the
   // tie-breaker, not the normal path.
   const subfolderOpt = (interaction.options.getString('subfolder') || '').trim().replace(/^\/+|\/+$/g, '');
-  // Omitted means exllamav3 decides. Note its default is NOT a flat 6: it is
-  // the tower's own declared default_vision_bits, which is 6 on the six
-  // validated arches (qwen3_vl, gemma4, glm4v, step3_7, deepseek_v4_vision,
-  // muse_glimmer) and 16 everywhere else. Tracking that beats copying it.
+  // Omitted means exllamav3 decides.
   const headBits = interaction.options.getInteger('head_bits');
   const userId = interaction.user.id;
 
@@ -107,14 +241,28 @@ export async function handleQuant(interaction) {
   const provider = 'runpod';
 
   // ── Parse & validate variant list ─────────────────────────────────────────
-  let variants = bpwInput.split(',').map((s) => s.trim()).filter(Boolean);
+  let variants = expandBpw(bpwInput);
   if (variants.length === 0) {
     return interaction.editReply({
       embeds: [embeds.error('Invalid Variants', 'Provide comma-separated values, e.g. `3.0,4.0,5.0`')],
     });
   }
+  // A typo used to be filtered out as NaN and the rest ran without it.
+  const unknown = variants.filter((t) => Number.isNaN(Number(t)));
+  if (unknown.length) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error(
+          'Invalid BPW',
+          `Not a number or a preset: ${unknown.join(', ')}. Presets: ` +
+            Object.entries(BPW_PRESETS).map(([k, v]) => `\`${k}\` (${v.join(', ')})`).join(', ')
+        ),
+      ],
+    });
+  }
 
-  const bpws = variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n));
+  // By value, so 4 and 4.0 are one variant, not two pods.
+  const bpws = [...new Set(variants.map((s) => parseFloat(s)).filter((n) => !isNaN(n)))];
   if (bpws.length === 0) {
     return interaction.editReply({
       embeds: [embeds.error('Invalid BPW', 'Provide comma-separated numbers, e.g. `3.0,4.0,5.0`')],
@@ -149,6 +297,29 @@ export async function handleQuant(interaction) {
       ],
     });
   }
+  // -mb takes whole bits, the three half-integer mul1 rates, or 16.
+  if (mtpBits !== null && !(Number.isInteger(mtpBits) && (mtpBits <= 8 || mtpBits === 16))
+      && ![1.5, 2.5, 3.5].includes(mtpBits)) {
+    return interaction.editReply({
+      embeds: [embeds.error('Invalid MTP bits', 'MTP bits must be 1-8, 1.5, 2.5, 3.5, or 16.')],
+    });
+  }
+
+  // A plain quant leaves the defaults out of its name -- that is what a bare
+  // `-exl3-4.0bpw` means. SC states everything, because the recipe picks head
+  // bits per budget and turboderp's SC branches name them (H3 through H6 on one
+  // model), so a bare bitrate would not identify the artifact.
+  if (sc && headBits === null) {
+    return interaction.editReply({
+      embeds: [
+        embeds.error(
+          'Self-calibration needs head bits',
+          'The recipe carries head bits and they go in the published name, so there is ' +
+            'no default to fall back on. Pass `head_bits` (1-8, or 16).'
+        ),
+      ],
+    });
+  }
 
   // ── Parse model URL ───────────────────────────────────────────────────────
   let modelId;
@@ -178,6 +349,36 @@ export async function handleQuant(interaction) {
       embeds: [embeds.error('Model Not Found', `\`${modelId}\` does not exist or is not accessible.`)],
     });
   }
+  // Under SC the name carries the tower state, so it has to be settled before
+  // the job runs -- inspectUploadRepo checks the final name up front. This used
+  // to make the requester state it by hand; preflight resolves the arch default
+  // off the generated table now, so it names itself.
+  const effVisionBits = visionBits ?? (flight.hasVision ? flight.visionBitsAuto : null);
+  // SC has to pin head bits rather than leave them to the converter: the name
+  // states them, and run_runpod_job refuses --sc without them for that reason.
+  // Resolving this only for the name left the flag unsent and every SC job from
+  // Discord died at launch unless the requester happened to type a number.
+  const effHeadBits = sc ? headBits ?? defaultHeadBits() : headBits;
+  // Pinning the tower to the number the arch already picks says nothing the
+  // plain name does not, and would publish a -V6 beside an identical unsuffixed
+  // build. Drop it back to auto so both spellings land on one repo.
+  const towerBits = visionBits !== null && visionBits === flight.visionBitsAuto ? null : visionBits;
+
+  // The drafter has to be one exllamav3 converts (DFlash2DraftModel and kin),
+  // which preflight checks against the same table. Found out here, not after
+  // the model's own quants have been paid for.
+  let draftModel = null;
+  if (draftInput) {
+    try {
+      draftModel = hf.parseModelId(draftInput);
+      await hf.preflight(draftModel);
+    } catch (err) {
+      return interaction.editReply({
+        embeds: [embeds.error('Drafter not usable', `\`${draftInput}\`: ${toUserMessage(err)}`)],
+      });
+    }
+  }
+
   // Preflight resolves this when the repo has one obvious source; an explicit
   // option wins so someone can quant the FP8 copy if they really mean to.
   const subfolder = subfolderOpt || flight.subfolder || null;
@@ -206,12 +407,20 @@ export async function handleQuant(interaction) {
   if (format === 'exl3') {
     try {
       for (const bpw of bpws) {
-        const repoName = exl3RepoName(modelName, bpw);
+        const repoName = exl3RepoName(modelName, bpw, {
+          sc,
+          scLite,
+          headBits: sc ? effHeadBits : null,
+          visionBits: sc ? effVisionBits : towerBits,
+          mtpBits,
+          ngramBits,
+          hq,
+        });
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
           bpw,
           hasVision: flight.hasVision,
-          quantOptions: { headBits, visionBits },
+          quantOptions: { headBits: effHeadBits, visionBits: towerBits },
         });
         precheckedRepos[String(bpw)] = state;
         // config_missing is a repo whose config.json could not be read -- an
@@ -256,12 +465,47 @@ export async function handleQuant(interaction) {
     }
   }
 
+  // ── Self-calibration donor ────────────────────────────────────────────────
+  // The trace is generated by a quant OF THIS MODEL: sc_rfn_probe walks both
+  // module trees together and sc_measure runs that trace through this model's
+  // embedding, so a quant of anything else fails in two different ways. Look
+  // for one already on the hub rather than making the requester find it, and
+  // refuse clearly when there is none -- a plain quant has to exist first.
+  let donorRepo = null;
+  let donorBpw = null;
+  if (sc) {
+    const wanted = Math.max(...bpws);
+    try {
+      // An existing 4.0 no longer qualifies; the job builds a 6.0 instead.
+      donorRepo = await hf.findDonorQuant(modelName, Math.max(DONOR_FLOOR_BPW, wanted));
+    } catch (err) {
+      return interaction.editReply({
+        embeds: [embeds.error('Could not look for a donor', toUserMessage(err))],
+      });
+    }
+    // No donor yet: build one first rather than making the requester run a
+    // separate command and watch for it to finish. The donor requirement is an
+    // implementation detail of self-calibration, not something to hand back.
+    if (!donorRepo) {
+      donorBpw = donorBitrateFor(wanted);
+      log.info(`SC has no donor for ${modelId}; will build ${donorBpw}bpw first`);
+    } else {
+      log.info(`SC donor for ${modelId}: ${donorRepo}`);
+    }
+  }
+
   // ── Cost gate: refuse if RunPod can't even afford the optimistic estimate ─
   // The work to actually do is the variants minus the ones already uploaded.
   const billable = Math.max(1, variants.length - alreadyUploaded.length);
+  // One set of options for the gate and the quote. The gate used to price a
+  // plain quant of unknown size, so an SC job on a 27B cleared it at $1.50.
+  const costOpts = {
+    sc, scLite, sizeGb: flight.sizeGb, needsDonor: !!donorBpw, isMoe: !!flight.isMoe,
+    gpuCount: gpuCount || 1,
+  };
   if (provider === 'runpod') {
     const bal = await getBalance();
-    const est = estimateCost(billable);
+    const est = await quoteCost(billable, costOpts);
     if (bal && est.low > bal.balance) {
       return interaction.editReply({
         embeds: [
@@ -308,8 +552,20 @@ export async function handleQuant(interaction) {
       bpws,
       testPrompt,
       codebook,
-      visionBits,
-      headBits,
+      sc,
+      scLite,
+      mtpBits,
+      ngramBits,
+      hq,
+      draftModel,
+      donorRepo,
+      donorBpw,
+      visionBits: towerBits,
+      headBits: effHeadBits,
+      gpuCount,
+      // For sizing each pod's runtime limit at launch.
+      sizeGb: flight.sizeGb || 0,
+      isMoe: !!flight.isMoe,
       subfolder,
       categories: [category],
       provider,
@@ -325,7 +581,35 @@ export async function handleQuant(interaction) {
     releaseRunSlot(userId);
   }
 
-  const costLine = provider === 'runpod' ? await costPreflightLine(variants.length) : '';
+  const costLine = provider === 'runpod'
+    ? await costPreflightLine(variants.length, costOpts)
+    : '';
+  // Kept on the job so the completion can put what it cost beside it.
+  if (provider === 'runpod') {
+    const q = await quoteCost(variants.length, costOpts).catch(() => null);
+    if (q) {
+      await db.patchJob(jobId, { quote: { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null } })
+        .catch(() => {});
+    }
+  }
+
+  // Someone else may already have made it. Said on the card so an admin is not
+  // paying for a copy by accident -- #quant-bot has had two people uploading the
+  // same model the same week. Best-effort: a slow HF search costs one line.
+  const ourOrgs = config.LEDGER_ORGS.map((o) => `${o.toLowerCase()}/`);
+  const community = await Promise.race([
+    findExl3Quants(modelId),
+    new Promise((r) => setTimeout(() => r([]), 5000)),
+  ]).then((qs) => qs.filter((q) => q.bpw != null
+      && !ourOrgs.some((o) => q.id.toLowerCase().startsWith(o))
+      && bpws.some((b) => Math.abs(q.bpw - b) < 0.051)))
+    .catch(() => []);
+  const pinned = [
+    draftModel ? `drafter ${draftModel}` : '',
+    mtpBits != null ? `-mb ${mtpBits}` : '',
+    ngramBits != null ? `-ngb ${ngramBits}` : '',
+    hq ? `-hq ${hq}` : '',
+  ].filter(Boolean).join(' · ');
 
   const requestEmbed = embeds.info(
     slot.quanter ? 'Quantization request · starting' : 'Quantization request · awaiting approval',
@@ -333,11 +617,26 @@ export async function handleQuant(interaction) {
       `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
       `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
       subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
-      `**Head bits:** ${headBits ?? 6}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionBits ?? 'arch default'}`,
+      `**Head bits:** ${effHeadBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
+      sc ? `**Self-calibration:** ${scLite ? 'trace only (no measurement)' : 'full'}  ·  **Donor:** ${
+        donorRepo ? `\`${donorRepo}\`` : `builds ${donorBpw}bpw first`}` : '',
+      pinned ? `**Pinned:** \`${pinned}\`` : '',
+      // Measured on 3090s and A100s: two cards convert ~1.7x faster for
+      // ~15-20% more per job. SC's trace and measurement use one card, so
+      // there the extra cards only speed up the conversion at the end.
+      (gpuCount || 1) > 1
+        ? `**GPUs:** ${gpuCount}, conversion ~${(gpuCount ** 0.79).toFixed(1)}x faster, `
+          + `~${Math.round((gpuCount ** 0.21 - 1) * 100)}% more per job${sc ? ' (calibration still runs on one)' : ''}`
+        : '',
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,
       alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
+      community.length
+        ? `**Already on HF from others:** ${community.slice(0, 3)
+          .map((q) => `[${q.id}](https://huggingface.co/${q.id}) (${q.bpw}${q.kind ? ` ${q.kind}` : ''})`).join(', ')}`
+          + (community.length > 3 ? ` +${community.length - 3} more, see \`/quants\`` : '')
+        : '',
       `**Job:** \`${jobId.slice(0, 8)}\``,
       '',
       slot.quanter
@@ -353,6 +652,12 @@ export async function handleQuant(interaction) {
     components: [slot.quanter ? stopButtons(jobId) : approvalButtons(jobId)],
   });
   await db.patchJob(jobId, { cardMessageId: card.id });
+  if (!slot.quanter) {
+    notifyAdmins(interaction.client,
+      `\`${modelId}\` ${variants.join(', ')}${sc ? (scLite ? ' SC (trace)' : ' SC') : ''} from `
+        + `${interaction.user.username} is awaiting approval${costLine ? ` (${costLine.replace(/\*\*/g, '')})` : ''}: `
+        + `${cardUrl({ channelId: interaction.channelId, cardMessageId: card.id })}`).catch(() => {});
+  }
 
   if (slot.quanter) {
     await interaction.editReply({
@@ -427,7 +732,18 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     visionBits = null,
     // Older records predate the option; null keeps exllamav3's default.
     headBits = null,
+    gpuCount = null,
     subfolder = null,
+    sc = false,
+    scLite = false,
+    mtpBits = null,
+    ngramBits = null,
+    hq = null,
+    draftModel = null,
+    donorRepo = null,
+    donorBpw = null,
+    sizeGb = 0,
+    isMoe = false,
     categories,
     provider,
     precheckedRepos = {},
@@ -489,16 +805,29 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         embeds: [embeds.jobComplete({ url: modelId, userId, results })],
         components: [],
       });
-      const pushedCount = results.filter((r) => r.pushed).length;
+      const outcome = jobOutcome(variants, results);
       let completionNote;
-      if (pushedCount === results.length && pushedCount > 0) {
+      if (outcome.allDone) {
         completionNote = `<@${userId}> Your quantization is done! 🎉`;
-      } else if (pushedCount > 0) {
-        completionNote = `<@${userId}> Quantization finished with partial upload success (${pushedCount}/${results.length}).`;
+      } else if (outcome.status === 'completed') {
+        completionNote = `<@${userId}> Partly done -- ${outcome.failed.join(', ')} bpw failed.`;
       } else {
-        completionNote =
-          `<@${userId}> Quantization finished, but upload failed for all outputs. ` +
-          'Please retry upload or contact an admin.';
+        completionNote = `<@${userId}> The quantization you asked for failed (${outcome.failed.join(', ')} bpw).`;
+      }
+      if (outcome.reason) completionNote += ` Reason: ${String(outcome.reason).slice(0, 300)}`;
+      if (!outcome.allDone) {
+        // A self-calibrated retry finds the donor on the hub and the finished
+        // stages in the cache, so it does not start over.
+        completionNote += ' Running the same command again picks up what finished.';
+      }
+      if (outcome.extras.length) {
+        completionNote += `\nAlso published: ${outcome.extras.join(', ')}`;
+      }
+      const actual = jobSpend(results);
+      if (actual) {
+        const q = job.quote;
+        completionNote += `\nRunPod: $${actual.cost.toFixed(2)} on ${actual.cards}`
+          + (q ? ` (quoted ~$${q.low.toFixed(2)}${q.high > q.low * 1.15 ? `, up to $${q.high.toFixed(2)}` : ''})` : '');
       }
       await thread.send(completionNote);
 
@@ -528,14 +857,16 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         url: modelId,
         categories: [category],
         authors: [userId],
-        quantizedBPWs: results.filter((r) => r.pushed).map((r) => r.bpw ?? r.variant),
+        quantizedBPWs: results.filter((r) => r.pushed && !r.drafter).map((r) => r.bpw ?? r.variant),
         results,
         completedAt: Date.now(),
       };
       await db.saveModels(models);
 
       await db.patchJob(jobId, {
-        status: db.JOB_STATUS.completed,
+        status: db.JOB_STATUS[outcome.status],
+        // Against job.quote, to refit the quote from what jobs really cost.
+        actualCost: jobSpend(results),
         completedAt: Date.now(),
         partialResults: results,
       });
@@ -602,10 +933,17 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     variants.forEach((v) => {
       pstate[v] = { stage: 'Provisioning', overall: 0, message: 'waiting for a GPU', startedAt: Date.now() };
     });
+    // The rows the embed draws. Normally the requested bitrates, but a job that
+    // has to build its own donor first shows that too -- otherwise the embed
+    // sits on "Queued" for the whole donor conversion, which is the frozen
+    // embed this spent a long night getting rid of.
+    let renderVariants = variants;
     renderParallel = throttle(async () => {
       try {
         await progressMsg.edit({
-          embeds: [embeds.jobProgressParallel({ url: modelId, userId, variants, state: pstate })],
+          embeds: [embeds.jobProgressParallel({
+            url: modelId, userId, variants: renderVariants, state: pstate,
+          })],
         });
       } catch (err) {
         log.debug(`parallel embed edit failed: ${err.message}`);
@@ -629,76 +967,157 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
 
     // Progress handler shared by a fresh run and a resumed one, so a reattached
     // job draws the same embed the original was drawing.
-    const onVariantProgress = (v) => (d) => {
+    const onGroupProgress = (vs) => (d) => {
       if (d.podId && !podIds.has(d.podId)) {
         podIds.add(d.podId);
         db.patchJob(jobId, { podIds: [...podIds] }).catch((err) =>
           log.debug(`could not record pod ${d.podId}: ${err.message}`)
         );
       }
-      pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      // Provisioning, download and calibration are one pod's work for the whole
+      // group, so every row in it shows them -- that is the truth, not a smear.
+      // Once the converter starts the stream names a bitrate, and only that row
+      // moves.
+      const targets = d.currentBPW && vs.includes(d.currentBPW) ? [d.currentBPW] : vs;
+      for (const v of targets) {
+        pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+      }
       renderParallel();
     };
 
-    async function runVariant(v) {
+    // Each variant takes its own row's url/sample from the group's result.
+    function markComplete(vs, res) {
+      const byVariant = new Map((res || []).map((r) => [String(r.variant ?? r.bpw), r]));
+      for (const x of vs) {
+        const r = byVariant.get(String(x));
+        pstate[x] = { ...pstate[x], stage: 'Complete', overall: 100, message: 'done',
+                      url: r?.url ?? null, sample: r?.sample ?? null };
+      }
+      renderParallel();
+    }
+
+    async function runGroup(vs, over = {}) {
+      const v = vs[0];
       // Resuming: the controller is already running and owns the pod. Attach to
       // its log instead of spawning a second one, and do not retry -- a retry
       // here would rent a pod alongside the one still working.
       const handle = resumeFrom?.get(v);
       if (handle) {
         try {
-          const res = await attachToCli(handle, { variants: [v], onProgress: onVariantProgress(v) });
-          const url = res?.[0]?.url ?? null;
-          pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url,
-                        sample: res?.[0]?.sample ?? null };
-          renderParallel();
+          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs), sc });
+          markComplete(vs, res);
           return res;
         } catch (err) {
-          pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+          for (const x of vs) {
+            pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
+          }
           renderParallel();
-          return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+          return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
         }
       }
+      // Every pod this group rented, retries included, so the completion can
+      // say what the job really cost.
+      const spent = [];
+      const withSpend = (res) => {
+        if (res?.length && spent.length) {
+          res[0].podCost = { cost: spent.reduce((a, c) => a + c.cost, 0), pods: spent };
+        }
+        return res;
+      };
       try {
-        return await runVariantWithRetry(v, {
+        return withSpend(await runVariantWithRetry(v, {
           maxAttempts: MAX_ATTEMPTS,
           run: async () => {
             const res = await runViaCli({
               jobId,
               modelId,
-              variants: [v],
+              variants: vs,
               hfOrg: config.HF_ORG,
               testPrompt,
               codebook,
               visionBits,
               headBits,
+              gpuCount,
               subfolder,
-              onProgress: onVariantProgress(v),
+              sc,
+              scLite,
+              mtpBits,
+              ngramBits,
+              hq,
+              donorRepo,
+              maxRuntimeH: podRuntimeHours({
+                sc: over.sc ?? sc, scLite: over.scLite ?? scLite, sizeGb, isMoe, nVariants: vs.length,
+              }),
+              ...over,
+              onProgress: onGroupProgress(vs),
+            }).catch((err) => {
+              if (err.podCost) spent.push(err.podCost);
+              throw err;
             });
-            const url = res && res[0] ? res[0].url : null;
-            const sample = res && res[0] ? res[0].sample : null;
-            pstate[v] = { ...pstate[v], stage: 'Complete', overall: 100, message: 'done', url, sample };
-            renderParallel();
+            if (res[0]?.podCost) spent.push(res[0].podCost);
+            markComplete(vs, res);
             return res;
           },
           onRetry: (next, max) => {
-            pstate[v] = { ...pstate[v], stage: 'Retrying', overall: 0, message: `attempt ${next}/${max}` };
+            for (const x of vs) {
+              pstate[x] = { ...pstate[x], stage: 'Retrying', overall: 0, message: `attempt ${next}/${max}` };
+            }
             renderParallel();
           },
-        });
+        }));
       } catch (err) {
-        pstate[v] = { ...pstate[v], stage: 'Failed', overall: 0, message: err.message };
+        for (const x of vs) {
+          pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
+        }
         renderParallel();
-        return [{ bpw: v, variant: v, url: null, pushed: false, reused: false, duration: '', error: err.message }];
+        return withSpend(vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message })));
       }
     }
 
+    // Self-calibration with no donor: build one first, on its own pod, and hand
+    // it to the run that needs it. Two pods rather than one -- the saving from
+    // merging them is about seven minutes on a job of several hours, and
+    // splitting keeps each side clear of the 8h max_runtime, which is the
+    // failure that actually costs something. The donor publishes either way, so
+    // a later SC failure still leaves a usable quant behind.
+    let effDonorRepo = donorRepo;
+    let donorResult = null;
+    if (sc && !effDonorRepo && donorBpw) {
+      renderVariants = [donorBpw, ...variants];
+      pstate[donorBpw] = { stage: 'Queued', overall: 0, message: 'donor for self-calibration' };
+      renderParallel();
+      // A plain build with exllamav3's defaults, whatever the job pinned: it is
+      // published as a plain quant and found again by its plain name, and a
+      // -HQ2 or -M3 donor would be neither.
+      const res = await runGroup([donorBpw], {
+        sc: false, scLite: false, donorRepo: null, mtpBits: null, ngramBits: null, hq: null,
+      });
+      effDonorRepo = res?.[0]?.url
+        ? res[0].url.replace('https://huggingface.co/', '')
+        : null;
+      if (!effDonorRepo) {
+        const why = res?.[0]?.error || 'no upload URL';
+        await handleError(new Error(
+          `Could not build the ${donorBpw}bpw donor self-calibration needs: ${why}`));
+        return { thread };
+      }
+      // It is a real published quant, not scaffolding, so it belongs in the
+      // completion embed alongside the variant that was asked for.
+      donorResult = { ...res[0], donor: true };
+      log.info(`built SC donor ${effDonorRepo} for ${modelId}`);
+      await db.patchJob(jobId, { donorRepo: effDonorRepo })
+        .catch((err) => log.debug(`could not record donor: ${err.message}`));
+    }
+
+    const groups = podGroups(variants, sc);
     let settled;
     try {
       settled = await Promise.all(
         // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
-        variants.map((v, i) =>
-          new Promise((r) => setTimeout(r, i * 4000)).then(() => runVariant(v))
+        groups.map((g, i) =>
+          new Promise((r) => setTimeout(r, i * 4000))
+            // The drafter rides on the first pod only; one copy is enough.
+            .then(() => runGroup(g, { donorRepo: effDonorRepo, draftModel: i === 0 ? draftModel : null }))
         )
       );
     } finally {
@@ -714,7 +1133,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         .edit({ embeds: [stoppedEmbed(after)], components: [] })
         .catch((err) => log.debug(`stopped embed edit failed: ${err.message}`));
     } else {
-      await handleComplete(settled.flat());
+      await handleComplete([...(donorResult ? [donorResult] : []), ...settled.flat()]);
     }
     return { thread };
   }

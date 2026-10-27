@@ -53,6 +53,52 @@ describe('attachToCli', () => {
     expect(seen.some((d) => d.podId === 'abc123')).toBe(true);
   });
 
+  it('returns a drafter as a flagged extra, never as a variant', async () => {
+    const handle = fakeHandle();
+    const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });
+    fs.appendFileSync(handle.logPath,
+      '[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n'
+      + '[drafter] done -> https://huggingface.co/o/m-DFlash2-exl3-4.0bpw\n');
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    const out = await p;
+    expect(out).toHaveLength(2);
+    expect(out[0].variant).toBe('4.0');
+    expect(out[1]).toMatchObject({ drafter: true, pushed: true,
+                                   url: 'https://huggingface.co/o/m-DFlash2-exl3-4.0bpw' });
+  });
+
+  it('reads what the pod cost, on success and on failure', async () => {
+    let handle = fakeHandle();
+    let p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });
+    fs.appendFileSync(handle.logPath, '[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n'
+      + '[cost] 1905s on NVIDIA RTX PRO 6000 Blackwell Workstation Edition (COMMUNITY) at $1.69/h = $0.89\n');
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    expect((await p)[0].podCost).toMatchObject({ secs: 1905, cloud: 'COMMUNITY', cost: 0.89 });
+
+    handle = fakeHandle();
+    p = attachToCli(handle, { variants: ['3.6'], onProgress: () => {} });
+    fs.appendFileSync(handle.logPath, '[joberror] pod gone\n'
+      + '[cost] 11520s on NVIDIA A100-SXM4-80GB x2 (SECURE) at $3.18/h = $10.18\n');
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(1, null);
+    await expect(p).rejects.toMatchObject({ podCost: { cost: 10.18, gpu: 'NVIDIA A100-SXM4-80GB x2' } });
+  });
+
+  it("links the pinned commit, not the moving branch", async () => {
+    const handle = fakeHandle();
+    const p = attachToCli(handle, { variants: ["4.0"], onProgress: () => {} });
+    const sha = "a".repeat(40);
+    fs.appendFileSync(handle.logPath, "[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n"
+      + `[upload] 4.0 pinned o/m-exl3-4.0bpw@${sha}\n`);
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    const out = await p;
+    expect(out[0].commit).toBe(sha);
+    expect(out[0].treeUrl).toBe(`https://huggingface.co/o/m-exl3-4.0bpw/tree/${sha}`);
+  });
+
   it('reports the controller error when it dies with no upload', async () => {
     const handle = fakeHandle();
     const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });

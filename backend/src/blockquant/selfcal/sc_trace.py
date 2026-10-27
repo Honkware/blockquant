@@ -1,11 +1,12 @@
-# sc_trace.py, vendored verbatim from turboderp-org/exllamav3 at 5be8865 (v1.4.9).
-# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_trace.py
+# sc_trace.py, vendored verbatim from turboderp-org/exllamav3 at cdc785d (v1.6.5).
+# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_trace.py
 # turboderp's code. Read VENDOR_MANIFEST.json before editing or re-vendoring.
 
 import sys, os
 
 import argparse
 import json
+import math
 import random
 import zlib
 
@@ -605,6 +606,7 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
         max_chunk_size = 2048,
@@ -634,6 +636,12 @@ def main(args):
             TEMPLATE_VARS = {}
 
     target_tokens = args.target_tokens or args.cal_rows * args.cal_cols
+    # BLOCKQUANT LOCAL PATCH: how much surplus to generate for the shuffle to
+    # draw on. Upstream gets whatever the last wave happens to add, measured at
+    # 1.56x; this asks for a deliberate 1.15x.
+    _POOL_FACTOR = 1.15
+    _avg_conv_tokens = 0.0
+    _conv_count = 0
     rows = []
     total_in = total_out = 0
 
@@ -655,8 +663,41 @@ def main(args):
                 if total_packed() >= target_tokens:
                     break
                 pending = {}    # c_idx -> {"input_ids", "chunks", "eos_reason"}
+                # BLOCKQUANT LOCAL PATCH -- see VENDOR_MANIFEST.json.
+                # The target is only checked at wave boundaries, and a wave is
+                # every live conversation at once, so crossing it early in a
+                # wave still runs the whole wave. Measured on a 0.8B: 798,117
+                # tokens generated for a 512,000 target, the last wave almost
+                # entirely surplus, at ~30k tok/min.
+                #
+                # Those tokens are not wasted -- rows are pooled, shuffled and
+                # sliced to cal_rows x cal_cols at the end, so a bigger pool
+                # means more mixing. But 1.56x is what wave granularity handed
+                # us, not a chosen number. Aim at a deliberate pool instead:
+                # enough slack for the shuffle, without paying for half a wave
+                # of generation nobody asked for.
+                eligible = [i for i, c in enumerate(convs)
+                            if c["alive"] and t_idx < len(c["turns"])]
+                want = int(target_tokens * _POOL_FACTOR) - total_packed()
+                if _avg_conv_tokens and want > 0 and eligible:
+                    # Round up, and over-provision, because falling short means
+                    # another whole wave -- far dearer than a little surplus.
+                    n = min(len(eligible),
+                            max(1, math.ceil(want / _avg_conv_tokens * 1.25)))
+                    if n < len(eligible):
+                        # Stride, not a prefix: the seed set is ordered by
+                        # domain and a prefix would sample only the first few.
+                        step = len(eligible) / n
+                        keep = {eligible[min(len(eligible) - 1, int(i * step))]
+                                for i in range(n)}
+                        eligible = [i for i in eligible if i in keep]
+                        print(f" -- Pool at {total_packed():,}/{int(target_tokens * _POOL_FACTOR):,}; "
+                              f"{len(eligible)} of the wave's conversations this turn")
+                _wave_set = set(eligible)
                 for c_idx, conv in enumerate(convs):
                     if not conv["alive"] or t_idx >= len(conv["turns"]):
+                        continue
+                    if c_idx not in _wave_set:
                         continue
                     conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
                     input_ids = tokenizer.hf_chat_template(
@@ -710,6 +751,13 @@ def main(args):
                     })
                     total_in += p["input_ids"].shape[-1]
                     total_out += response_ids.numel()
+                    # BLOCKQUANT LOCAL PATCH: running mean, so the wave sizing
+                    # above uses this model's real output length rather than a
+                    # guess at max_new_tokens.
+                    _conv_count += 1
+                    _avg_conv_tokens = ((_avg_conv_tokens * (_conv_count - 1)
+                                         + p["input_ids"].shape[-1] + response_ids.numel())
+                                        / _conv_count)
                     conv["messages"].append({
                         "role": "assistant",
                         "content": clean_response_for_context(tokenizer, response_ids),
@@ -733,26 +781,31 @@ def main(args):
     print(f" -- {len(rows)} trace rows, {total_in:,} context + {total_out:,} response tokens "
           f"-> {args.output}")
 
-    # Packed calibration rows: each trace row's exact model-visible stream (templated context +
-    # sampled response), row order shuffled for mixing, concatenated and sliced to fixed width
+    # Packed calibration rows: one row per trace row, its exact model-visible stream (templated
+    # context + sampled response) from position 0, truncated to cal_cols and right-padded, with
+    # the true lengths alongside. Rows are never sliced out of a concatenated stream: instruction
+    # models (Gemma4-it) need every row to start with BOS + system prompt + whole turns, and a
+    # window cut mid-conversation makes them wildly unstable. Row order shuffled for mixing
     cal_out = args.cal_out or os.path.splitext(args.output)[0] + ".safetensors"
     order = list(range(len(rows)))
     random.Random(args.seed).shuffle(order)
-    stream = []
-    for i in order:
-        stream += rows[i]["input_ids"] + rows[i]["response_ids"]
-    n_rows = len(stream) // args.cal_cols
-    if args.cal_rows and n_rows > args.cal_rows:
-        n_rows = args.cal_rows
-    packed = torch.tensor(stream[:n_rows * args.cal_cols], dtype = torch.long)
-    packed = packed.view(n_rows, args.cal_cols)
-    save_file({"input_ids": packed}, cal_out)
-    print(f" -- {n_rows} calibration rows x {args.cal_cols} tokens -> {cal_out}")
+    if args.cal_rows and len(order) > args.cal_rows:
+        order = order[:args.cal_rows]
+    n_rows = len(order)
+    packed = torch.zeros((n_rows, args.cal_cols), dtype = torch.long)
+    lengths = torch.zeros((n_rows,), dtype = torch.long)
+    for r, i in enumerate(order):
+        ids = (rows[i]["input_ids"] + rows[i]["response_ids"])[:args.cal_cols]
+        packed[r, :len(ids)] = torch.tensor(ids, dtype = torch.long)
+        lengths[r] = len(ids)
+    save_file({"input_ids": packed, "lengths": lengths}, cal_out)
+    print(f" -- {n_rows} calibration rows x up to {args.cal_cols} tokens (mean {lengths.float().mean():.0f}, "
+          f"{int((lengths == args.cal_cols).sum())} truncated) -> {cal_out}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, default_cache_size = 131072, add_draft_model_args = True)
+    model_init.add_args(parser, default_cache_size = 131072, add_draft_model_args = True, default_autosplit_max_batch_size = 32)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output trace (JSON, qbench-compatible)")
     parser.add_argument("-co", "--cal_out", type = str, default = None, help = "Output packed calibration rows (safetensors), default: derived from --output")
     parser.add_argument("-cr", "--cal_rows", type = int, default = 250, help = "Calibration rows to pack, default: 250")

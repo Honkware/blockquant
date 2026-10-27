@@ -1,8 +1,6 @@
-# qbench/measure.py, vendored from turboderp-org/exllamav3 at 0740edc (v1.5.0).
-# turboderp's code, unmodified. We take the measurement half of qbench and
-# drive DiffStats ourselves; qbench.py's YAML orchestration and plot.py
-# (matplotlib/pandas/seaborn) are deliberately not vendored.
-# Read VENDOR_MANIFEST.json.
+# measure.py, vendored verbatim from turboderp-org/exllamav3 at cdc785d (v1.6.5).
+# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/eval/qbench/measure.py
+# turboderp's code. Read VENDOR_MANIFEST.json before editing or re-vendoring.
 
 """
 KLD/ppl measurement against the cached reference logits.

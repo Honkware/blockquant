@@ -1,15 +1,17 @@
 {
-  "generated_at": "2026-09-13T18:51:47+00:00",
+  "generated_at": "2026-10-27T21:03:04+00:00",
   "exllamav3": {
-    "ref": "0740edc",
-    "version": "1.5.0"
+    "ref": "cdc785db",
+    "version": "1.6.5"
   },
   "architectures": [
     "AfmoeForCausalLM",
     "ApertusForCausalLM",
     "ArceeForCausalLM",
+    "BailingMoeV3ForCausalLM",
     "Cohere2ForCausalLM",
     "CohereForCausalLM",
+    "DFlash2DraftModel",
     "DFlashDraftModel",
     "DFlashLagunaForCausalLM",
     "DeciLMForCausalLM",
@@ -22,6 +24,7 @@
     "Gemma2ForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3ForConditionalGeneration",
+    "Gemma4AssistantForCausalLM",
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4ForCausalLM",
@@ -36,11 +39,14 @@
     "HYV3ForCausalLM",
     "HyperCLOVAXForCausalLM",
     "IQuestCoderForCausalLM",
+    "KimiLinearForCausalLM",
     "LagunaForCausalLM",
     "Lfm2ForCausalLM",
     "Lfm2MoeForCausalLM",
+    "Lfm2VlForConditionalGeneration",
     "LlamaForCausalLM",
     "MiMoForCausalLM",
+    "MiMoV2ForCausalLM",
     "MiniMaxM2ForCausalLM",
     "Ministral3ForCausalLM",
     "Mistral3ForConditionalGeneration",
@@ -49,6 +55,7 @@
     "MuseGlimmerAssistantModel",
     "MuseGlimmerForConditionalGeneration",
     "NemotronHForCausalLM",
+    "NemotronH_Omni_Reasoning_V3",
     "Olmo3ForCausalLM",
     "OlmoHybridForCausalLM",
     "Phi3ForCausalLM",
@@ -70,5 +77,26 @@
     "Spark2_5ForCausalLM",
     "Step3p5ForCausalLM",
     "Step3p7ForConditionalGeneration"
-  ]
+  ],
+  "default_vision_bits": {
+    "DeepseekV4ForCausalLM": 6,
+    "Gemma4ForConditionalGeneration": 6,
+    "Gemma4UnifiedForConditionalGeneration": 6,
+    "Glm4vForConditionalGeneration": 6,
+    "Glm4vMoeForConditionalGeneration": 6,
+    "Glm5NextForConditionalGeneration": 6,
+    "Lfm2VlForConditionalGeneration": 6,
+    "MuseGlimmerForConditionalGeneration": 6,
+    "NemotronHForCausalLM": 16,
+    "NemotronH_Omni_Reasoning_V3": 16,
+    "Qwen3VLForConditionalGeneration": 6,
+    "Qwen3VLMoeForConditionalGeneration": 6,
+    "Qwen3_5ForCausalLM": 6,
+    "Qwen3_5ForConditionalGeneration": 6,
+    "Qwen3_5MoeForCausalLM": 6,
+    "Qwen3_5MoeForConditionalGeneration": 6,
+    "Qwen4ExpForConditionalGeneration": 6,
+    "Step3p7ForConditionalGeneration": 6
+  },
+  "default_head_bits": 6
 }

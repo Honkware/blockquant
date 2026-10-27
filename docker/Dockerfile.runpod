@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.5.0 covers every registered
+# One image for every architecture. exllamav3 1.6.5 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake. The old three-image split (stable 0.0.38 +
@@ -87,10 +87,20 @@ ARG MAX_JOBS=2
 ENV MAX_JOBS=${MAX_JOBS}
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
 # health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.5.0.
+# providers/runpod/provider.py); this ref reports 1.6.5.
 #
-# v1.5.0. Pinned to the tag's commit rather than the tag name, since a tag can
+# v1.6.5. Pinned to the tag's commit rather than the tag name, since a tag can
 # be moved.
+#
+# 1.5.0 -> 1.6.5 is 469 commits. What matters here: new archs (bailing_hybrid
+# for Ling 3.x, kimi_linear, mimo_v2, lfm2_vl, dflash2, gemma4_assistant);
+# convert takes -mb/-ngb/-eb and a level for -hq; it splits a large MoE layer
+# into several capture passes when its Hessians do not fit in VRAM; and
+# sc_trace packs one calibration row per trace row from position 0 rather than
+# slicing a concatenated stream, because a window cut mid-conversation made
+# Gemma4-it unstable. That last one changes what an SC quant comes out as.
+# sc_measure's layer streaming is upstream now, so selfcal/ carries one local
+# patch instead of two.
 #
 # 1.4.9 -> 1.5.0 replaces the single-token and batched MoE paths with one
 # two-stage cooperative kernel and makes MoE output deterministic, and swaps in
@@ -104,7 +114,7 @@ ENV MAX_JOBS=${MAX_JOBS}
 # Qwen3-VL, Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are the
 # validated ones. The vision_bits option on the command is what makes that
 # choice visible and reversible.
-ARG EXLLAMAV3_REF=0740edc2da569fb99174023c1d2988b1e98cb41e
+ARG EXLLAMAV3_REF=cdc785db89e263e65e5849cb53e1ada156411414
 RUN python -m pip install --no-cache-dir --no-deps \
         "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
 
@@ -134,7 +144,7 @@ RUN python /tmp/fetch_cal_data.py && rm /tmp/fetch_cal_data.py
 ENV HF_DATASETS_CACHE=/opt/blockquant/datasets
 RUN mkdir -p /opt/blockquant/datasets \
     && python -c "from datasets import load_dataset; \
-                  d=load_dataset('wikitext','wikitext-2-raw-v1',split='test'); \
+                  d=load_dataset('Salesforce/wikitext','wikitext-2-raw-v1',split='test'); \
                   print('wikitext-2 test rows:', len(d))"
 
 # ---- Verify the stack at build time ---------------------------------------
@@ -143,7 +153,7 @@ import sys, torch, importlib.metadata as m
 assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
 assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
 _exl = tuple(int(x) for x in m.version("exllamav3").split(".")[:2])
-assert _exl >= (1, 5), f"exllamav3 older than 1.5: {m.version('exllamav3')}"
+assert _exl >= (1, 6), f"exllamav3 older than 1.6: {m.version('exllamav3')}"
 print("python", sys.version.split()[0], "| torch", torch.__version__,
       "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
       "| exllamav3", m.version("exllamav3"), "| transformers", m.version("transformers"))

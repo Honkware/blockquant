@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { AttachmentBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
+import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
 import * as hf from '../services/huggingface.js';

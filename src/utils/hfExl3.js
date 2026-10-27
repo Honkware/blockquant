@@ -13,13 +13,36 @@
 // headBits is required for an SC build, because under SC the recipe picks
 // head bits per budget and the name is incomplete without it. visionBits is
 // set only when the tower was quantized; absent means it was copied at fp16.
-export function exl3RepoName(modelName, bpw, { sc = false, headBits = null, visionBits = null } = {}) {
+// 16 is how a request spells "copy the tower whole", and a copied tower is not
+// named -- so it is not a -V16, it is nothing. Mirrors quantized_vision_bits in
+// backend/src/blockquant/cards.py.
+export function quantizedVisionBits(visionBits) {
+  if (visionBits == null) return null;
+  const n = Number(visionBits);
+  return n >= 1 && n <= 8 ? n : null;
+}
+
+// 2.5 stays 2.5, 3.0 is 3. Mirrors _bits_str in cards.py.
+const bitsStr = (b) => String(Number(b));
+
+// SCT is the trace-only kind (sc_mode:trace): own-output calibration, no
+// recipe. -M/-NG/-HQ appear only when pinned, like -V. Mirrors exl3_repo_slug.
+export function exl3RepoName(modelName, bpw, {
+  sc = false, scLite = false, headBits = null, visionBits = null,
+  mtpBits = null, ngramBits = null, hq = null,
+} = {}) {
   const n = Number(bpw);
   if (!Number.isFinite(n)) throw new TypeError(`Invalid bpw value: ${bpw} (expected finite number)`);
-  if (sc && headBits == null) throw new TypeError('A self-calibrated quant must name its head bits');
+  if ((sc || scLite) && headBits == null) throw new TypeError('A self-calibrated quant must name its head bits');
   const variant = Number.isInteger(n) ? n.toFixed(1) : String(n);
-  const core = sc ? `SC-${variant}bpw-H${headBits}` : `${variant}bpw`;
-  return `${modelName}-exl3-${core}${visionBits ? `-V${visionBits}` : ''}`;
+  const core = sc && !scLite ? `SC-${variant}bpw-H${headBits}`
+    : scLite ? `SCT-${variant}bpw-H${headBits}` : `${variant}bpw`;
+  const vb = quantizedVisionBits(visionBits);
+  let tail = vb ? `-V${vb}` : '';
+  if (mtpBits != null) tail += `-M${bitsStr(mtpBits)}`;
+  if (ngramBits) tail += `-NG${ngramBits}`;
+  if (hq) tail += `-HQ${hq}`;
+  return `${modelName}-exl3-${core}${tail}`;
 }
 
 export function exl3TreeUrl(repoUrl) {

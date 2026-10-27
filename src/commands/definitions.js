@@ -13,7 +13,7 @@ export const commands = [
     .addStringOption((opt) =>
       opt
         .setName('bpw')
-        .setDescription('Bits per weight, comma-separated (e.g. 3.0,4.0,5.0)')
+        .setDescription('Bits per weight, comma-separated (e.g. 3.0,4.0,5.0), or low / mid / high / ladder')
         .setRequired(true)
     )
     .addStringOption((opt) =>
@@ -22,11 +22,35 @@ export const commands = [
         .setDescription('Optional: a test prompt run on each finished quant; the reply shows in the result')
         .setRequired(false)
     )
+    .addBooleanOption((opt) =>
+      opt
+        .setName('sc')
+        .setDescription('Self-calibrated: measure this model and convert from a per-tensor recipe. Needs head_bits')
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('sc_mode')
+        .setDescription('How much self-calibration to do. Implies sc. Default full')
+        .setRequired(false)
+        .addChoices(
+          { name: 'full: measure every tensor, per-tensor recipe', value: 'full' },
+          { name: 'trace: own-output calibration + -hq 2, no measure (big models)', value: 'trace' }
+        )
+    )
     .addStringOption((opt) =>
       opt
         .setName('subfolder')
         .setDescription('Subdirectory holding the model, for repos that ship several formats (e.g. BF16)')
         .setRequired(false)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('gpu_count')
+        .setDescription('GPUs on the pod. The converter runs one worker thread per device. Default 1.')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(4)
     )
     .addIntegerOption((opt) =>
       opt
@@ -55,6 +79,36 @@ export const commands = [
           { name: 'mcg', value: 'mcg' },
           { name: '3inst', value: '3inst' }
         )
+    )
+    .addNumberOption((opt) =>
+      opt
+        .setName('mtp_bits')
+        .setDescription('Bits for the MTP head: 1-8, 1.5/2.5/3.5, or 16. Default 4. Ignored without one')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(16)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('ngram_bits')
+        .setDescription('Bits for n-gram embedding tables (PLE models like Qwen3.8-Flash-Next). Default: bpw rounded')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(8)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('draft_model')
+        .setDescription('A drafter (e.g. a DFlash2 repo) to quantize at 4bpw beside the model, on the same pod')
+        .setRequired(false)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('hq')
+        .setDescription('Promote select layers N times (MoE mostly). Default 0, or 2 with sc_mode:trace')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(4)
     ),
 
   new SlashCommandBuilder()
@@ -111,6 +165,15 @@ export const commands = [
         )
     ),
 
+  new SlashCommandBuilder()
+    .setName('quants')
+    .setDescription('Every EXL3 quant of a model on Hugging Face, ours and the community\'s')
+    .addStringOption((opt) =>
+      opt
+        .setName('model')
+        .setDescription('HuggingFace URL or ID. Leave empty for the bot\'s latest quants.')
+        .setRequired(false)
+    ),
   new SlashCommandBuilder().setName('queue').setDescription('Check the quantization queue status'),
   new SlashCommandBuilder().setName('health').setDescription('Check bot/service health summary'),
 

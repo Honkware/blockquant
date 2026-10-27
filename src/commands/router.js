@@ -4,6 +4,7 @@ import { handleQuant } from './quant.js';
 import { handleCatbench, autocompleteCatbench } from './catbench.js';
 import { handleApproval } from './approval.js';
 import { handleStop, handleStopButton } from './stop.js';
+import { handleQuants } from './quants.js';
 import { handleHealth, handleHistory, handleQueueStatus } from './info.js';
 import { handleCache, handleConfig, handleDiag, handlePause, handleResume } from './admin.js';
 import { toUserMessage } from '../errors/taxonomy.js';
@@ -12,6 +13,7 @@ const log = getLogger('commands');
 
 const handlers = {
   quant: handleQuant,
+  quants: handleQuants,
   stop: handleStop,
   config: handleConfig,
   catbench: handleCatbench,
