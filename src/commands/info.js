@@ -1,5 +1,4 @@
 import { MessageFlags } from 'discord.js';
-import * as db from '../services/db.js';
 import * as jobQueue from '../services/queue.js';
 import * as workspace from '../services/workspace.js';
 import * as embeds from '../utils/embeds.js';

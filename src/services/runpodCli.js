@@ -53,7 +53,6 @@ const RE = {
 // fragment is newest -- so escape codes reach the embed, where they render as
 // literal junk and eat the message budget. Strip once here rather than in each
 // pattern: every line goes through this.
-// eslint-disable-next-line no-control-regex
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*[a-zA-Z]', 'g');
 export const stripAnsi = (s) => String(s).replace(ANSI, '');
 
