@@ -10,6 +10,7 @@ Example:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -35,6 +36,10 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 
 
+# Card prices, conversion speeds and exclusions, shared with the bot's quote
+# (src/services/gpuQuote.js) so both pick the same card.
+_GPU_TABLE = json.loads((Path(__file__).resolve().parent.parent / "gpu_table.json").read_text())
+
 # Datacenter Blackwell (sm_100). The image compiles for 8.0/8.6/8.9/9.0/12.0,
 # so consumer and pro Blackwell (sm_120: RTX 5090, RTX PRO Blackwell) run, but
 # sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
@@ -47,18 +52,18 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # Qwen3.8-27B in a 1905 s pod for $1.16 -- against 5748-6135 s and $2.54-2.71
 # for the same model on an A100. The exclusion was the most expensive line in
 # this file.
-_BLACKWELL_EXCLUDE = ("B200", "B300")
+_BLACKWELL_EXCLUDE = tuple(_GPU_TABLE["exclude"]["no_kernels"])
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
-_WEAK_FOR_QUANT = {"NVIDIA L4"}
+_WEAK_FOR_QUANT = set(_GPU_TABLE["exclude"]["weak"])
 
 # exllamav3 is CUDA-only (no ROCm), so AMD cards can't compile or run the
 # extension at all. RunPod lists e.g. "AMD Instinct MI300X OAM" whose huge VRAM
 # sorts to the top of the big-model capable-first order, so a big quant would
 # preferentially land on a card it cannot use and fail the health check. Matched
 # as substrings of the RunPod GPU id.
-_NON_CUDA_EXCLUDE = ("AMD", "Instinct", "Radeon")
+_NON_CUDA_EXCLUDE = tuple(_GPU_TABLE["exclude"]["non_cuda"])
 
 # --- arch-support registry (the committed single source of truth) -------------
 # The pre-flight gate reads backend/arch_support.json (generated from exllamav3
@@ -354,40 +359,7 @@ def _sc_min_vram(base_gb: float | None, floor: int) -> int:
 #                             converting once boot, download and upload are out
 # The rest are placed by architecture beside the nearest measured card. A card
 # missing here gets 1.0, which is never enough to be preferred on a guess.
-_CONVERT_SPEED = {
-    "NVIDIA GeForce RTX 3090": 1.0,
-    "NVIDIA GeForce RTX 3090 Ti": 1.1,
-    "NVIDIA RTX A6000": 1.0,
-    "NVIDIA A40": 0.9,
-    "NVIDIA RTX A5000": 0.8,
-    "NVIDIA RTX A4500": 0.7,
-    "NVIDIA RTX A4000": 0.55,
-    "NVIDIA L40S": 2.0,
-    "NVIDIA L40": 1.8,
-    "NVIDIA GeForce RTX 4090": 2.0,
-    "NVIDIA RTX 6000 Ada Generation": 2.0,
-    "NVIDIA RTX 5000 Ada Generation": 1.3,
-    "NVIDIA RTX 4000 Ada Generation": 0.7,
-    "NVIDIA RTX 4000 SFF Ada Generation": 0.6,
-    "NVIDIA RTX 2000 Ada Generation": 0.4,
-    "NVIDIA A100-SXM4-80GB": 1.1,
-    "NVIDIA A100 80GB PCIe": 0.95,
-    "NVIDIA A100-SXM4-40GB": 1.1,
-    "NVIDIA H100 PCIe": 2.0,
-    "NVIDIA H100 80GB HBM3": 2.5,
-    "NVIDIA H100 NVL": 2.3,
-    "NVIDIA H200": 2.5,
-    "NVIDIA H200 NVL": 2.5,
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 4.2,
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 4.2,
-    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 3.2,
-    "NVIDIA RTX PRO 5000 Blackwell": 2.4,
-    "NVIDIA RTX PRO 4500 Blackwell": 1.8,
-    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 1.8,
-    "NVIDIA RTX PRO 4000 Blackwell": 1.4,
-    "NVIDIA GeForce RTX 5090": 3.0,
-    "NVIDIA GeForce RTX 5080": 1.8,
-}
+_CONVERT_SPEED = {g: c["speed"] for g, c in _GPU_TABLE["cards"].items() if "speed" in c}
 
 
 def _convert_speed(gid: str) -> float:
@@ -916,6 +888,7 @@ def main():
     chosen_gpu = None
     chosen_cloud = None
     hourly = 0.0
+    t_created = None
     ssh = None
     last_err = None
     _price_cache: dict = {}
@@ -971,6 +944,7 @@ def main():
             print(f"[1/6] Trying {candidate}{n_tag}  (~${rate:.2f}/hr {cloud})...", flush=True)
             try:
                 instance_id = attempt.launch({})
+                t_created = time.time()
             except Exception as e:
                 msg = str(e).lower()
                 # Out-of-stock is expected. But transient/rate-limit errors are
@@ -1195,6 +1169,14 @@ def main():
             sys.exit(1)
 
     finally:
+        # What this pod cost, on every exit, from creation: billing starts
+        # there, not when SSH comes up four minutes later. The bot compares it
+        # with what it quoted. The failed 27B SC pod spent about $10 and said
+        # nothing, because only the success path printed a total.
+        if t_created:
+            _secs = time.time() - t_created
+            print(f"[cost] {_secs:.0f}s on {chosen_gpu}{n_tag} ({chosen_cloud}) at "
+                  f"${hourly:.2f}/h = ${_secs / 3600 * hourly:.2f}", flush=True)
         if not args.keep_pod:
             print(f"Terminating pod {instance_id}...")
             if not provider.terminate(instance_id):

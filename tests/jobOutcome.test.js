@@ -4,7 +4,7 @@ process.env.CLIENT_ID ??= 'test';
 process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
 
-const { jobOutcome } = await import('../src/commands/quant.js');
+const { jobOutcome, jobSpend } = await import('../src/commands/quant.js');
 
 const ok = (v, url) => ({ variant: v, bpw: v, pushed: true, url, error: null });
 const bad = (v, error) => ({ variant: v, bpw: v, pushed: false, url: null, error });
@@ -82,5 +82,22 @@ describe('a drafter quantized beside the model', () => {
     expect(o.status).toBe('failed');
     expect(o.extras).toEqual(['u/drafter']);
     expect(jobOutcome(['4.0'], [ok('4.0', 'u/q'), drafter]).allDone).toBe(true);
+  });
+});
+
+describe('what a job cost', () => {
+  it('adds every pod, retries and donor included', () => {
+    const pod = (cost, gpu, cloud) => ({ cost, gpu, cloud, secs: 1, rate: 1 });
+    const s = jobSpend([
+      { podCost: { pods: [pod(3.25, 'A100', 'SECURE')] } },
+      { podCost: { pods: [pod(1.0, 'A100', 'SECURE'), pod(9.18, 'A100', 'SECURE')] } },
+      {},
+    ]);
+    expect(s.cost).toBeCloseTo(13.43, 6);
+    expect(s.cards).toBe('A100 (secure)');
+  });
+
+  it('says nothing when no pod reported', () => {
+    expect(jobSpend([{}, { variant: '4.0' }])).toBe(null);
   });
 });

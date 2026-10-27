@@ -216,18 +216,40 @@ export function estimateCost(variantCount,
 }
 
 /** One-line preflight string for the approval embed; '' if balance unknown. */
+/**
+ * The quote: off the card the launcher would rent at today's live price when
+ * RunPod's listing can be read, off the size-based band when it cannot.
+ */
+export async function quoteCost(variantCount, opts = {}) {
+  const { liveGpuTypes, quoteJob } = await import('./gpuQuote.js');
+  const live = await liveGpuTypes(opts.gpuCount || 1);
+  const q = live && quoteJob(live, { ...opts, variants: variantCount, gpus: opts.gpuCount || 1 });
+  if (q) return { ...q, sc: !!opts.sc, donor: !!opts.needsDonor, live: true };
+  return { ...estimateCost(variantCount, opts), live: false };
+}
+
+/** One-line preflight string for the approval embed. */
 export async function costPreflightLine(variantCount, opts = {}) {
-  const bal = await getBalance();
-  const est = estimateCost(variantCount, opts);
+  const [bal, est] = await Promise.all([getBalance(), quoteCost(variantCount, opts)]);
   // Whole dollars hide the difference between $0.40 and $1.40 on a small job,
   // which is most of what a self-calibrated 0.8B costs.
   const fmt = (v) => (v < 10 ? v.toFixed(2) : v.toFixed(0));
   const parts = est.sc ? [est.donor ? 'donor + calibration' : 'calibration'] : [];
-  const costStr = `~$${fmt(est.low)}-${fmt(est.high)}${parts.length ? ` (incl. ${parts[0]})` : ''}`;
+  const incl = parts.length ? ` (incl. ${parts[0]})` : '';
+  const mins = (h) => (h >= 2 ? `${h.toFixed(1)} h` : `${Math.round(h * 60)} min`);
+  // Say which card, because that is what the number rests on: a 27B is a
+  // dollar on a Blackwell and three and a half on an A100 if the Blackwells
+  // are taken, and a bare range does not say which way it went.
+  const costStr = est.live
+    ? `~$${fmt(est.low)}${incl} on ${est.best.name} (${est.best.cloud}, $${est.best.rate.toFixed(2)}/h, `
+      + `~${mins(est.hours.low)})`
+      + (est.high > est.low * 1.15
+        ? `; up to $${fmt(est.high)} if it falls back to ${est.next ? `${est.next.name} (${est.next.cloud})` : 'a slower run'}`
+        : '')
+    : `~$${fmt(est.low)}-${fmt(est.high)}${incl}`;
   if (!bal) {
     return `**Est. RunPod cost:** ${costStr} (balance unavailable)`;
   }
-  const lowBalance = bal.balance < est.high;
-  const warn = lowBalance ? '  ⚠️ may exceed balance' : '';
+  const warn = bal.balance < est.high ? '  ⚠️ may exceed balance' : '';
   return `**RunPod:** $${bal.balance.toFixed(2)} balance  ·  est. cost ${costStr}${warn}`;
 }

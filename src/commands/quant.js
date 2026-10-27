@@ -17,7 +17,7 @@ import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import {
-  costPreflightLine, getBalance, estimateCost, convertHours, calibrationHours,
+  costPreflightLine, getBalance, quoteCost, convertHours, calibrationHours,
 } from '../services/runpod.js';
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
@@ -115,6 +115,14 @@ export function jobOutcome(variants, results) {
     reason: failed.map((r) => r.error).find(Boolean) || null,
     extras: extras.map((r) => r.url || label(r)),
   };
+}
+
+/** What the job's pods cost in total, and on what, from the [cost] lines. */
+export function jobSpend(results) {
+  const pods = (results || []).flatMap((r) => r.podCost?.pods || []);
+  if (!pods.length) return null;
+  const cards = [...new Set(pods.map((p) => `${p.gpu} (${p.cloud.toLowerCase()})`))].join(', ');
+  return { cost: pods.reduce((a, p) => a + p.cost, 0), cards, pods };
 }
 
 // The least a donor may be. sc_trace generates the whole calibration set
@@ -497,7 +505,7 @@ export async function handleQuant(interaction) {
   };
   if (provider === 'runpod') {
     const bal = await getBalance();
-    const est = estimateCost(billable, costOpts);
+    const est = await quoteCost(billable, costOpts);
     if (bal && est.low > bal.balance) {
       return interaction.editReply({
         embeds: [
@@ -576,6 +584,14 @@ export async function handleQuant(interaction) {
   const costLine = provider === 'runpod'
     ? await costPreflightLine(variants.length, costOpts)
     : '';
+  // Kept on the job so the completion can put what it cost beside it.
+  if (provider === 'runpod') {
+    const q = await quoteCost(variants.length, costOpts).catch(() => null);
+    if (q) {
+      await db.patchJob(jobId, { quote: { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null } })
+        .catch(() => {});
+    }
+  }
 
   // Someone else may already have made it. Said on the card so an admin is not
   // paying for a copy by accident -- #quant-bot has had two people uploading the
@@ -807,6 +823,12 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       if (outcome.extras.length) {
         completionNote += `\nAlso published: ${outcome.extras.join(', ')}`;
       }
+      const actual = jobSpend(results);
+      if (actual) {
+        const q = job.quote;
+        completionNote += `\nRunPod: $${actual.cost.toFixed(2)} on ${actual.cards}`
+          + (q ? ` (quoted ~$${q.low.toFixed(2)}${q.high > q.low * 1.15 ? `, up to $${q.high.toFixed(2)}` : ''})` : '');
+      }
       await thread.send(completionNote);
 
       // Catbench: if a smoke-test reply was an SVG (e.g. "draw a kitten"),
@@ -843,6 +865,8 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
 
       await db.patchJob(jobId, {
         status: db.JOB_STATUS[outcome.status],
+        // Against job.quote, to refit the quote from what jobs really cost.
+        actualCost: jobSpend(results),
         completedAt: Date.now(),
         partialResults: results,
       });
@@ -991,8 +1015,17 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
           return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
         }
       }
+      // Every pod this group rented, retries included, so the completion can
+      // say what the job really cost.
+      const spent = [];
+      const withSpend = (res) => {
+        if (res?.length && spent.length) {
+          res[0].podCost = { cost: spent.reduce((a, c) => a + c.cost, 0), pods: spent };
+        }
+        return res;
+      };
       try {
-        return await runVariantWithRetry(v, {
+        return withSpend(await runVariantWithRetry(v, {
           maxAttempts: MAX_ATTEMPTS,
           run: async () => {
             const res = await runViaCli({
@@ -1017,7 +1050,11 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               }),
               ...over,
               onProgress: onGroupProgress(vs),
+            }).catch((err) => {
+              if (err.podCost) spent.push(err.podCost);
+              throw err;
             });
+            if (res[0]?.podCost) spent.push(res[0].podCost);
             markComplete(vs, res);
             return res;
           },
@@ -1027,13 +1064,13 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
             }
             renderParallel();
           },
-        });
+        }));
       } catch (err) {
         for (const x of vs) {
           pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
         }
         renderParallel();
-        return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
+        return withSpend(vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message })));
       }
     }
 

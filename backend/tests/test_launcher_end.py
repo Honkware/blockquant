@@ -57,3 +57,12 @@ def test_each_card_is_tried_on_community_before_secure():
     _, src = _main()
     assert 'cloud_order = [args.cloud] if cli_passed_cloud else ["COMMUNITY", "SECURE"]' in src
     assert "for g in gpu_candidates for c in cloud_order" in src
+
+
+def test_every_exit_says_what_the_pod_cost():
+    # Only the success path printed a total, from after SSH came up. The failed
+    # 27B SC pod spent about $10 and the bot never knew.
+    _, src = _main()
+    fin = src[src.index("    finally:", src.index("[6/6] Fetching result")):]
+    assert 'print(f"[cost]' in fin
+    assert "t_created = time.time()" in src

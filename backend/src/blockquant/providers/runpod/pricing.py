@@ -1,5 +1,8 @@
 """RunPod GPU catalogue lookups — price, and how many fit in one pod."""
 
+import json
+from pathlib import Path
+
 # Fallback prices used only when the live lookup fails. Values are the SECURE
 # rate (the higher of the two clouds) so the --max-price cap fails safe. Keep
 # the cheap VRAM-appropriate tier listed so a lookup hiccup never wrongly
@@ -10,46 +13,10 @@
 # id as "NVIDIA H200", so it fell through to 2.00, cleared a $2.10 cap, and
 # billed its real $3.79. A default below the high-end tier cannot fail safe --
 # it is exactly the case it was meant to guard.
-STATIC_PRICES = {
-    # Cheap consumer / workstation tier (what auto-select targets).
-    "NVIDIA RTX 4000 Ada Generation": 0.26,
-    "NVIDIA RTX 4000 SFF Ada Generation": 0.26,
-    "NVIDIA RTX 2000 Ada Generation": 0.28,
-    "NVIDIA GeForce RTX 3090": 0.46,
-    "NVIDIA GeForce RTX 3090 Ti": 0.46,
-    "NVIDIA L4": 0.44,
-    "NVIDIA GeForce RTX 4090": 0.69,
-    "NVIDIA RTX 5000 Ada Generation": 0.83,
-    "NVIDIA GeForce RTX 5090": 1.19,
-    "NVIDIA GeForce RTX 5080": 0.59,
-    "NVIDIA RTX PRO 4000 Blackwell": 0.57,
-    "NVIDIA RTX PRO 4500 Blackwell": 0.72,
-    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.72,
-    "NVIDIA RTX PRO 5000 Blackwell": 0.96,
-    "NVIDIA RTX A4000": 0.32,
-    "NVIDIA RTX A4500": 0.44,
-    "NVIDIA RTX A5000": 0.46,
-    "NVIDIA RTX A6000": 0.79,
-    "NVIDIA RTX 6000 Ada Generation": 0.77,
-    "NVIDIA A40": 0.47,
-    "NVIDIA L40": 0.99,
-    "NVIDIA L40S": 0.86,
-    # Pricey tier (kept accurate so the cap reliably skips them).
-    "NVIDIA A100 80GB PCIe": 1.64,
-    "NVIDIA A100-SXM4-80GB": 1.89,
-    "NVIDIA A100-SXM4-40GB": 1.29,
-    "NVIDIA H100 PCIe": 2.39,
-    "NVIDIA H100 80GB HBM3": 3.49,
-    "NVIDIA H100 NVL": 2.79,
-    "NVIDIA H200": 3.99,
-    "NVIDIA H200 NVL": 3.79,
-    # Back in the sweep since sm_120 is in the image. The Max-Q listed at $0.50
-    # secure on 2026-10-27 next to $1.64 community, which reads as a listing
-    # error, so it carries its siblings' rate rather than the bargain.
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 2.49,
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 2.59,
-    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 2.59,
-}
+# The prices themselves live in backend/gpu_table.json with each card's
+# conversion speed, so the bot's quote ranks cards the way the launcher does.
+_TABLE = json.loads((Path(__file__).resolve().parents[4] / "gpu_table.json").read_text())
+STATIC_PRICES = {g: c["price"] for g, c in _TABLE["cards"].items() if "price" in c}
 
 # What an unlisted card costs, for capping purposes. High on purpose: skipping
 # a cheap new card wastes nothing, taking an expensive one bills for hours.

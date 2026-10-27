@@ -25,6 +25,8 @@ const RE = {
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
   drafterDone: /\[drafter\]\s*done\s*->\s*(https?:\/\/\S+)/,
+  // The launcher's last word on what the pod cost, success or not.
+  podCost: /\[cost\]\s*(\d+)s on (.+?) \((\w+)\) at \$([0-9.]+)\/h = \$([0-9.]+)/,
   // Optional smoke-test reply, base64 so newlines/quotes survive the log relay.
   // The `b64` sentinel avoids matching the "[sample] N generating..." status line:
   // "[sample] 4.0 b64 <base64>"
@@ -324,6 +326,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
     const total = variants.length;
     const results = new Map(); // bpw -> url
     let drafterUrl = null;
+    let podCost = null;
     const samples = new Map(); // bpw -> decoded smoke-test reply
     let curBpw = variants[0];
     let curDownloadPct = 0;   // from [download] N% (monotonic)
@@ -387,6 +390,10 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
       }
       if ((m = RE.jobError.exec(line))) {
         jobError = m[1].trim().slice(0, 300);
+        return;
+      }
+      if ((m = RE.podCost.exec(line))) {
+        podCost = { secs: Number(m[1]), gpu: m[2], cloud: m[3], rate: Number(m[4]), cost: Number(m[5]) };
         return;
       }
       if ((m = RE.drafterDone.exec(line))) {
@@ -528,6 +535,8 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         out.push({ bpw: 'drafter 4.0', variant: 'drafter', url: drafterUrl, treeUrl: drafterUrl,
                    pushed: true, reused: false, duration: '', sample: null, error: null, drafter: true });
       }
+      // On the first result only: one pod, billed once, however many bitrates.
+      if (podCost && out.length) out[0].podCost = podCost;
       if (results.size > 0) {
         resolve(out); // full or partial success
       } else {
@@ -540,6 +549,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         err.signal = signal || null;
         err.podCreated = !!podId;
         err.retryable = isControllerRetryable({ signal, podId });
+        err.podCost = podCost;
         reject(err);
       }
     });
