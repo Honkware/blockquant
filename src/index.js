@@ -12,6 +12,8 @@ import { reapOrphans as reap } from './services/reaper.js';
 import { sweep as sweepControllers } from './services/detached.js';
 import { resumeJob } from './commands/quant.js';
 import { registerChat } from './chat/index.js';
+import { remindPending } from './services/approvalNotify.js';
+import { registerTypedCommandHint } from './services/typedCommandHint.js';
 
 const log = getLogger('bot');
 
@@ -69,6 +71,7 @@ client.on('interactionCreate', routeCommand);
 // Optional Kimi chat module — no-op unless CHAT_ENABLED + KIMI_API_KEY are set.
 // Delete this line + src/chat/ to remove the feature entirely.
 registerChat(client);
+registerTypedCommandHint(client);
 
 // ── Ready ───────────────────────────────────────────────────────────────────
 
@@ -231,6 +234,10 @@ async function start() {
   // previous session) and every 2 min thereafter.
   reapOrphans().catch(() => {});
   setInterval(() => reapOrphans().catch(() => {}), 120_000);
+
+  // 6. Requests nobody has approved. Hourly tick; each job is reminded about
+  // at most every 12h, starting 6h after it was made.
+  setInterval(() => remindPending(client).catch((e) => log.warn(`reminder failed: ${e.message}`)), 3_600_000);
 }
 
 // ── Graceful Shutdown ───────────────────────────────────────────────────────

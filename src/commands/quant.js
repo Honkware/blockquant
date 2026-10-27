@@ -23,6 +23,7 @@ import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from 
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { findExl3Quants } from '../services/exl3Index.js';
+import { notifyAdmins, cardUrl } from '../services/approvalNotify.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
 
 const log = getLogger('cmd:quant');
@@ -172,6 +173,18 @@ export function podGroups(variants, sc) {
 
 export async function handleQuant(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Every early return below is a reply only the requester sees, and none was
+  // logged. From 09-18 to 10-25 five /quant's ended between preflight and the
+  // job write with nothing on our side to say why, and "Quant bot is dead :("
+  // in #quant-bot was the only report of it. One line per reply says where
+  // each request ended.
+  const editReply = interaction.editReply.bind(interaction);
+  interaction.editReply = (payload) => {
+    const title = payload?.embeds?.[0]?.data?.title;
+    if (title) log.info(`/quant ${interaction.options.getString('url')} by ${interaction.user.username}: ${title}`);
+    return editReply(payload);
+  };
 
   const urlInput = interaction.options.getString('url', true);
   const bpwInput = interaction.options.getString('bpw', true);
@@ -599,6 +612,12 @@ export async function handleQuant(interaction) {
     components: [slot.quanter ? stopButtons(jobId) : approvalButtons(jobId)],
   });
   await db.patchJob(jobId, { cardMessageId: card.id });
+  if (!slot.quanter) {
+    notifyAdmins(interaction.client,
+      `\`${modelId}\` ${variants.join(', ')}${sc ? (scLite ? ' SC (trace)' : ' SC') : ''} from `
+        + `${interaction.user.username} is awaiting approval${costLine ? ` (${costLine.replace(/\*\*/g, '')})` : ''}: `
+        + `${cardUrl({ channelId: interaction.channelId, cardMessageId: card.id })}`).catch(() => {});
+  }
 
   if (slot.quanter) {
     await interaction.editReply({
