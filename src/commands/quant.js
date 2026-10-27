@@ -17,12 +17,13 @@ import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import {
-  costPreflightLine, getBalance, quoteCost, convertHours, calibrationHours,
+  getBalance, convertHours, calibrationHours,
 } from '../services/runpod.js';
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { findExl3Quants } from '../services/exl3Index.js';
+import { costPreflightLine, quoteCost } from '../services/gpuQuote.js';
 import { notifyAdmins, cardUrl } from '../services/approvalNotify.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
 
