@@ -44,7 +44,7 @@ bits_per_weight: {{BPW}}
 
 <div align="center">
 
-{{QUANTS_TABLE}}
+{{QUANTS_TABLE}}{{KL_CHART}}
 
 </div>
 

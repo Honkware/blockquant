@@ -251,6 +251,12 @@ def main():
                if row.get(k) is not None},
         )
         _push_card(repo_id, args.base, v, rendered)
+        # The card links kl.svg whenever build_kl_svg draws one.
+        svg = cards.build_kl_svg(quant_rows, repo_id)
+        if svg:
+            api.upload_file(path_or_fileobj=svg.encode(), path_in_repo="kl.svg",
+                            repo_id=repo_id, repo_type="model",
+                            commit_message="Update KL chart")
         cards.add_to_collection(slug, repo_id, token)
         print(f"[publish] {v} bpw done -> https://huggingface.co/{repo_id}", flush=True)
     if slug:

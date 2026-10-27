@@ -198,3 +198,36 @@ def test_the_launcher_names_jobs_the_way_the_pod_does():
     a = types.SimpleNamespace(sc=False, sc_lite=False, hq=None, head_bits=None,
                               vision_bits=6, mtp_bits=3.0, ngram_bits=None)
     assert cards.exl3_repo_slug("M", "4.0", **fn(a)) == "M-exl3-4.0bpw-V6-M3"
+
+
+def _kl_rows(method="qbench · self-sampled trace · 40 rows"):
+    return [dict(variant=v, kl_div=k, kl_method=method, repo_id=f"o/m-{v}-{sc}", sc=sc)
+            for v, k, sc in [("2.0", 0.08, False), ("4.0", 0.011, False), ("3.0", 0.018, True)]]
+
+
+def test_kl_chart_is_drawn_for_a_family_scored_on_one_corpus():
+    svg = cards.build_kl_svg(_kl_rows(), "o/m-4.0-False")
+    assert svg.startswith("<svg") and "self-sampled" in svg
+    assert svg.count("<circle") >= 4      # three points, a ring, the legend
+
+
+def test_kl_chart_refuses_to_mix_corpora_or_draw_one_point():
+    rows = _kl_rows()
+    rows[0]["kl_method"] = "qbench · wiki2 · 40×2048"
+    assert cards.build_kl_svg(rows) is None
+    assert cards.build_kl_svg(_kl_rows()[:1]) is None
+
+
+def test_the_card_links_the_chart_only_when_there_is_one():
+    kw = dict(base_repo="o/M", repo_id="o/m-4.0-False", variant="4.0", head_bits=6,
+              cal_rows=250, size_gb=1.0, model_config={}, collection_url="",
+              quantized_by="x")
+    assert "(kl.svg)" in cards.render_exl3_card(quant_rows=_kl_rows(), **kw)
+    assert "kl.svg" not in cards.render_exl3_card(quant_rows=_kl_rows()[:1], **kw)
+
+
+def test_every_card_upload_carries_its_chart():
+    # A card that links kl.svg without the file shows a broken image.
+    for src in (SRC, Path(__file__).resolve().parent.parent / "scripts/publish_quant.py"):
+        text = src.read_text()
+        assert text.count('path_in_repo="kl.svg"') == text.count("build_kl_svg("), src.name

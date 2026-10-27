@@ -390,6 +390,78 @@ def _cal_source(bundled: str, *, sc: bool, sc_lite: bool, donor_repo: str | None
             + (f" with `-hq {int(hq)}`" if hq else ""))
 
 
+_KIND_STYLE = {"plain": ("#6b8a76", "plain"), "sc": ("#c63010", "SC"),
+               "sct": ("#c9a227", "SCT")}
+
+
+def build_kl_svg(rows: list[dict], current_repo_id: str | None = None) -> str | None:
+    """Median KL against bpw for the family, as a standalone SVG, or None.
+
+    Asked for in #quant-bot ("there should also be a script to produce the KLD
+    graphs") and done by ezexl3. Drawn here rather than with qbench's plot.py,
+    which would put matplotlib, pandas and seaborn on the pod for one chart.
+    Only drawn when two or more quants were scored on one corpus: the same quant
+    measures three orders of magnitude apart on its own output and on wiki2, and
+    a chart mixing them is the thing the table already refuses to do.
+    """
+    import math
+    pts = [r for r in rows if (r.get("kl_div") or 0) > 0]
+    methods = {r.get("kl_method") or "" for r in pts}
+    if len(pts) < 2 or len(methods) != 1:
+        return None
+    corpus = ("self-sampled" if "trace" in next(iter(methods))
+              else "wiki2" if "wiki2" in next(iter(methods)) else "")
+    W, H, L, R, T, B = 640, 300, 64, 20, 34, 44
+    xs = [float(r["variant"]) for r in pts]
+    ys = [math.log10(r["kl_div"]) for r in pts]
+    x0, x1 = math.floor(min(xs) * 2) / 2, math.ceil(max(xs) * 2) / 2
+    if x1 - x0 < 1:
+        x1 = x0 + 1
+    y0, y1 = math.floor(min(ys)), math.ceil(max(ys))
+    if y1 == y0:
+        y1 = y0 + 1
+    px = lambda x: L + (x - x0) / (x1 - x0) * (W - L - R)
+    py = lambda y: T + (y1 - y) / (y1 - y0) * (H - T - B)
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
+           'font-family="ui-monospace,Menlo,monospace" font-size="11">',
+           f'<rect width="{W}" height="{H}" rx="6" fill="#14120e"/>',
+           f'<text x="{L}" y="20" fill="#d8d2c4" font-size="12">median KL vs fp16'
+           + (f" · {corpus}" if corpus else "") + " (log)</text>"]
+    for e in range(y0, y1 + 1):
+        y = py(e)
+        out.append(f'<line x1="{L}" y1="{y:.1f}" x2="{W - R}" y2="{y:.1f}" stroke="#2a2620"/>')
+        out.append(f'<text x="{L - 8}" y="{y + 4:.1f}" fill="#8f8879" text-anchor="end">1e{e}</text>')
+    step = 0.5 if x1 - x0 <= 3 else 1.0
+    x = x0
+    while x <= x1 + 1e-9:
+        out.append(f'<text x="{px(x):.1f}" y="{H - B + 18}" fill="#8f8879" text-anchor="middle">{x:g}</text>')
+        x += step
+    out.append(f'<text x="{(L + W - R) / 2:.0f}" y="{H - 8}" fill="#8f8879" text-anchor="middle">bpw</text>')
+    kind = lambda r: "sc" if r.get("sc") else "sct" if r.get("sc_lite") else "plain"
+    present = []
+    for k, (colour, _) in _KIND_STYLE.items():
+        series = sorted((r for r in pts if kind(r) == k), key=lambda r: float(r["variant"]))
+        if not series:
+            continue
+        present.append(k)
+        line = " ".join(f"{px(float(r['variant'])):.1f},{py(math.log10(r['kl_div'])):.1f}" for r in series)
+        if len(series) > 1:
+            out.append(f'<polyline points="{line}" fill="none" stroke="{colour}" stroke-width="2"/>')
+        for r in series:
+            cx, cy = px(float(r["variant"])), py(math.log10(r["kl_div"]))
+            if current_repo_id and r.get("repo_id") == current_repo_id:
+                out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="7" fill="none" stroke="#d8d2c4" stroke-width="1.5"/>')
+            out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{colour}"/>')
+    if len(present) > 1:
+        lx = W - R - 70 * len(present)
+        for i, k in enumerate(present):
+            colour, label = _KIND_STYLE[k]
+            out.append(f'<circle cx="{lx + i * 70 + 6}" cy="16" r="4" fill="{colour}"/>')
+            out.append(f'<text x="{lx + i * 70 + 14}" y="20" fill="#d8d2c4">{label}</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
 def _render(template: str, ctx: dict) -> str:
     out = template
     for key, value in ctx.items():
@@ -462,6 +534,9 @@ def render_exl3_card(
         "SHORT_NAME": repo_id.split("/")[-1],
         "QUANTS_TABLE": build_quants_table(quant_rows, variant, n_params_b,
                                            current_repo_id=repo_id),
+        # The file itself goes up beside README.md; see build_kl_svg.
+        "KL_CHART": ("\n\n![median KL against bpw](kl.svg)"
+                     if build_kl_svg(quant_rows, repo_id) else ""),
         "COLLECTION_URL": collection_url,
     }
     return _render(_find_template(), ctx)

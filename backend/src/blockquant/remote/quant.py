@@ -1226,6 +1226,12 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         )
         api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                         repo_id=repo_id, repo_type="model")
+        # The card links kl.svg whenever this returns one, so the two go up
+        # together or the card shows a broken image.
+        svg = cards.build_kl_svg(quant_rows, repo_id)
+        if svg:
+            api.upload_file(path_or_fileobj=svg.encode(), path_in_repo="kl.svg",
+                            repo_id=repo_id, repo_type="model")
         print(f"[card] {o['variant']} written", flush=True)
 
 
@@ -1371,6 +1377,10 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             )
             api.upload_file(path_or_fileobj=card.encode(),
                             path_in_repo="README.md", repo_id=d["repo"])
+            svg = cards.build_kl_svg(quant_rows, d["repo"])
+            if svg:
+                api.upload_file(path_or_fileobj=svg.encode(), path_in_repo="kl.svg",
+                                repo_id=d["repo"])
             print(f"[backfill] re-rendered card for {v}", flush=True)
         except Exception as e:
             print(f"[backfill] {v} card re-render failed: {e}", flush=True)
