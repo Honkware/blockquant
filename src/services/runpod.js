@@ -36,24 +36,26 @@ export async function terminatePod(id) {
   }
 }
 
-// Everything below is calibrated on runs measured on 2026-09-16 rather than
-// guessed, and quotes a band from community rates to secure ones because a job
-// can land in either pool.
+// Everything below is calibrated on measured runs rather than guessed, and
+// quotes a band from community rates to secure ones because a job can land in
+// either pool.
 //
 //   conversion   an 8B (15.3 GB) took 31.0 min on one RTX 3090
-//   sc_trace     30,500 tok/min through a 1.1 GB donor on an L40S (864 GB/s)
-//   sc_measure   0.5-0.8x of sc_trace on the one model where both were timed
+//   sc_trace     Swift-Qwen3.8-27b (51.75 GB), 4.0bpw donor: 132.7 min on
+//                2x A100 SXM with -tp, ~4,800 tok/min
+//   sc_measure   that same job reached module 44/67 in 42.5 min, i.e. ~0.5x
+//                of sc_trace, in line with the 0.5-0.8x seen on a 0.8B
 //
-// What is NOT measured: sc_measure on a large model, and how tensor-parallel
-// generation scales. The band is wide on purpose where the data is thin.
+// The trace used to be scaled off a 1.1 GB donor on an L40S and halved at the
+// low end for MTP drafting. The 27B came in at 2.2 h against a quoted
+// 0.9-1.2 h: tensor parallel bought nothing over the one-card estimate, and
+// MTP did not engage. So it is anchored on the 27B now, the size where the
+// money is, and nothing assumes drafting helps.
 const CONVERT_MIN_PER_GB = 31.0 / 15.26;      // measured, one 3090
 const BIG_CARD_SPEEDUP = 1.8;                 // A100-class vs a 3090, convert
 const CONVERT_H_AT_72GB = 3.7;                // the older 35B anchor, kept as the ceiling
-const TRACE_TOK_MIN_REF = 30500;              // measured
-const TRACE_REF_BW = 864;                     // L40S, GB/s
-const TRACE_REF_DONOR_GB = 1.1;
-const BIG_CARD_BW = 1935;                     // A100 80GB, GB/s
-const TRACE_TOKENS = 250 * 2048 * 1.2;        // target plus the wave-sizing pool
+const TRACE_H_REF = 132.7 / 60;               // measured, 27B
+const TRACE_REF_GB = 51.75;
 
 /** Mirrors _recommend_max_price in backend/scripts/run_runpod_job.py. */
 export function maxPricePerHour(sizeGb, sc = false) {
@@ -71,9 +73,11 @@ export function maxPricePerHour(sizeGb, sc = false) {
   return !gb || gb <= 20 ? Math.max(1.30, cap) : Math.max(2.10, cap);
 }
 
-/** Community and secure rates for the card a job this size will land on. */
-export function rateBand(sizeGb, sc = false) {
-  const cap = maxPricePerHour(sizeGb, sc);
+/** Community and secure rates for the pod a job this size will land on. */
+export function rateBand(sizeGb, sc = false, gpus = 1) {
+  // The cap is per GPU-hour and the launcher multiplies it by the pod's GPU
+  // count. Quoting one card's rate put a 2x A100 job at half what it billed.
+  const cap = maxPricePerHour(sizeGb, sc) * Math.max(1, gpus || 1);
   // Community runs 25-30% under secure on every card checked, and a job can
   // land in either pool, so the quote spans both rather than picking one.
   return { low: cap * 0.66, high: cap };
@@ -99,28 +103,28 @@ export function convertHours(sizeGb, isMoe = false) {
 export function calibrationHours(sizeGb) {
   const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
   if (!gb) return { low: 0.75, high: 3.0 };
-  // sc_trace generates through the DONOR, which is a ~4bpw quant of the model.
-  const donorGb = Math.max(0.2, gb / 4);
-  const tokMin = TRACE_TOK_MIN_REF * (BIG_CARD_BW / TRACE_REF_BW) * (TRACE_REF_DONOR_GB / donorGb);
-  const traceH = TRACE_TOKENS / tokMin / 60;
-  // Low end assumes MTP drafting engages (it needs the weights) and that
-  // sc_measure lands at the fast end of the one ratio we have; high end
-  // assumes neither.
-  return { low: (traceH / 2) * 1.5, high: traceH * 1.8 };
+  // sc_trace is bandwidth-bound generation through the donor, so it goes with
+  // the donor's size and that goes with the model's. The 27B's 132.7 min
+  // includes loading; a tiny model is mostly loading.
+  const traceH = Math.max(0.08, TRACE_H_REF * (gb / TRACE_REF_GB));
+  // Plus sc_measure at 0.5x and 0.8x of that; the probe is under a minute.
+  return { low: traceH * 1.5, high: traceH * 1.8 };
 }
 
 /** The one-off calibration cost band for a self-calibrated job. */
-export function scCalibrationCost(sizeGb) {
+export function scCalibrationCost(sizeGb, gpus = 1) {
   const h = calibrationHours(sizeGb);
-  const r = rateBand(sizeGb, true);
-  const ceiling = 8 * maxPricePerHour(sizeGb, true);   // a pod cannot outlive max_runtime
+  const r = rateBand(sizeGb, true, gpus);
+  const ceiling = 8 * r.high;                          // a pod cannot outlive max_runtime
   return { low: Math.min(ceiling, h.low * r.low), high: Math.min(ceiling, h.high * r.high) };
 }
 
 /** Hours and dollars for converting one variant of a model this size. */
-export function convertCost(sizeGb, sc = false, isMoe = false) {
+export function convertCost(sizeGb, sc = false, isMoe = false, gpus = 1) {
+  // Hours do not shrink with gpus: the 27B donor converted in 57.7 min on two
+  // A100s, about what one is estimated at. A second card is for VRAM.
   const h = convertHours(sizeGb, isMoe);
-  const r = rateBand(sizeGb, sc);
+  const r = rateBand(sizeGb, sc, gpus);
   return { low: h.low * r.low, high: h.high * r.high };
 }
 
@@ -161,20 +165,22 @@ export async function getBalance() {
 
 /** Conservative cost band for N variants, e.g. { low: 4.5, high: 9 }. */
 export function estimateCost(variantCount,
-                             { sc = false, sizeGb = 0, needsDonor = false, isMoe = false } = {}) {
+                             { sc = false, sizeGb = 0, needsDonor = false, isMoe = false,
+                               gpuCount = 1 } = {}) {
   const n = Math.max(0, variantCount || 0);
-  const per = convertCost(sizeGb, sc, isMoe);
+  const per = convertCost(sizeGb, sc, isMoe, gpuCount);
   let low = n * per.low;
   let high = n * per.high;
   if (!sc) return { low, high, sc: false };
   // Once for the job, not once per bitrate.
-  const cal = scCalibrationCost(sizeGb);
+  const cal = scCalibrationCost(sizeGb, gpuCount);
   low += cal.low;
   high += cal.high;
   // The donor is another whole conversion, and the job builds it itself now,
   // so quoting without it would understate what the requester is agreeing to.
   if (needsDonor) {
-    const donor = convertCost(sizeGb, false, isMoe);
+    // On the same GPU count: the donor pod is launched with the job's options.
+    const donor = convertCost(sizeGb, false, isMoe, gpuCount);
     low += donor.low;
     high += donor.high;
   }

@@ -129,9 +129,7 @@ describe('what the quote is calibrated on', () => {
   });
 
   it('scales calibration off the measured generation rate', () => {
-    // 30,500 tok/min through a 1.1 GB donor on an L40S. A 27B donor is ~12x
-    // bigger, so the trace is slower even on a faster card -- the band has to
-    // be hours here, not minutes.
+    // A 27B trace is hours, not minutes, on any card we rent.
     const h = calibrationHours(GB);
     expect(h.low).toBeGreaterThan(0.5);
     expect(h.high).toBeLessThan(8);
@@ -152,12 +150,37 @@ describe('what the quote is calibrated on', () => {
     expect(withDonor.donor).toBe(true);
   });
 
-  it('contains the bottom-up figure for the 27B job', () => {
-    // Worked by hand from the measured rates: ~$5.60-7.70 on a community
-    // A100 80GB. A band that excluded it would mean one of the two is wrong.
-    const e = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true });
-    expect(e.low).toBeLessThan(7.70);
-    expect(e.high).toBeGreaterThan(5.60);
+  it('covers what the 27B job actually billed', () => {
+    // 2x A100 SXM at $3.18/hr: the donor pod ran ~65 min, and the SC pod ~3.2 h
+    // before it died in sc_measure, so ~$14 spent without finishing. Running
+    // to the end was another ~1.6 h, ~$19 all told. The old quote, built on
+    // MTP halving the trace and one card's rate, said $5.60-7.70.
+    const e = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true, gpuCount: 2 });
+    expect(e.high).toBeGreaterThan(19);
+    expect(e.low).toBeLessThan(19);
+  });
+
+  it('puts the measured calibration inside the band', () => {
+    // sc_trace 132.7 min, probe 0.6, sc_measure 42.5 min to module 44 of 67.
+    const measured = (132.7 + 0.6 + 42.5 * 67 / 44) / 60;
+    const h = calibrationHours(GB);
+    expect(h.low).toBeLessThan(measured * 1.05);
+    expect(h.high).toBeGreaterThan(measured);
+  });
+
+  it('bills a pod for every GPU on it', () => {
+    // The launcher's cap is per GPU-hour times the count; the quote used one.
+    const one = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true });
+    const two = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true, gpuCount: 2 });
+    expect(two.low).toBeCloseTo(2 * one.low, 6);
+    expect(two.high).toBeCloseTo(2 * one.high, 6);
+    expect(rateBand(GB, true, 2).high).toBeCloseTo(2 * maxPricePerHour(GB, true), 6);
+  });
+
+  it('does not assume a second GPU converts faster', () => {
+    // 57.7 min on two A100s, which is the one-card figure.
+    expect(convertHours(GB).low).toBeLessThan(57.7 / 60 + 0.3);
+    expect(convertHours(GB).high).toBeGreaterThan(57.7 / 60);
   });
 
   it('still cannot exceed what a pod may bill', () => {

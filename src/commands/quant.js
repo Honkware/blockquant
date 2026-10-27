@@ -126,9 +126,10 @@ export async function handleQuant(interaction) {
   // different artifact now, and 16 is the way back. preflight resolves which
   // off the generated table, so the name can say -V6 without asking.
   // exllamav3's converter runs one worker thread per device and tile-splits
-  // large tensors across them, so more cards really do convert faster -- but
-  // the price cap multiplies by the count, and nothing has timed a multi-GPU
-  // convert yet, so it stays opt-in rather than scaling with model size.
+  // large tensors across them, so in principle more cards convert faster. The
+  // one multi-GPU convert timed so far, the 27B donor on 2x A100, took 57.7
+  // min, which is what the one-card estimate says; the price cap multiplies by
+  // the count regardless. So it stays opt-in, for when a model needs the VRAM.
   const gpuCount = interaction.options.getInteger('gpu_count');
   const visionBits = interaction.options.getInteger('vision_bits');
   // Only for repos that keep their model in a subdirectory. Preflight picks it
@@ -434,6 +435,7 @@ export async function handleQuant(interaction) {
   const costLine = provider === 'runpod'
     ? await costPreflightLine(variants.length, {
         sc, sizeGb: flight.sizeGb, needsDonor: !!donorBpw, isMoe: !!flight.isMoe,
+        gpuCount: gpuCount || 1,
       })
     : '';
 
