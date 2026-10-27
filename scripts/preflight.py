@@ -85,7 +85,9 @@ def _weight_gb(model_id: str, token: str, subfolder: str = "") -> float:
                 continue
             if e.path.endswith((".safetensors", ".bin", ".pt", ".gguf")):
                 total += getattr(e, "size", 0) or 0
-        return round(total / (1024 ** 3), 2)
+        # GB, not GiB: the launcher sizes caps, floors and disk in 1e9, and the
+        # quote has to agree with it about how big the model is.
+        return round(total / 1e9, 2)
     except Exception:
         return 0.0
 
@@ -214,6 +216,8 @@ def main():
                     result['architecture'] = pick["architecture"]
                     result['archSupported'] = True
                     result.update({k: pick[k] for k in ("hasVision", "isMoe", "numExperts")})
+                    # Without it the quote priced an unknown-size model.
+                    result["sizeGb"] = _weight_gb(args.model, token, pick["path"])
                     if pick["hasVision"]:
                         result["visionBitsAuto"] = auto_vision_bits(pick["architecture"])
                 else:

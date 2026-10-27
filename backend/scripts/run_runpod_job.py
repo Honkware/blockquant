@@ -761,7 +761,7 @@ def main():
     _variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     if str(args.container_disk).strip().lower() == "auto":
         args.container_disk = RunPodProvider.recommend_container_gb(
-            args.model, _variants, args.hf_token, sc=args.sc)
+            args.model, _variants, args.hf_token, sc=args.sc, subfolder=args.subfolder)
     else:
         args.container_disk = int(args.container_disk)
     if str(args.volume_disk).strip().lower() == "auto":
@@ -774,7 +774,7 @@ def main():
     # Model size (HF download GB) drives the price cap AND the card ordering:
     # big models go to a capable card (compute-bound, ~3x faster for ~same total
     # cost), small ones stay cheap. Computed once, reused for both.
-    _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token)
+    _base_gb = RunPodProvider._base_download_gb(args.model, args.hf_token, args.subfolder)
     # A ceiling on the POD, not the card: it is compared against
     # get_cost_per_hour(), which is the card's rate times --gpu-count.
     args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count, sc=args.sc)

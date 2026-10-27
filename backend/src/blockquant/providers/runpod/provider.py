@@ -123,13 +123,19 @@ class RunPodProvider(Provider):
         logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
     @staticmethod
-    def _base_download_gb(model_id: str, token: str = "") -> float | None:
-        """Total HF download size of the base model in GB, or None on lookup
-        failure."""
+    def _base_download_gb(model_id: str, token: str = "", subfolder: str = "") -> float | None:
+        """What the pod will actually download, in GB, or None on lookup failure.
+
+        Only the subfolder when there is one. Summing the whole repo priced and
+        floored the nerkyor job as a 434 GB model and sized its disk to match,
+        when it pulled the 57 GB BF16 folder and nothing else.
+        """
+        want = f"{subfolder.strip('/')}/" if subfolder else ""
         try:
             from huggingface_hub import HfApi
             info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
-            base_gb = sum((s.size or 0) for s in (info.siblings or [])) / 1e9
+            base_gb = sum((s.size or 0) for s in (info.siblings or [])
+                          if s.rfilename.startswith(want)) / 1e9
         except Exception:
             return None
         return base_gb if base_gb > 0 else None
@@ -152,7 +158,7 @@ class RunPodProvider(Provider):
     @staticmethod
     def recommend_container_gb(
         model_id: str, variants, token: str = "", floor_gb: int = 120,
-        sc: bool = False,
+        sc: bool = False, subfolder: str = "",
     ) -> int:
         """Size the local-NVMe container disk for the SERIAL pipeline. remote/
         quant.py now quantizes -> kl-evals -> uploads -> DELETES each variant
@@ -175,7 +181,7 @@ class RunPodProvider(Provider):
         Falls back generously when the HF lookups fail; never below floor_gb.
         """
         import math
-        base_gb = RunPodProvider._base_download_gb(model_id, token)
+        base_gb = RunPodProvider._base_download_gb(model_id, token, subfolder)
         if base_gb is None:
             return max(floor_gb, 200)
         bpws = []
