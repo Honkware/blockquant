@@ -20,7 +20,12 @@ STATIC_PRICES = {
     "NVIDIA L4": 0.44,
     "NVIDIA GeForce RTX 4090": 0.69,
     "NVIDIA RTX 5000 Ada Generation": 0.83,
-    "NVIDIA GeForce RTX 5090": 0.94,
+    "NVIDIA GeForce RTX 5090": 1.19,
+    "NVIDIA GeForce RTX 5080": 0.59,
+    "NVIDIA RTX PRO 4000 Blackwell": 0.57,
+    "NVIDIA RTX PRO 4500 Blackwell": 0.72,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.72,
+    "NVIDIA RTX PRO 5000 Blackwell": 0.96,
     "NVIDIA RTX A4000": 0.32,
     "NVIDIA RTX A4500": 0.44,
     "NVIDIA RTX A5000": 0.46,
@@ -38,6 +43,12 @@ STATIC_PRICES = {
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H200": 3.99,
     "NVIDIA H200 NVL": 3.79,
+    # Back in the sweep since sm_120 is in the image. The Max-Q listed at $0.50
+    # secure on 2026-10-27 next to $1.64 community, which reads as a listing
+    # error, so it carries its siblings' rate rather than the bargain.
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 2.49,
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 2.59,
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 2.59,
 }
 
 # What an unlisted card costs, for capping purposes. High on purpose: skipping

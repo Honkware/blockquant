@@ -40,13 +40,14 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
 # TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
 # RunPod GPU id.
-# Matched as substrings of the RunPod GPU id. "Blackwell" covers the whole RTX
-# PRO family; the GeForce ones carry no such marker and need naming. Do NOT
-# shorten these to "50" -- RTX 5000 Ada and RTX PRO 5000 are Ada sm_89 and run
-# fine. This listed only B200/B300 while claiming to cover sm_120, which went
-# unnoticed because a 5090 at $0.94 sat above the small-model cap and was never
-# reached; SC raises the cap to $1.30 AND sorts capable-first, which reaches it.
-_BLACKWELL_EXCLUDE = ("B200", "B300", "Blackwell", "RTX 5090", "RTX 5080")
+#
+# sm_120 was excluded again on 09-15 for having no kernels under "torch
+# 2.6/cu124". The image had been torch 2.8/cu129 built for 12.0 since before
+# that, and two days earlier an RTX PRO 6000 Blackwell had converted a
+# Qwen3.8-27B in a 1905 s pod for $1.16 -- against 5748-6135 s and $2.54-2.71
+# for the same model on an A100. The exclusion was the most expensive line in
+# this file.
+_BLACKWELL_EXCLUDE = ("B200", "B300")
 
 # Cards too weak to reliably quantize a large model (low compute / VRAM-marginal
 # for big MoE layers). Exact GPU-id match. The L4 froze mid-quant on the 35B MoE.
@@ -339,14 +340,77 @@ def _sc_min_vram(base_gb: float | None, floor: int) -> int:
     return max(floor, int(base_gb * 1.25) + 1)
 
 
-def _capable_first(base_gb: float | None, sc: bool = False) -> bool:
-    """Whether to try the fastest allowed card first rather than the cheapest.
+# Conversion speed against an RTX 3090, which with the price is what a job
+# costs. The sort used to be by price, descending for big work, on the theory
+# that a dearer card converts faster. Measured, it does not: an A100 converts at
+# about a 3090's rate per card, for six times the money.
+#
+# Measured, from controller logs:
+#   RTX 3090            1.0   Qwen3-8B 4.0, 1.89 min/GB
+#   L40S                2.0   Qwen3.5-0.8B 3.0, 2.8 min against the 3090's 5.6
+#   A100-SXM4-80GB      1.1   Qwen3.8-27B, 5748-6135 s pods
+#   A100 80GB PCIe      0.95  Qwen3.8-27B 3.8, a 7143 s pod
+#   RTX PRO 6000 Bw WS  4.2   Qwen3.8-27B 4.0, a 1905 s pod: ~25 min of it
+#                             converting once boot, download and upload are out
+# The rest are placed by architecture beside the nearest measured card. A card
+# missing here gets 1.0, which is never enough to be preferred on a guess.
+_CONVERT_SPEED = {
+    "NVIDIA GeForce RTX 3090": 1.0,
+    "NVIDIA GeForce RTX 3090 Ti": 1.1,
+    "NVIDIA RTX A6000": 1.0,
+    "NVIDIA A40": 0.9,
+    "NVIDIA RTX A5000": 0.8,
+    "NVIDIA RTX A4500": 0.7,
+    "NVIDIA RTX A4000": 0.55,
+    "NVIDIA L40S": 2.0,
+    "NVIDIA L40": 1.8,
+    "NVIDIA GeForce RTX 4090": 2.0,
+    "NVIDIA RTX 6000 Ada Generation": 2.0,
+    "NVIDIA RTX 5000 Ada Generation": 1.3,
+    "NVIDIA RTX 4000 Ada Generation": 0.7,
+    "NVIDIA RTX 4000 SFF Ada Generation": 0.6,
+    "NVIDIA RTX 2000 Ada Generation": 0.4,
+    "NVIDIA A100-SXM4-80GB": 1.1,
+    "NVIDIA A100 80GB PCIe": 0.95,
+    "NVIDIA A100-SXM4-40GB": 1.1,
+    "NVIDIA H100 PCIe": 2.0,
+    "NVIDIA H100 80GB HBM3": 2.5,
+    "NVIDIA H100 NVL": 2.3,
+    "NVIDIA H200": 2.5,
+    "NVIDIA H200 NVL": 2.5,
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 4.2,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 4.2,
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 3.2,
+    "NVIDIA RTX PRO 5000 Blackwell": 2.4,
+    "NVIDIA RTX PRO 4500 Blackwell": 1.8,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 1.8,
+    "NVIDIA RTX PRO 4000 Blackwell": 1.4,
+    "NVIDIA GeForce RTX 5090": 3.0,
+    "NVIDIA GeForce RTX 5080": 1.8,
+}
 
-    The sweep and the two lines that announce it read this, because they said
-    different things for a while: the banner reported cheapest-first on an SC
-    job that was in fact sweeping capable-first.
+
+def _convert_speed(gid: str) -> float:
+    return _CONVERT_SPEED.get(gid, 1.0)
+
+
+def _kl_min_vram(base_gb: float | None, floor: int, gpu_count: int = 1) -> int:
+    """VRAM per card a plain job needs so its KL number is not dropped.
+
+    The KL eval loads the fp16 model, autosplit across the pod's cards, and
+    skips when it does not fit. Sorting by price then took whatever card was
+    priciest, and for a big model that was an 80 GB one, so the number came
+    along by accident. Sorted by cost per job the cheap 24-48 GB cards win, and
+    a 27B on one of those would publish with no KL at all. One model is
+    resident at a time, so 1.1x plus 3 GB covers the weights, one row's
+    logits and the cache -- an 8B with KL ran on a 24 GB 3090. A model too big
+    for any single card at this count keeps the old floor and loses the number,
+    as it always did.
     """
-    return bool(sc or (base_gb and base_gb > 25))
+    if not base_gb:
+        return floor
+    need = -(-(base_gb * 1.1 + 3) // max(1, gpu_count))
+    return max(floor, int(need)) if need <= 96 else floor
 
 
 def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
@@ -396,11 +460,12 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
         if gid in _WEAK_FOR_QUANT:
             continue
         cards.append((mem, gid))
-    # Big model (> ~25 GB download, ~12B+) or a self-calibrated one -> capable-
-    # first: sort by price (then VRAM) DESCENDING so the fastest allowed card is
-    # tried first, falling back to cheaper ones. Otherwise cheapest/smallest.
-    big = _capable_first(base_gb, sc)
-    cards.sort(key=lambda c: (static_price(c[1]), c[0]), reverse=big)
+    # Cheapest per job first: price over conversion speed. Big and SC jobs used
+    # to go price-descending on the theory that dearer is faster; the A100 it
+    # kept landing on converts like a 3090 at six times the price. The VRAM
+    # floor the caller passes, not the order, is what keeps a big job off a
+    # card that cannot hold what it needs.
+    cards.sort(key=lambda c: (static_price(c[1]) / _convert_speed(c[1]), -c[0]))
     return [gid for _, gid in cards]
 
 
@@ -714,8 +779,7 @@ def main():
     # get_cost_per_hour(), which is the card's rate times --gpu-count.
     args.max_price = _pod_price_cap(args.max_price, _base_gb, args.gpu_count, sc=args.sc)
     print(f"[gpu] model ~{_base_gb or 0:.0f} GB -> price cap ${args.max_price:.2f}/hr per pod "
-          f"({args.gpu_count} GPU), "
-          f"{'capable-first' if _capable_first(_base_gb, args.sc) else 'cheapest-first'}", flush=True)
+          f"({args.gpu_count} GPU), cheapest per job first", flush=True)
 
     # Pre-flight gate: refuse an architecture exllamav3 cannot read BEFORE a pod
     # is rented and the weights are pulled. The image is whatever the bot pinned
@@ -806,7 +870,10 @@ def main():
     print(header, flush=True)
 
     if args.gpu.strip().lower() == "auto":
-        _min_vram = _sc_min_vram(_base_gb, args.min_vram) if args.sc else args.min_vram
+        _kl_on = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
+        _min_vram = (_sc_min_vram(_base_gb, args.min_vram) if args.sc
+                     else _kl_min_vram(_base_gb, args.min_vram, args.gpu_count) if _kl_on
+                     else args.min_vram)
         gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
                                        sc=args.sc)
         if not gpu_candidates and _min_vram > args.min_vram:
@@ -822,8 +889,7 @@ def main():
         if not gpu_candidates:
             print(f"ERROR: no GPUs with >= {_min_vram}GB VRAM found")
             sys.exit(1)
-        _order = "capable first" if _capable_first(_base_gb, args.sc) else "cheapest first"
-        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {_min_vram}GB, {_order}")
+        print(f"[gpu] auto: {len(gpu_candidates)} candidates >= {_min_vram}GB, cheapest per job first")
     else:
         gpu_candidates = [args.gpu] + [g.strip() for g in args.gpu_fallback.split(",") if g.strip()]
     # De-dup while preserving order

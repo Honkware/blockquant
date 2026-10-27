@@ -6,10 +6,14 @@ costs per hour -- but the ordering did not know about SC, so a small model
 still took the cheapest card and the raised cap bought nothing. The first real
 SC job ran on a $0.50 3090 for that reason.
 
-Raising what SC can reach also reaches cards that were previously out of
-budget, which is how the Blackwell list turned out to be narrower than its own
-comment: torch 2.6/cu124 has no sm_120 kernels, so a 5090 dies mid-run with
-"no kernel image is available for execution on the device".
+Blackwell was excluded twice for having no sm_120 kernels under torch 2.6. The
+image has been torch 2.8/cu129 with 12.0 in TORCH_CUDA_ARCH_LIST since before
+the second time, and an RTX PRO 6000 Blackwell converted a 27B two days before
+it for less than half what an A100 cost. Only sm_100 (B200/B300) is missing.
+
+The order was by price, descending for big work. It is by price over measured
+conversion speed now, because the dearest allowed card was an A100, which
+converts at about a 3090's rate.
 """
 import importlib.util
 import sys
@@ -36,15 +40,27 @@ def _excluded(m, gid: str) -> bool:
 
 # Real RunPod GPU ids. The Ada ones are the trap: an "RTX 5000"/"RTX 6000"
 # substring rule would drop perfectly good cards we rely on.
+@pytest.mark.parametrize("gid", ["NVIDIA B200", "NVIDIA B300 SXM6 AC"])
+def test_datacenter_blackwell_is_refused(rj, gid):
+    # sm_100: not in TORCH_CUDA_ARCH_LIST, and 12.0's PTX does not JIT down.
+    assert _excluded(rj, gid)
+
+
 @pytest.mark.parametrize("gid", [
     "NVIDIA GeForce RTX 5090",
-    "NVIDIA GeForce RTX 5080",
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-    "NVIDIA RTX PRO 4500 Blackwell Server Edition",
-    "NVIDIA B200",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA RTX PRO 4500 Blackwell",
 ])
-def test_blackwell_is_refused(rj, gid):
-    assert _excluded(rj, gid), f"{gid} has no cu124 kernels and would die mid-run"
+def test_sm120_blackwell_is_a_candidate(rj, gid):
+    # The image compiles 12.0. The Workstation Edition converted a Qwen3.8-27B
+    # in a 1905 s pod for $1.16 on 2026-09-13.
+    assert not _excluded(rj, gid)
+
+
+def test_the_image_still_compiles_what_that_assumes():
+    df = (ROOT.parent / "docker/Dockerfile.runpod").read_text()
+    assert "12.0" in df.split("TORCH_CUDA_ARCH_LIST=")[1].split("\n")[0]
 
 
 @pytest.mark.parametrize("gid", [
@@ -64,25 +80,45 @@ def test_sc_raises_the_cap_on_a_small_model(rj):
     assert rj._recommend_max_price(3.6, sc=True) == 1.30
 
 
-def test_sc_sorts_capable_first_so_the_raised_cap_means_something(rj, monkeypatch):
-    cards = [("NVIDIA GeForce RTX 3090", 24, 0.46),
-             ("NVIDIA A100-SXM4-40GB", 40, 1.29),
-             ("NVIDIA L40S", 48, 0.86)]
-    monkeypatch.setattr(rj, "_auto_gpu_ids", rj._auto_gpu_ids)
+def _ranked(rj, monkeypatch, cards, min_vram=24, sc=False):
     fake = type(sys)("runpod")
     fake.get_gpus = lambda: [{"id": g, "memoryInGb": m} for g, m, _ in cards]
     fake.api_key = ""
     monkeypatch.setitem(sys.modules, "runpod", fake)
     prices = {g: p for g, _, p in cards}
-    monkeypatch.setitem(
-        sys.modules, "blockquant.providers.runpod.pricing",
-        type(sys)("p"))
-    sys.modules["blockquant.providers.runpod.pricing"].static_price = lambda g: prices.get(g, 99)
+    mod = type(sys)("p")
+    mod.static_price = lambda g: prices.get(g, 99)
+    monkeypatch.setitem(sys.modules, "blockquant.providers.runpod.pricing", mod)
+    return rj._auto_gpu_ids("k", min_vram, 3.6, sc=sc)
 
-    cheap = rj._auto_gpu_ids("k", 24, 3.6, sc=False)
-    capable = rj._auto_gpu_ids("k", 24, 3.6, sc=True)
-    assert cheap[0] == "NVIDIA GeForce RTX 3090"
-    assert capable[0] == "NVIDIA A100-SXM4-40GB"
+
+def test_the_cheapest_card_per_job_goes_first(rj, monkeypatch):
+    # Secure prices, 2026-10-27. Price-descending put the A100 first; per job
+    # the Blackwell is a third of its cost, and the 3090 beats it on a model
+    # that fits.
+    cards = [("NVIDIA GeForce RTX 3090", 24, 0.46),
+             ("NVIDIA A100-SXM4-80GB", 80, 1.89),
+             ("NVIDIA RTX PRO 6000 Blackwell Server Edition", 96, 2.49)]
+    order = _ranked(rj, monkeypatch, cards)
+    assert order[0] == "NVIDIA GeForce RTX 3090"
+    assert order.index("NVIDIA RTX PRO 6000 Blackwell Server Edition") < order.index("NVIDIA A100-SXM4-80GB")
+
+
+def test_a_card_nobody_has_timed_is_not_preferred_on_a_guess(rj):
+    assert rj._convert_speed("NVIDIA Some Future Card") == 1.0
+
+
+def test_a_big_plain_job_keeps_its_kl_number(rj):
+    # Cheapest-per-job would put a 27B on a 24-48 GB card that cannot hold the
+    # fp16 for the KL eval, and the card would publish without one.
+    assert rj._kl_min_vram(55.6, 24) > 48
+    assert rj._kl_min_vram(55.6, 24) <= 80
+    # An 8B with KL ran on a 3090; the floor must not push it off one.
+    assert rj._kl_min_vram(16.4, 24) == 24
+    # Split across cards, each needs its share.
+    assert rj._kl_min_vram(55.6, 24, gpu_count=2) <= 48
+    # Bigger than any one card: no floor to hold to, keep the old one.
+    assert rj._kl_min_vram(400, 24) == 24
 
 
 # Real RunPod prices at the time this was written. The SC cap exists to clear
