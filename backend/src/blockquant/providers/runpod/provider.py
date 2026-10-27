@@ -1006,6 +1006,7 @@ class RunPodProvider(Provider):
         mtp_bits: float | None = None,
         ngram_bits: int | None = None,
         hq: int | None = None,
+        draft_model: str = "",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1047,6 +1048,7 @@ class RunPodProvider(Provider):
             "mtp_bits": mtp_bits,
             "ngram_bits": ngram_bits,
             "hq": hq,
+            "draft_model": draft_model or "",
             "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,
@@ -1123,7 +1125,7 @@ class RunPodProvider(Provider):
     # Self-calibration is four such stages and the longest part of an SC job.
     _PROGRESS_MARKERS = (
         r"\[download\]|\[progress\]|\[quantize\]|\[upload\]|\[done\]|"
-        r"\[sc\]|\[kl\]|\[backfill\]|\[card\]|\[fatal\]|"
+        r"\[sc\]|\[kl\]|\[backfill\]|\[card\]|\[fatal\]|\[drafter\]|"
         r"Bootstrap complete|Pod ID|ERROR|Traceback|self-terminate"
     )
 

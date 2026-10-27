@@ -592,6 +592,9 @@ def main():
     parser.add_argument("--ngram-bits", type=int, default=None,
                         help="Bits for hashed n-gram embedding tables (PLE models): 1-8. "
                              "Omitted: --bits rounded")
+    parser.add_argument("--draft-model", default="",
+                        help="HF id of a drafter (DFlash2, MTP head, ...) to quantize at 4bpw "
+                             "on the same pod and publish beside the model.")
     parser.add_argument("--hq", type=int, default=None,
                         help="Promote select layers this many levels (MoE mostly). "
                              "Omitted: 0, or 2 under --sc-lite")
@@ -1018,6 +1021,7 @@ def main():
             mtp_bits=args.mtp_bits,
             ngram_bits=args.ngram_bits,
             hq=args.hq,
+            draft_model=args.draft_model,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,

@@ -53,6 +53,21 @@ describe('attachToCli', () => {
     expect(seen.some((d) => d.podId === 'abc123')).toBe(true);
   });
 
+  it('returns a drafter as a flagged extra, never as a variant', async () => {
+    const handle = fakeHandle();
+    const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });
+    fs.appendFileSync(handle.logPath,
+      '[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n'
+      + '[drafter] done -> https://huggingface.co/o/m-DFlash2-exl3-4.0bpw\n');
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    const out = await p;
+    expect(out).toHaveLength(2);
+    expect(out[0].variant).toBe('4.0');
+    expect(out[1]).toMatchObject({ drafter: true, pushed: true,
+                                   url: 'https://huggingface.co/o/m-DFlash2-exl3-4.0bpw' });
+  });
+
   it('reports the controller error when it dies with no upload', async () => {
     const handle = fakeHandle();
     const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });

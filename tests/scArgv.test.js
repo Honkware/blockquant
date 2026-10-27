@@ -57,6 +57,15 @@ describe('convert settings argv', () => {
   });
 });
 
+describe('drafter argv', () => {
+  it('sends the drafter only when there is one', () => {
+    runViaCli({ modelId: 'o/m', variants: ['4.0'], draftModel: 'x/m-DFlash2' });
+    expect(flag(h.args, '--draft-model')).toBe('x/m-DFlash2');
+    runViaCli({ modelId: 'o/m', variants: ['4.0'] });
+    expect(h.args).not.toContain('--draft-model');
+  });
+});
+
 describe("keep-pod passthrough", () => {
   it("sends the flag only when asked", () => {
     runViaCli({ modelId: "o/m", variants: ["4.0"] });

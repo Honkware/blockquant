@@ -231,3 +231,20 @@ def test_every_card_upload_carries_its_chart():
     for src in (SRC, Path(__file__).resolve().parent.parent / "scripts/publish_quant.py"):
         text = src.read_text()
         assert text.count('path_in_repo="kl.svg"') == text.count("build_kl_svg("), src.name
+
+
+def test_the_card_links_the_drafter_published_beside_it():
+    card = cards.render_exl3_card(
+        base_repo="o/M", repo_id="x/M-exl3-4.0bpw", variant="4.0", head_bits=6, cal_rows=250,
+        size_gb=1.0, model_config={}, quant_rows=[], collection_url="", quantized_by="x",
+        drafter_repo="x/M-DFlash2-exl3-4.0bpw")
+    assert "| Drafter | [`x/M-DFlash2-exl3-4.0bpw`](https://huggingface.co/x/M-DFlash2-exl3-4.0bpw) |" in card
+
+
+def test_a_drafter_failure_cannot_fail_the_job():
+    # Best-effort by construction: every step inside one try that returns None.
+    src = SRC.read_text()
+    fn = src[src.index("def _quant_drafter"):src.index("def _selfcal_dir")]
+    body = fn[fn.index("    try:"):]
+    assert "except Exception as e:" in body and "return None" in body
+    assert 'print(f"[drafter] done -> ' in fn, "the bot finds the drafter by this line"

@@ -74,3 +74,13 @@ describe('a donor at the same bitrate as its target', () => {
     expect(o.extras).toEqual(['u/donor']);
   });
 });
+
+describe('a drafter quantized beside the model', () => {
+  it('is published extra, and never stands in for the model', () => {
+    const drafter = { variant: 'drafter', bpw: 'drafter 4.0', pushed: true, url: 'u/drafter', drafter: true };
+    const o = jobOutcome(['4.0'], [bad('4.0', 'oom'), drafter]);
+    expect(o.status).toBe('failed');
+    expect(o.extras).toEqual(['u/drafter']);
+    expect(jobOutcome(['4.0'], [ok('4.0', 'u/q'), drafter]).allDone).toBe(true);
+  });
+});

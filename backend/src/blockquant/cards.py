@@ -491,6 +491,7 @@ def render_exl3_card(
     mtp_bits: float | None = None,
     ngram_bits: int | None = None,
     hq: int | None = None,
+    drafter_repo: str | None = None,
 ) -> str:
     """Render the full polished card for one EXL3 variant."""
     base_name = base_repo.split("/")[-1]
@@ -527,6 +528,8 @@ def render_exl3_card(
             f"\n| MTP head | `{_bits_str(mtp_bits)}` bits |" if mtp_bits is not None else "",
             f"\n| N-gram tables | `{int(ngram_bits)}` bits |" if ngram_bits else "",
             f"\n| Promoted layers | `-hq {int(hq)}` |" if hq else "",
+            (f"\n| Drafter | [`{drafter_repo}`](https://huggingface.co/{drafter_repo}) |"
+             if drafter_repo else ""),
         ]),
         "CAL_ROWS": str(cal_rows),
         "CODEBOOK": (codebook or "mcg").lower(),

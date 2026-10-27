@@ -759,6 +759,57 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
     return recipe, cal
 
 
+def _quant_drafter(draft_id: str, *, base_model: str, api, owner: str, hf_token: str,
+                   quant_root: Path, parser, prepare, exl_main, bits: float = 4.0) -> str | None:
+    """Quantize a speculative-decoding drafter and publish it. Returns its repo.
+
+    A DFlash2 drafter for Qwen3.8-Flash-Next converts at 4 bpw in about 45 s
+    (dot_treo, #quant-test), and people in the channel were asking how to make
+    one. On a pod that is already up for the model, that is nearly free; on a
+    pod of its own it would be ten minutes of rental for a minute of work.
+    Best-effort: the model's quants are the job, this rides along.
+    """
+    from huggingface_hub import snapshot_download
+    try:
+        src, out, wd = (quant_root / f"drafter-{k}" for k in ("src", "out", "work"))
+        print(f"[drafter] {draft_id} ...", flush=True)
+        snapshot_download(repo_id=draft_id, local_dir=str(src), token=hf_token or None)
+        old = sys.argv
+        sys.argv = ["convert", "-i", str(src), "-o", str(out), "-w", str(wd), "-b", f"{bits:g}"]
+        try:
+            args = parser.parse_args()
+        finally:
+            sys.argv = old
+        in_args, job_state, ok, err = prepare(args)
+        if not ok:
+            raise RuntimeError(f"prepare failed: {err}")
+        exl_main(in_args, job_state)
+        name = draft_id.split("/")[-1]
+        repo_id = f"{owner}/{name}-exl3-{bits:.1f}bpw"
+        (out / "README.md").write_text(
+            "---\n"
+            f"base_model: {draft_id}\n"
+            "base_model_relation: quantized\n"
+            "library_name: exllamav3\n"
+            "tags:\n- exl3\n- draft-model\n"
+            "---\n\n"
+            f"# {name} EXL3 {bits:.1f}bpw\n\n"
+            f"[`{draft_id}`](https://huggingface.co/{draft_id}) at {bits:g} bits per weight, a "
+            f"speculative-decoding drafter for [`{base_model}`](https://huggingface.co/{base_model}). "
+            "Point TabbyAPI's `draft_model` at it, or exllamav3's `-dm`.\n",
+            encoding="utf-8")
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
+        api.upload_folder(folder_path=str(out), repo_id=repo_id, repo_type="model")
+        print(f"[drafter] done -> https://huggingface.co/{repo_id}", flush=True)
+        return repo_id
+    except Exception as e:
+        print(f"[drafter] WARN skipped ({type(e).__name__}: {e})", flush=True)
+        return None
+    finally:
+        for d in ("src", "out", "work"):
+            shutil.rmtree(quant_root / f"drafter-{d}", ignore_errors=True)
+
+
 def _selfcal_dir() -> Path | None:
     """Where the vendored selfcal tree is, whichever layout this is running in.
 
@@ -1172,7 +1223,8 @@ def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
                     head_bits, cal_rows, codebook, model_dir,
-                    name_parts: dict | None = None, donor_repo: str = "") -> None:
+                    name_parts: dict | None = None, donor_repo: str = "",
+                    drafter_repo: str | None = None) -> None:
     """Render each variant's card with the full cross-variant table and push
     README.md to its repo. Runs after the serial upload+delete, so the out_dir
     is gone -- sizes/KL come from the recs and the card goes up via the API."""
@@ -1220,7 +1272,7 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
             quantized_by=owner, codebook=o.get("_codebook", codebook),
-            donor_repo=donor_repo or None,
+            donor_repo=donor_repo or None, drafter_repo=drafter_repo,
             **{k: _np.get(k) for k in ("sc", "sc_lite", "mtp_bits", "ngram_bits", "hq")
                if _np.get(k) is not None},
         )
@@ -1462,6 +1514,8 @@ def main() -> int:
         # Optional smoke-test prompt: run on each finished quant so the requester
         # sees a real reply. The fp16 is already gone by here; we load the quant.
         test_prompt: str = (cfg.get("test_prompt") or "").strip()
+        # A drafter to quantize beside the model, e.g. a DFlash2 head.
+        draft_model: str = (cfg.get("draft_model") or "").strip()
 
         t0 = time.time()
 
@@ -1953,13 +2007,20 @@ def main() -> int:
             _publish(variant, out_dir, work_dir, rec)
             outputs.append(rec)
 
+        drafter_repo = None
+        if draft_model and api and owner:
+            drafter_repo = _quant_drafter(draft_model, base_model=model_id, api=api, owner=owner,
+                                          hf_token=hf_token, quant_root=quant_root, parser=parser,
+                                          prepare=prepare, exl_main=exl_main)
+
         if hf_token:
             # Re-render each card with the full cross-variant table now that every
             # bpw is known and push README.md to each repo (out_dirs are gone).
             try:
                 _finalize_cards(outputs, model_id, model_name, owner, hf_token,
                                 head_bits, cal_rows, codebook, model_dir,
-                                name_parts=name_parts, donor_repo=donor_repo)
+                                name_parts=name_parts, donor_repo=donor_repo,
+                                drafter_repo=drafter_repo)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an
@@ -1992,6 +2053,7 @@ def main() -> int:
         emit_result({
             "status": "complete",
             "outputs": outputs,
+            "drafter_repo": drafter_repo,
             "total_time": time.time() - t0,
         })
         print("[done]", flush=True)

@@ -104,7 +104,7 @@ function visionSummary(flight, bits) {
 export function jobOutcome(variants, results) {
   const asked = new Set(variants.map(String));
   const label = (r) => String(r.variant ?? r.bpw);
-  const wanted = (r) => !r.donor && asked.has(label(r));
+  const wanted = (r) => !r.donor && !r.drafter && asked.has(label(r));
   const requested = results.filter(wanted);
   const failed = requested.filter((r) => !r.pushed);
   const extras = results.filter((r) => !wanted(r) && r.pushed);
@@ -205,6 +205,7 @@ export async function handleQuant(interaction) {
   // sc_mode:trace without it means -hq 2, and the name has to say so up front.
   const hqOpt = interaction.options.getInteger('hq');
   const hq = hqOpt ?? (scLite ? 2 : null);
+  const draftInput = (interaction.options.getString('draft_model') || '').trim();
   // Omitted means exllamav3 decides, and its default is NOT a flat 6: it is the
   // tower's own declared default_vision_bits, 6 on the arches with a validated
   // tower and 16 -- copy it whole -- everywhere else. 1.4.9 is where that split
@@ -355,6 +356,21 @@ export async function handleQuant(interaction) {
   // plain name does not, and would publish a -V6 beside an identical unsuffixed
   // build. Drop it back to auto so both spellings land on one repo.
   const towerBits = visionBits !== null && visionBits === flight.visionBitsAuto ? null : visionBits;
+
+  // The drafter has to be one exllamav3 converts (DFlash2DraftModel and kin),
+  // which preflight checks against the same table. Found out here, not after
+  // the model's own quants have been paid for.
+  let draftModel = null;
+  if (draftInput) {
+    try {
+      draftModel = hf.parseModelId(draftInput);
+      await hf.preflight(draftModel);
+    } catch (err) {
+      return interaction.editReply({
+        embeds: [embeds.error('Drafter not usable', `\`${draftInput}\`: ${toUserMessage(err)}`)],
+      });
+    }
+  }
 
   // Preflight resolves this when the repo has one obvious source; an explicit
   // option wins so someone can quant the FP8 copy if they really mean to.
@@ -534,6 +550,7 @@ export async function handleQuant(interaction) {
       mtpBits,
       ngramBits,
       hq,
+      draftModel,
       donorRepo,
       donorBpw,
       visionBits: towerBits,
@@ -573,6 +590,7 @@ export async function handleQuant(interaction) {
       && bpws.some((b) => Math.abs(q.bpw - b) < 0.051)))
     .catch(() => []);
   const pinned = [
+    draftModel ? `drafter ${draftModel}` : '',
     mtpBits != null ? `-mb ${mtpBits}` : '',
     ngramBits != null ? `-ngb ${ngramBits}` : '',
     hq ? `-hq ${hq}` : '',
@@ -699,6 +717,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     mtpBits = null,
     ngramBits = null,
     hq = null,
+    draftModel = null,
     donorRepo = null,
     donorBpw = null,
     sizeGb = 0,
@@ -810,7 +829,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         url: modelId,
         categories: [category],
         authors: [userId],
-        quantizedBPWs: results.filter((r) => r.pushed).map((r) => r.bpw ?? r.variant),
+        quantizedBPWs: results.filter((r) => r.pushed && !r.drafter).map((r) => r.bpw ?? r.variant),
         results,
         completedAt: Date.now(),
       };
@@ -1054,7 +1073,8 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
         groups.map((g, i) =>
           new Promise((r) => setTimeout(r, i * 4000))
-            .then(() => runGroup(g, { donorRepo: effDonorRepo }))
+            // The drafter rides on the first pod only; one copy is enough.
+            .then(() => runGroup(g, { donorRepo: effDonorRepo, draftModel: i === 0 ? draftModel : null }))
         )
       );
     } finally {

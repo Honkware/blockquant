@@ -24,6 +24,7 @@ const RE = {
   layer: /Quantized:\s*\S*?layers\.(\d+)/,
   eta: /Estimated remaining time:\s*(.+)/,
   uploadDone: /\[upload\]\s*([0-9.]+)\s*(?:bpw\s*)?done\s*->\s*(https?:\/\/\S+)/,
+  drafterDone: /\[drafter\]\s*done\s*->\s*(https?:\/\/\S+)/,
   // Optional smoke-test reply, base64 so newlines/quotes survive the log relay.
   // The `b64` sentinel avoids matching the "[sample] N generating..." status line:
   // "[sample] 4.0 b64 <base64>"
@@ -187,6 +188,8 @@ export function runViaCli({
   mtpBits = null,
   ngramBits = null,
   hq = null,
+  // A drafter to quantize on the same pod, e.g. a DFlash2 head.
+  draftModel = null,
   // Leaves the pod up on BOTH paths, so a crash after the conversion keeps the
   // finished quant reachable for rescue_upload.py. Not a Discord option: the
   // controller normally terminates on failure, which is right for unattended
@@ -254,6 +257,7 @@ export function runViaCli({
     if (mtpBits != null) args.push('--mtp-bits', String(mtpBits));
     if (ngramBits != null) args.push('--ngram-bits', String(ngramBits));
     if (hq != null) args.push('--hq', String(hq));
+    if (draftModel) args.push('--draft-model', String(draftModel));
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.
@@ -319,6 +323,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
   return new Promise((resolve, reject) => {
     const total = variants.length;
     const results = new Map(); // bpw -> url
+    let drafterUrl = null;
     const samples = new Map(); // bpw -> decoded smoke-test reply
     let curBpw = variants[0];
     let curDownloadPct = 0;   // from [download] N% (monotonic)
@@ -382,6 +387,10 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
       }
       if ((m = RE.jobError.exec(line))) {
         jobError = m[1].trim().slice(0, 300);
+        return;
+      }
+      if ((m = RE.drafterDone.exec(line))) {
+        drafterUrl = m[1];
         return;
       }
       if ((m = RE.uploadDone.exec(line))) {
@@ -513,6 +522,12 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
                 : `cli exit ${code}`,
         };
       });
+      // Flagged so nothing counts it as a requested variant: it lands under
+      // "Also published", like a donor.
+      if (drafterUrl) {
+        out.push({ bpw: 'drafter 4.0', variant: 'drafter', url: drafterUrl, treeUrl: drafterUrl,
+                   pushed: true, reused: false, duration: '', sample: null, error: null, drafter: true });
+      }
       if (results.size > 0) {
         resolve(out); // full or partial success
       } else {

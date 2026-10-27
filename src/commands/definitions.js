@@ -96,6 +96,12 @@ export const commands = [
         .setMinValue(1)
         .setMaxValue(8)
     )
+    .addStringOption((opt) =>
+      opt
+        .setName('draft_model')
+        .setDescription('A drafter (e.g. a DFlash2 repo) to quantize at 4bpw beside the model, on the same pod')
+        .setRequired(false)
+    )
     .addIntegerOption((opt) =>
       opt
         .setName('hq')
