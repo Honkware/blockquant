@@ -56,3 +56,25 @@ describe('exl3RepoName', () => {
     expect(() => exl3RepoName('M', 4, { sc: true })).toThrow(TypeError);
   });
 });
+
+// The pod names these in cards.exl3_repo_slug; test_convert_flags.py pins the
+// same strings on that side, so a drift fails one of the two suites.
+describe('pinned convert settings in the name', () => {
+  it('names the trace-only kind apart from full SC', () => {
+    expect(exl3RepoName('M', 3, { scLite: true, headBits: 6, hq: 2 })).toBe('M-exl3-SCT-3.0bpw-H6-HQ2');
+    expect(exl3RepoName('M', 3, { sc: true, scLite: true, headBits: 6, hq: 2 })).toBe('M-exl3-SCT-3.0bpw-H6-HQ2');
+    expect(exl3RepoName('M', 3, { sc: true, headBits: 6 })).toBe('M-exl3-SC-3.0bpw-H6');
+  });
+
+  it('appends M, NG and HQ in the order the pod does', () => {
+    expect(exl3RepoName('M', 4, { sc: true, headBits: 5, visionBits: 6, mtpBits: 3 })).toBe(
+      'M-exl3-SC-4.0bpw-H5-V6-M3'
+    );
+    expect(exl3RepoName('M', 4, { mtpBits: 2.5, ngramBits: 6 })).toBe('M-exl3-4.0bpw-M2.5-NG6');
+    expect(exl3RepoName('M', 4, { hq: 0 })).toBe('M-exl3-4.0bpw');
+  });
+
+  it('will not name an SCT build without head bits', () => {
+    expect(() => exl3RepoName('M', 3, { scLite: true })).toThrow(TypeError);
+  });
+});

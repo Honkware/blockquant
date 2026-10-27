@@ -41,7 +41,9 @@ def main() -> None:
             if owner != org:
                 continue
             parsed = cards.parse_exl3_slug(slug, args.base)
-            if not parsed or parsed["sc"]:
+            # A donor is a plain quant. SC and SCT ones were themselves built
+            # off a trace, and a trace off one of those is a copy of a copy.
+            if not parsed or parsed["sc"] or parsed.get("sc_lite"):
                 continue
             if float(parsed["variant"]) >= args.min_bpw:
                 found.append((float(parsed["variant"]), rid))

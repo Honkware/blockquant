@@ -180,8 +180,13 @@ export function runViaCli({
   headBits = null,
   subfolder = null,
   sc = false,
+  scLite = false,
   donorRepo = null,
   gpuCount = null,
+  // Pinned only; unset leaves each to exllamav3.
+  mtpBits = null,
+  ngramBits = null,
+  hq = null,
   // Leaves the pod up on BOTH paths, so a crash after the conversion keeps the
   // finished quant reachable for rescue_upload.py. Not a Discord option: the
   // controller normally terminates on failure, which is right for unattended
@@ -243,8 +248,12 @@ export function runViaCli({
         return;
       }
       args.push('--sc');
+      if (scLite) args.push('--sc-lite');
       if (donorRepo) args.push('--donor-repo', String(donorRepo));
     }
+    if (mtpBits != null) args.push('--mtp-bits', String(mtpBits));
+    if (ngramBits != null) args.push('--ngram-bits', String(ngramBits));
+    if (hq != null) args.push('--hq', String(hq));
     // GPUs per pod. Omitted means one, which is every quant job today. The CLI
     // caps the POD price, not the card, so more GPUs raise the bill and the cap
     // together rather than sneaking past it.

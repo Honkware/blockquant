@@ -126,11 +126,18 @@ def _resolve_arch(model_id: str, token: str, revision: str = "", subfolder: str 
     return (archs[0] if archs else cfg.get("model_type", "?")), False, True
 
 
-def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
+def _variant_uploaded(model_id: str, variants, hf_org: str, token: str,
+                      name_parts: dict | None = None, since: float = 0.0) -> bool:
     """True if a requested variant's exl3 repo is already on HF with a
     config.json. Used as a fallback when the result file can't be read over a
     dropped SSH connection -- the pod uploads to HF on its own, so an upload may
-    have succeeded even though the controller lost contact."""
+    have succeeded even though the controller lost contact.
+
+    It has to look under the name this job publishes, and only count a repo
+    this launch touched. It checked the plain name for everything, so an SC 4.0
+    whose pod died was judged on the plain 4.0 -- which an SC 4.0 builds as its
+    own donor an hour earlier. That reads as done for a quant that never landed.
+    """
     try:
         from huggingface_hub import HfApi
 
@@ -140,14 +147,42 @@ def _variant_uploaded(model_id: str, variants, hf_org: str, token: str) -> bool:
         org = hf_org or (api.whoami() or {}).get("name", "")
         for v in variants:
             try:
-                info = api.model_info(cards.exl3_repo_id(org, base, v))
-                if "config.json" in {s.rfilename for s in (info.siblings or [])}:
-                    return True
+                info = api.model_info(cards.exl3_repo_id(org, base, v, **(name_parts or {})))
+                if "config.json" not in {s.rfilename for s in (info.siblings or [])}:
+                    continue
+                mod = getattr(info, "last_modified", None)
+                if since and mod is not None and mod.timestamp() < since:
+                    continue
+                return True
             except Exception:
                 continue
     except Exception:
         return False
     return False
+
+
+def _name_parts_from_args(args) -> dict:
+    """What remote/quant.py names this job's repos, from the request alone.
+
+    The pod settles the final name off the written config, which can only drop
+    a component (a pinned -mb on a model with no MTP head), never add one -- so
+    this is the name to check unless the request pinned something that no-oped.
+    """
+    from blockquant import cards
+    # 16 is "copy the tower", which the written config records as no
+    # vision_bits at all, so the name carries nothing for it.
+    vb = cards.quantized_vision_bits(args.vision_bits)
+    if args.sc:
+        hq = args.hq if args.hq is not None else (2 if args.sc_lite else None)
+        parts = {("sc_lite" if args.sc_lite else "sc"): True,
+                 "head_bits": args.head_bits, "vision_bits": vb}
+    else:
+        hq = args.hq
+        parts = {"vision_bits": vb} if vb else {}
+    for k, v in (("mtp_bits", args.mtp_bits), ("ngram_bits", args.ngram_bits), ("hq", hq)):
+        if v:
+            parts[k] = v
+    return parts
 
 
 _FRAME = ("Traceback", "  File ", "During handling", "The above exception")
@@ -546,6 +581,21 @@ def main():
              "validated, else 16).",
     )
     parser.add_argument(
+        "--sc-lite", action="store_true",
+        help="With --sc: calibrate on the model's own trace and stop there -- no "
+             "sensitivity measurement, no recipe, -hq 2 unless --hq says otherwise. "
+             "Published as -SCT-.",
+    )
+    parser.add_argument("--mtp-bits", type=float, default=None,
+                        help="Bits for the MTP head: 1-8, 1.5/2.5/3.5, or 16. "
+                             "Omitted: exllamav3's default of 4")
+    parser.add_argument("--ngram-bits", type=int, default=None,
+                        help="Bits for hashed n-gram embedding tables (PLE models): 1-8. "
+                             "Omitted: --bits rounded")
+    parser.add_argument("--hq", type=int, default=None,
+                        help="Promote select layers this many levels (MoE mostly). "
+                             "Omitted: 0, or 2 under --sc-lite")
+    parser.add_argument(
         "--local-exllama",
         type=Path,
         default=Path(__file__).parent.parent.parent / "exllamav3",
@@ -601,6 +651,11 @@ def main():
                   "and they go in the published name, so there is no default to take.",
                   flush=True)
             sys.exit(2)
+    elif args.sc_lite:
+        # It would otherwise run as a plain quant under a plain name, which is
+        # not what was asked for and not what the requester would go looking for.
+        print("[joberror] --sc-lite is a kind of --sc; pass both.", flush=True)
+        sys.exit(2)
 
     # Resolve the codebook before anything reads it: the summary, the [job]
     # header and the provider all want a concrete value, not "auto".
@@ -959,6 +1014,10 @@ def main():
             donor_repo=args.donor_repo,
             codebook=args.codebook,
             vision_bits=args.vision_bits,
+            sc_lite=args.sc_lite,
+            mtp_bits=args.mtp_bits,
+            ngram_bits=args.ngram_bits,
+            hq=args.hq,
             cal_rows=cal_rows,
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
@@ -1035,7 +1094,8 @@ def main():
         if result is None:
             # SSH unreachable / pod self-terminated. The pod uploads to HF on its
             # own, so check there before declaring failure.
-            if _variant_uploaded(args.model, _variants, args.hf_org, args.hf_token):
+            if _variant_uploaded(args.model, _variants, args.hf_org, args.hf_token,
+                                 name_parts=_name_parts_from_args(args), since=t_launch):
                 print("      result unreadable over SSH, but the variant is on HF "
                       "-> treating as complete", flush=True)
                 sys.exit(0)

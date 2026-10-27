@@ -1002,6 +1002,10 @@ class RunPodProvider(Provider):
         keep_pod: bool = False,
         test_prompt: str | None = None,
         codebook: str = "mul1",
+        sc_lite: bool = False,
+        mtp_bits: float | None = None,
+        ngram_bits: int | None = None,
+        hq: int | None = None,
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1039,6 +1043,10 @@ class RunPodProvider(Provider):
             "sc": bool(sc),
             "donor_repo": donor_repo or "",
             "vision_bits": vision_bits,
+            "sc_lite": bool(sc_lite),
+            "mtp_bits": mtp_bits,
+            "ngram_bits": ngram_bits,
+            "hq": hq,
             "codebook": codebook,
             "pod_id": instance_id,
             "runpod_api_key": self.api_key,

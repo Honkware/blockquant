@@ -29,7 +29,8 @@ def _name_parts_for(*, sc, head_bits, vision_bits):
     for node in ast.walk(ast.parse(SRC.read_text())):
         if isinstance(node, ast.FunctionDef) and node.name == "_name_parts_for":
             ns = {"cards": cards, "sc": sc, "head_bits": head_bits,
-                  "vision_bits": vision_bits}
+                  "vision_bits": vision_bits, "sc_lite": False, "_pinned": {},
+                  "mtp_bits": None, "ngram_bits": None}
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), ns)
             return ns["_name_parts_for"]
     pytest.fail("_name_parts_for is gone from quant.py")

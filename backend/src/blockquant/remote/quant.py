@@ -247,10 +247,18 @@ def _model_has_tensor_prefix(model_dir: Path, prefix: str) -> bool:
     """True if any model tensor key starts with `prefix`. Reads the safetensors
     index when present, else scans each .safetensors header. Fails OPEN (True) so
     we never wrongly strip something on an unreadable model."""
+    return _model_has_tensor(model_dir, lambda k: k.startswith(prefix))
+
+
+def _model_has_tensor_substring(model_dir: Path, part: str) -> bool:
+    return _model_has_tensor(model_dir, lambda k: part in k)
+
+
+def _model_has_tensor(model_dir: Path, match) -> bool:
     idx = model_dir / "model.safetensors.index.json"
     if idx.exists():
         try:
-            return any(k.startswith(prefix) for k in json.loads(idx.read_text()).get("weight_map", {}))
+            return any(match(k) for k in json.loads(idx.read_text()).get("weight_map", {}))
         except Exception:
             return True
     import struct
@@ -261,7 +269,7 @@ def _model_has_tensor_prefix(model_dir: Path, prefix: str) -> bool:
         try:
             with open(sf, "rb") as f:
                 hdr = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
-            if any(k.startswith(prefix) for k in hdr):
+            if any(match(k) for k in hdr):
                 return True
         except Exception:
             return True
@@ -587,8 +595,12 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
                    head_bits: int, cal_rows: int, cal_cols: int,
                    timings: dict | None = None,
                    gpu_count: int = 1,
-                   on_built=None) -> tuple[Path, Path]:
+                   on_built=None,
+                   trace_only: bool = False) -> tuple[Path | None, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
+
+    trace_only stops after sc_trace and returns (None, cal): the SCT kind,
+    calibrated on the trace with the budgeted allocation choosing the bits.
 
     Four of turboderp's scripts in order, each a subprocess so a crash in one
     is a stage failure rather than something that takes this process with it.
@@ -693,6 +705,8 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
             stage("sc_trace", trace_argv, cal)
     else:
         stage("sc_trace", trace_argv, cal)
+    if trace_only:
+        return None, cal
     stage("sc_rfn_probe", ["-mq", str(donor_dir), "-mr", str(model_dir),
                            "-o", str(rfn)], rfn)
     # --load-mode auto, NOT --streaming. Streaming walks one module at a time
@@ -1158,7 +1172,7 @@ def _repo_codebook(repo_id: str, hf_token: str, default: str = "mcg") -> str:
 
 def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
                     head_bits, cal_rows, codebook, model_dir,
-                    name_parts: dict | None = None) -> None:
+                    name_parts: dict | None = None, donor_repo: str = "") -> None:
     """Render each variant's card with the full cross-variant table and push
     README.md to its repo. Runs after the serial upload+delete, so the out_dir
     is gone -- sizes/KL come from the recs and the card goes up via the API."""
@@ -1178,6 +1192,10 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
         # Without this the Mode column calls a self-calibrated quant "plain",
         # which is the one distinction the column exists to draw.
         "sc": bool((o.get("_name_parts") or {}).get("sc")),
+        "sc_lite": bool((o.get("_name_parts") or {}).get("sc_lite")),
+        "mtp_bits": (o.get("_name_parts") or {}).get("mtp_bits"),
+        "ngram_bits": (o.get("_name_parts") or {}).get("ngram_bits"),
+        "hq": (o.get("_name_parts") or {}).get("hq"),
         "repo_id": o.get("hf_repo_id") or cards.exl3_repo_id(
             owner, model_name, o["variant"], **(o.get("_name_parts") or {})),
         "size_gb": o.get("_size_gb"),
@@ -1191,8 +1209,8 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
     collection_url = cards.collection_url_for(owner=owner, base_name=model_name, token=hf_token)
 
     for o in outputs:
-        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(
-            owner, model_name, o["variant"], **(o.get("_name_parts") or name_parts or {}))
+        _np = o.get("_name_parts") or name_parts or {}
+        repo_id = o.get("hf_repo_id") or cards.exl3_repo_id(owner, model_name, o["variant"], **_np)
         card = cards.render_exl3_card(
             base_repo=model_id, repo_id=repo_id, variant=o["variant"],
             head_bits=o.get("_head_bits", head_bits),
@@ -1202,6 +1220,9 @@ def _finalize_cards(outputs, model_id, model_name, owner, hf_token,
             model_config=model_config, quant_rows=quant_rows,
             collection_url=collection_url, license_id=license_id,
             quantized_by=owner, codebook=o.get("_codebook", codebook),
+            donor_repo=donor_repo or None,
+            **{k: _np.get(k) for k in ("sc", "sc_lite", "mtp_bits", "ngram_bits", "hq")
+               if _np.get(k) is not None},
         )
         api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                         repo_id=repo_id, repo_type="model")
@@ -1387,13 +1408,30 @@ def main() -> int:
         # job starts; nothing here goes looking.
         sc: bool = bool(cfg.get("sc", False))
         donor_repo: str = (cfg.get("donor_repo") or "").strip()
+        # Trace-only self-calibration (SCT): the model's own sampled output is
+        # the calibration set and nothing else runs. turboderp's advice for big
+        # models is sc_trace plus -hq 2 instead of measuring the whole model.
+        # sc_measure is about a third of an SC run, it is the stage that took
+        # the first 27B pod down, and past VRAM it is the slow streaming path.
+        # Still an SC job everywhere else -- donor, cache, timings.
+        sc_lite: bool = sc and bool(cfg.get("sc_lite", False))
+        # Pinned only. None leaves each to this exllamav3's default, and the
+        # name says nothing about a setting nobody chose.
+        mtp_bits = cfg.get("mtp_bits")
+        ngram_bits = cfg.get("ngram_bits")
+        hq = cfg.get("hq")
+        if sc_lite and hq is None:
+            hq = 2
+        _pinned = {k: v for k, v in (("mtp_bits", mtp_bits), ("ngram_bits", ngram_bits),
+                                     ("hq", hq)) if v}
         # One pair drives sc_trace and the conversion both, because convert
         # crops the calibration file to its own and refuses a smaller one.
         # What the published name carries, for anything that needs it before a
         # conversion exists. Once one does, _name_parts_for reads it back off
         # the written config instead -- see there.
-        name_parts = {"sc": sc, "head_bits": head_bits, "vision_bits": vision_bits} if sc \
-            else ({"vision_bits": vision_bits} if vision_bits else {})
+        name_parts = ({("sc_lite" if sc_lite else "sc"): True, "head_bits": head_bits,
+                       "vision_bits": vision_bits} if sc
+                      else ({"vision_bits": vision_bits} if vision_bits else {})) | _pinned
         sc_cal_rows: int = int(cfg.get("cal_rows") or 250)
         sc_cal_cols: int = int(cfg.get("cal_cols") or 2048)
         # Calibration tunables — fewer rows trades quality for speed.
@@ -1592,12 +1630,22 @@ def main() -> int:
             the suffix only when the requester pinned the tower themselves.
             """
             import cards
+            pinned = dict(_pinned)
+            # convert writes mtp_bits only when there was an MTP head to
+            # quantize, so a pinned -mb on a model without one names nothing.
+            pinned.pop("mtp_bits", None)
+            if mtp_bits is not None and rec.get("_mtp_bits") is not None:
+                pinned["mtp_bits"] = rec["_mtp_bits"]
+            # Nothing records ngram_bits, so look for the tables themselves: on
+            # a model without them -ngb is a no-op the name should not claim.
+            if ngram_bits and not _model_has_tensor_substring(model_dir, "ngram"):
+                pinned.pop("ngram_bits", None)
             if sc:
-                return {"sc": True,
+                return {("sc_lite" if sc_lite else "sc"): True,
                         "head_bits": rec.get("_head_bits", head_bits),
-                        "vision_bits": rec.get("_vision_bits")}
+                        "vision_bits": rec.get("_vision_bits")} | pinned
             vb = cards.quantized_vision_bits(vision_bits)
-            return {"vision_bits": vb} if vb else {}
+            return ({"vision_bits": vb} if vb else {}) | pinned
 
         def _publish(variant, out_dir, work_dir, rec):
             # Own import, like _finalize_cards and _backfill_sibling_kl. main()
@@ -1618,6 +1666,7 @@ def main() -> int:
             rec["_cal_rows"] = (_qc.get("calibration") or {}).get("rows", cal_rows)
             # Present only when the tower was quantized; that is the signal.
             rec["_vision_bits"] = _qc.get("vision_bits")
+            rec["_mtp_bits"] = _qc.get("mtp_bits")
             # Settle the name here, where the conversion is on disk to read, so
             # the card pass and the manifest cannot derive a different one.
             rec["_name_parts"] = _name_parts_for(rec)
@@ -1677,7 +1726,7 @@ def main() -> int:
                     model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
                     cal_cols=sc_cal_cols, timings=sc_timings,
-                    gpu_count=gpu_count, on_built=_save)
+                    gpu_count=gpu_count, on_built=_save, trace_only=sc_lite)
 
             print(f"[quantize] {variant} bpw ...", flush=True)
             _t_quant = time.time()
@@ -1707,12 +1756,24 @@ def main() -> int:
                 argv += ["-rcp", str(sc_recipe), "-cd", str(sc_cal),
                          "--cal_rows", str(sc_cal_rows),
                          "--cal_cols", str(sc_cal_cols)]
+            elif sc_cal is not None:
+                # SCT: the trace is the calibration set and --bits allocates.
+                argv += ["-cd", str(sc_cal), "--cal_rows", str(sc_cal_rows),
+                         "--cal_cols", str(sc_cal_cols)]
             if gpu_count > 1:
                 argv += ["-d", ",".join(str(i) for i in range(gpu_count))]
             if head_bits is not None:
                 argv += ["--head_bits", str(int(head_bits))]
             if vision_bits is not None:
                 argv += ["-vb", str(int(vision_bits))]
+            # 1.6+ only, which the version gate guarantees. -mb takes the
+            # half-integer mul1 rates, so it is not forced to an int.
+            if mtp_bits is not None:
+                argv += ["-mb", f"{float(mtp_bits):g}"]
+            if ngram_bits:
+                argv += ["-ngb", str(int(ngram_bits))]
+            if hq:
+                argv += ["-hq", str(int(hq))]
             # SC already set these to match its trace; a second pair would be
             # argparse's last-wins and could quietly disagree with the file.
             if not sc:
@@ -1888,7 +1949,7 @@ def main() -> int:
             try:
                 _finalize_cards(outputs, model_id, model_name, owner, hf_token,
                                 head_bits, cal_rows, codebook, model_dir,
-                                name_parts=name_parts)
+                                name_parts=name_parts, donor_repo=donor_repo)
             except Exception:
                 # traceback is imported at module scope; a local re-import here
                 # would make the name function-local and trip an

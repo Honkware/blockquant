@@ -114,6 +114,8 @@ def _quant_rows(api, repos, cal_rows, head_bits) -> list[dict]:
         rows.append({
             "variant": v, "head_bits": r.get("head_bits") or _repo_head_bits(repo_id, head_bits),
             "sc": r.get("sc", False), "vision_bits": r.get("vision_bits"),
+            "sc_lite": r.get("sc_lite", False), "mtp_bits": r.get("mtp_bits"),
+            "ngram_bits": r.get("ngram_bits"), "hq": r.get("hq"),
             "repo_id": repo_id,
             "cal_rows": cal_rows, "kl_div": kl, "kl_method": kl_method,
             "size_gb": _real_size_gb(api, repo_id),
@@ -245,6 +247,8 @@ def main():
             model_config=model_config, quant_rows=quant_rows,
             collection_url=coll_url, license_id=license_id,
             quantized_by=hf_org, codebook=args.codebook, title_override=args.title,
+            **{k: row.get(k) for k in ("sc", "sc_lite", "mtp_bits", "ngram_bits", "hq")
+               if row.get(k) is not None},
         )
         _push_card(repo_id, args.base, v, rendered)
         cards.add_to_collection(slug, repo_id, token)

@@ -46,8 +46,16 @@ def quantized_vision_bits(vision_bits) -> int | None:
     return n if 1 <= n <= 8 else None
 
 
+def _bits_str(b) -> str:
+    """2.5 stays 2.5, 3.0 is 3. MTP bits take the half-integer mul1 rates."""
+    f = float(b)
+    return str(int(f)) if f.is_integer() else f"{f:g}"
+
+
 def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
-                   head_bits: int | None = None, vision_bits: int | None = None) -> str:
+                   sc_lite: bool = False, head_bits: int | None = None,
+                   vision_bits: int | None = None, mtp_bits: float | None = None,
+                   ngram_bits: int | None = None, hq: int | None = None) -> str:
     """Canonical repo name: ``{model}-exl3-{bpw}bpw``.
 
     Self-calibrated builds take ``-SC-{bpw}bpw-H{n}``. Head bits is required
@@ -56,18 +64,36 @@ def exl3_repo_slug(base_name: str, variant: str, *, sc: bool = False,
     incomplete without it. A plain ``-exl3-{bpw}bpw`` already means bundled
     calibration, and one name must not describe two different artifacts.
 
+    ``-SCT-`` is the trace-only kind: calibrated on the model's own sampled
+    output, but no sensitivity measurement and no recipe, so the budgeted
+    allocation chose every tensor's bits. It is a different artifact from an
+    SC quant of the same bitrate and must not overwrite one.
+
     ``-V{n}`` is appended when the vision tower was quantized. Its absence
     means the tower was copied at fp16 -- that is how exllamav3 records it
     too, where quantization_config carries vision_bits only when the tower
-    was quantized.
+    was quantized. ``-M{n}``, ``-NG{n}`` and ``-HQ{n}`` follow the same rule:
+    present only when the request pinned them, since each changes the weights
+    and an unpinned one is just whatever this exllamav3 defaults to.
     """
-    if sc and head_bits is None:
+    if (sc or sc_lite) and head_bits is None:
         raise ValueError("A self-calibrated quant must name its head bits")
     v = exl3_variant(variant)
-    core = f"SC-{v}bpw-H{int(head_bits)}" if sc else f"{v}bpw"
+    if sc:
+        core = f"SC-{v}bpw-H{int(head_bits)}"
+    elif sc_lite:
+        core = f"SCT-{v}bpw-H{int(head_bits)}"
+    else:
+        core = f"{v}bpw"
     vb = quantized_vision_bits(vision_bits)
-    vis = f"-V{vb}" if vb else ""
-    return f"{base_name}-exl3-{core}{vis}"
+    tail = f"-V{vb}" if vb else ""
+    if mtp_bits is not None:
+        tail += f"-M{_bits_str(mtp_bits)}"
+    if ngram_bits:
+        tail += f"-NG{int(ngram_bits)}"
+    if hq:
+        tail += f"-HQ{int(hq)}"
+    return f"{base_name}-exl3-{core}{tail}"
 
 
 def exl3_slug_rx(base_name: str) -> re.Pattern:
@@ -79,8 +105,9 @@ def exl3_slug_rx(base_name: str) -> re.Pattern:
     family. Keep this next to the builder so the two move together.
     """
     return re.compile(
-        rf"^{re.escape(base_name)}-exl3-(?P<sc>SC-)?(?P<variant>[0-9.]+)bpw"
-        rf"(?:-H(?P<head_bits>\d+))?(?:-V(?P<vision_bits>\d+))?$"
+        rf"^{re.escape(base_name)}-exl3-(?:(?P<sc>SC-)|(?P<sct>SCT-))?(?P<variant>[0-9.]+)bpw"
+        rf"(?:-H(?P<head_bits>\d+))?(?:-V(?P<vision_bits>\d+))?"
+        rf"(?:-M(?P<mtp_bits>[0-9.]+))?(?:-NG(?P<ngram_bits>\d+))?(?:-HQ(?P<hq>\d+))?$"
     )
 
 
@@ -89,12 +116,17 @@ def parse_exl3_slug(slug: str, base_name: str) -> dict | None:
     m = exl3_slug_rx(base_name).match(slug)
     if not m:
         return None
+    num = lambda g, f=int: f(m.group(g)) if m.group(g) else None
     return {
         "slug": slug,
         "variant": m.group("variant"),
         "sc": bool(m.group("sc")),
-        "head_bits": int(m.group("head_bits")) if m.group("head_bits") else None,
-        "vision_bits": int(m.group("vision_bits")) if m.group("vision_bits") else None,
+        "sc_lite": bool(m.group("sct")),
+        "head_bits": num("head_bits"),
+        "vision_bits": num("vision_bits"),
+        "mtp_bits": num("mtp_bits", float),
+        "ngram_bits": num("ngram_bits"),
+        "hq": num("hq"),
     }
 
 
@@ -230,9 +262,18 @@ def _est_size_gb(bpw: float, n_params_b: float = 35.0) -> float:
 def _mode_label(row: dict) -> str:
     """How one row differs from a plain quant at its bitrate."""
     hb = row.get("head_bits")
-    mode = f"SC&nbsp;H{hb}" if row.get("sc") and hb else "SC" if row.get("sc") else "plain"
+    kind = "SC" if row.get("sc") else "SCT" if row.get("sc_lite") else None
+    mode = f"{kind}&nbsp;H{hb}" if kind and hb else kind or "plain"
     vb = quantized_vision_bits(row.get("vision_bits"))
-    return f"{mode}&nbsp;V{vb}" if vb else mode
+    if vb:
+        mode += f"&nbsp;V{vb}"
+    if row.get("mtp_bits") is not None:
+        mode += f"&nbsp;M{_bits_str(row['mtp_bits'])}"
+    if row.get("ngram_bits"):
+        mode += f"&nbsp;NG{int(row['ngram_bits'])}"
+    if row.get("hq"):
+        mode += f"&nbsp;HQ{int(row['hq'])}"
+    return mode
 
 
 def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float = 35.0,
@@ -274,7 +315,7 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     # A VL family where every row reads "plain V6" is not more than one kind --
     # that was a whole column restating one fact on every line.
     modes = [_mode_label(r) for r in rows]
-    has_mode = any(r.get("sc") for r in rows) or len(set(modes)) > 1
+    has_mode = any(r.get("sc") or r.get("sc_lite") for r in rows) or len(set(modes)) > 1
     # Head bits and calibration rows are the same down every row and the recipe
     # table below states them for this repo, so the columns only added width.
     header = (
@@ -292,7 +333,7 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     body = []
     # Plain before SC at the same bitrate, then by name so the order is stable.
     for row in sorted(rows, key=lambda r: (float(r["variant"]), bool(r.get("sc")),
-                                           r.get("repo_id") or "")):
+                                           bool(r.get("sc_lite")), r.get("repo_id") or "")):
         v = row["variant"]
         # Two rows can share a bpw once SC or a quantized tower is in play, so
         # the repo id decides which one is this card when callers supply it.
@@ -330,6 +371,25 @@ def build_quants_table(rows: list[dict], current_variant: str, n_params_b: float
     return header + "\n" + "\n".join(body)
 
 
+def _cal_source(bundled: str, *, sc: bool, sc_lite: bool, donor_repo: str | None,
+                hq: int | None) -> str:
+    """What the quant was calibrated on, which is not the bundled mix for SC.
+
+    Every SC card said "exllamav3 bundled mix" here, because this row came off
+    the model config and never knew how the quant was built. An SC quant is
+    calibrated on the model's own sampled output, and that is the whole claim.
+    """
+    if not (sc or sc_lite):
+        return bundled
+    src = (f"self-sampled: the model's own output, generated through "
+           f"[`{donor_repo}`](https://huggingface.co/{donor_repo})" if donor_repo
+           else "self-sampled: the model's own output")
+    if sc:
+        return src + "; per-tensor bitrates from a sensitivity measurement (`sc_measure` + `sc_optimize`)"
+    return (src + "; no sensitivity measurement, bitrates from the budgeted allocation"
+            + (f" with `-hq {int(hq)}`" if hq else ""))
+
+
 def _render(template: str, ctx: dict) -> str:
     out = template
     for key, value in ctx.items():
@@ -353,6 +413,12 @@ def render_exl3_card(
     quantized_by: str,
     codebook: str = "mul1",
     title_override: str | None = None,
+    sc: bool = False,
+    sc_lite: bool = False,
+    donor_repo: str | None = None,
+    mtp_bits: float | None = None,
+    ngram_bits: int | None = None,
+    hq: int | None = None,
 ) -> str:
     """Render the full polished card for one EXL3 variant."""
     base_name = base_repo.split("/")[-1]
@@ -370,7 +436,8 @@ def render_exl3_card(
         "TITLE": pretty_title(base_name, title_override),
         "ARCH_LINE": facts["arch_line"],
         "ARCH_BADGE": facts["arch_badge"],
-        "CAL_SOURCE": facts["cal_source"],
+        "CAL_SOURCE": _cal_source(facts["cal_source"], sc=sc, sc_lite=sc_lite,
+                                  donor_repo=donor_repo, hq=hq),
         "PARALLEL_LINE": facts["parallel_line"],
         "BPW": variant,
         "SIZE_GB": size_str,
@@ -381,9 +448,14 @@ def render_exl3_card(
         "HEAD_BITS": str(head_bits) if head_bits is not None else "unrecorded",
         # Absent means the tower was copied at fp16, which is the common case and
         # not worth a row. exllamav3 records vision_bits only when it quantized
-        # the tower, so presence is the whole signal.
-        "VISION_ROW": (f"\n| Vision tower | `{int(vision_bits)}` bits |"
-                       if vision_bits else ""),
+        # the tower, so presence is the whole signal. The rest are rows only
+        # when pinned, for the same reason the name carries them only then.
+        "EXTRA_ROWS": "".join([
+            f"\n| Vision tower | `{int(vision_bits)}` bits |" if vision_bits else "",
+            f"\n| MTP head | `{_bits_str(mtp_bits)}` bits |" if mtp_bits is not None else "",
+            f"\n| N-gram tables | `{int(ngram_bits)}` bits |" if ngram_bits else "",
+            f"\n| Promoted layers | `-hq {int(hq)}` |" if hq else "",
+        ]),
         "CAL_ROWS": str(cal_rows),
         "CODEBOOK": (codebook or "mcg").lower(),
         "REPO_ID": repo_id,

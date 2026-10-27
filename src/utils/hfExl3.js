@@ -22,14 +22,27 @@ export function quantizedVisionBits(visionBits) {
   return n >= 1 && n <= 8 ? n : null;
 }
 
-export function exl3RepoName(modelName, bpw, { sc = false, headBits = null, visionBits = null } = {}) {
+// 2.5 stays 2.5, 3.0 is 3. Mirrors _bits_str in cards.py.
+const bitsStr = (b) => String(Number(b));
+
+// SCT is the trace-only kind (sc_mode:trace): own-output calibration, no
+// recipe. -M/-NG/-HQ appear only when pinned, like -V. Mirrors exl3_repo_slug.
+export function exl3RepoName(modelName, bpw, {
+  sc = false, scLite = false, headBits = null, visionBits = null,
+  mtpBits = null, ngramBits = null, hq = null,
+} = {}) {
   const n = Number(bpw);
   if (!Number.isFinite(n)) throw new TypeError(`Invalid bpw value: ${bpw} (expected finite number)`);
-  if (sc && headBits == null) throw new TypeError('A self-calibrated quant must name its head bits');
+  if ((sc || scLite) && headBits == null) throw new TypeError('A self-calibrated quant must name its head bits');
   const variant = Number.isInteger(n) ? n.toFixed(1) : String(n);
-  const core = sc ? `SC-${variant}bpw-H${headBits}` : `${variant}bpw`;
+  const core = sc && !scLite ? `SC-${variant}bpw-H${headBits}`
+    : scLite ? `SCT-${variant}bpw-H${headBits}` : `${variant}bpw`;
   const vb = quantizedVisionBits(visionBits);
-  return `${modelName}-exl3-${core}${vb ? `-V${vb}` : ''}`;
+  let tail = vb ? `-V${vb}` : '';
+  if (mtpBits != null) tail += `-M${bitsStr(mtpBits)}`;
+  if (ngramBits) tail += `-NG${ngramBits}`;
+  if (hq) tail += `-HQ${hq}`;
+  return `${modelName}-exl3-${core}${tail}`;
 }
 
 export function exl3TreeUrl(repoUrl) {

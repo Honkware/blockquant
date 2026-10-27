@@ -55,7 +55,8 @@ def _out_dir(tmp_path, **qc):
     return d
 
 
-def _ns(api, *, sc, vision_bits=None, head_bits=6, hf_token="t"):
+def _ns(api, *, sc, vision_bits=None, head_bits=6, hf_token="t", sc_lite=False,
+        pinned=None, has_ngram=False):
     ns = {
         "json": json, "Path": Path,
         "_dir_size_gb": lambda d: 0.5,
@@ -65,6 +66,12 @@ def _ns(api, *, sc, vision_bits=None, head_bits=6, hf_token="t"):
         "shutil": type(sys)("shutil"),
         "head_bits": head_bits, "codebook": "mul1", "cal_rows": 250,
         "sc": sc, "vision_bits": vision_bits,
+        # Closure vars _name_parts_for reads; unpinned unless a test says so.
+        "sc_lite": sc_lite, "_pinned": pinned or {},
+        "mtp_bits": (pinned or {}).get("mtp_bits"),
+        "ngram_bits": (pinned or {}).get("ngram_bits"),
+        "model_dir": Path("/nonexistent"),
+        "_model_has_tensor_substring": lambda d, part: has_ngram,
         "hf_token": hf_token, "owner": "Honkware", "model_name": "Qwen3.5-0.8B",
         "api": api, "repo_ids": [],
     }

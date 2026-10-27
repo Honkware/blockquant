@@ -141,7 +141,17 @@ export async function handleQuant(interaction) {
   // Trellis codebook. Recorded in the quant itself, so it decides which
   // ExLlamaV3 builds can read what we publish; config.CODEBOOK is the default.
   const codebook = interaction.options.getString('codebook') || config.CODEBOOK;
-  const sc = interaction.options.getBoolean('sc') ?? false;
+  // sc_mode implies sc: nobody picks a calibration depth for a quant they did
+  // not want calibrated. trace is turboderp's advice for big models -- the
+  // model's own sampled output as calibration plus -hq 2, without measuring.
+  const scMode = interaction.options.getString('sc_mode');
+  const sc = (interaction.options.getBoolean('sc') ?? false) || !!scMode;
+  const scLite = sc && scMode === 'trace';
+  const mtpBits = interaction.options.getNumber('mtp_bits');
+  const ngramBits = interaction.options.getInteger('ngram_bits');
+  // sc_mode:trace without it means -hq 2, and the name has to say so up front.
+  const hqOpt = interaction.options.getInteger('hq');
+  const hq = hqOpt ?? (scLite ? 2 : null);
   // Omitted means exllamav3 decides, and its default is NOT a flat 6: it is the
   // tower's own declared default_vision_bits, 6 on the arches with a validated
   // tower and 16 -- copy it whole -- everywhere else. 1.4.9 is where that split
@@ -210,6 +220,13 @@ export async function handleQuant(interaction) {
       embeds: [
         embeds.error('Invalid head bits', 'Head bits must be 1-8, or 16 to leave the head unquantized.'),
       ],
+    });
+  }
+  // -mb takes whole bits, the three half-integer mul1 rates, or 16.
+  if (mtpBits !== null && !(Number.isInteger(mtpBits) && (mtpBits <= 8 || mtpBits === 16))
+      && ![1.5, 2.5, 3.5].includes(mtpBits)) {
+    return interaction.editReply({
+      embeds: [embeds.error('Invalid MTP bits', 'MTP bits must be 1-8, 1.5, 2.5, 3.5, or 16.')],
     });
   }
 
@@ -302,8 +319,12 @@ export async function handleQuant(interaction) {
       for (const bpw of bpws) {
         const repoName = exl3RepoName(modelName, bpw, {
           sc,
+          scLite,
           headBits: sc ? effHeadBits : null,
           visionBits: sc ? effVisionBits : towerBits,
+          mtpBits,
+          ngramBits,
+          hq,
         });
         const state = await hf.inspectUploadRepo(repoName, {
           sourceModel: modelId,
@@ -435,6 +456,10 @@ export async function handleQuant(interaction) {
       testPrompt,
       codebook,
       sc,
+      scLite,
+      mtpBits,
+      ngramBits,
+      hq,
       donorRepo,
       donorBpw,
       visionBits: towerBits,
@@ -565,6 +590,10 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     gpuCount = null,
     subfolder = null,
     sc = false,
+    scLite = false,
+    mtpBits = null,
+    ngramBits = null,
+    hq = null,
     donorRepo = null,
     donorBpw = null,
     categories,
@@ -846,6 +875,10 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               gpuCount,
               subfolder,
               sc,
+              scLite,
+              mtpBits,
+              ngramBits,
+              hq,
               donorRepo,
               ...over,
               onProgress: onGroupProgress(vs),
@@ -881,7 +914,12 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       renderVariants = [donorBpw, ...variants];
       pstate[donorBpw] = { stage: 'Queued', overall: 0, message: 'donor for self-calibration' };
       renderParallel();
-      const res = await runGroup([donorBpw], { sc: false, donorRepo: null });
+      // A plain build with exllamav3's defaults, whatever the job pinned: it is
+      // published as a plain quant and found again by its plain name, and a
+      // -HQ2 or -M3 donor would be neither.
+      const res = await runGroup([donorBpw], {
+        sc: false, scLite: false, donorRepo: null, mtpBits: null, ngramBits: null, hq: null,
+      });
       effDonorRepo = res?.[0]?.url
         ? res[0].url.replace('https://huggingface.co/', '')
         : null;

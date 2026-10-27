@@ -30,6 +30,16 @@ export const commands = [
     )
     .addStringOption((opt) =>
       opt
+        .setName('sc_mode')
+        .setDescription('How much self-calibration to do. Implies sc. Default full')
+        .setRequired(false)
+        .addChoices(
+          { name: 'full — measure every tensor, per-tensor recipe', value: 'full' },
+          { name: 'trace — own-output calibration + -hq 2, no measure (big models)', value: 'trace' }
+        )
+    )
+    .addStringOption((opt) =>
+      opt
         .setName('subfolder')
         .setDescription('Subdirectory holding the model, for repos that ship several formats (e.g. BF16)')
         .setRequired(false)
@@ -69,6 +79,30 @@ export const commands = [
           { name: 'mcg', value: 'mcg' },
           { name: '3inst', value: '3inst' }
         )
+    )
+    .addNumberOption((opt) =>
+      opt
+        .setName('mtp_bits')
+        .setDescription('Bits for the MTP head: 1-8, 1.5/2.5/3.5, or 16. Default 4. Ignored without one')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(16)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('ngram_bits')
+        .setDescription('Bits for n-gram embedding tables (PLE models like Qwen3.8-Flash-Next). Default: bpw rounded')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(8)
+    )
+    .addIntegerOption((opt) =>
+      opt
+        .setName('hq')
+        .setDescription('Promote select layers N times (MoE mostly). Default 0, or 2 with sc_mode:trace')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(4)
     ),
 
   new SlashCommandBuilder()

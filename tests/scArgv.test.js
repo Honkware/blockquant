@@ -37,6 +37,26 @@ describe('self-calibration argv', () => {
   });
 });
 
+describe('convert settings argv', () => {
+  it('sends sc-lite only with sc', () => {
+    runViaCli({ modelId: 'o/m', variants: ['3.0'], sc: true, scLite: true,
+                donorRepo: 'o/m-exl3-6.0bpw', headBits: 6, hq: 2 });
+    expect(h.args).toContain('--sc-lite');
+    expect(flag(h.args, '--hq')).toBe('2');
+    runViaCli({ modelId: 'o/m', variants: ['3.0'], scLite: true });
+    expect(h.args).not.toContain('--sc-lite');
+  });
+
+  it('passes pinned MTP and n-gram bits, and nothing when unset', () => {
+    runViaCli({ modelId: 'o/m', variants: ['4.0'], mtpBits: 2.5, ngramBits: 6, hq: 1 });
+    expect(flag(h.args, '--mtp-bits')).toBe('2.5');
+    expect(flag(h.args, '--ngram-bits')).toBe('6');
+    expect(flag(h.args, '--hq')).toBe('1');
+    runViaCli({ modelId: 'o/m', variants: ['4.0'] });
+    for (const f of ['--mtp-bits', '--ngram-bits', '--hq']) expect(h.args).not.toContain(f);
+  });
+});
+
 describe("keep-pod passthrough", () => {
   it("sends the flag only when asked", () => {
     runViaCli({ modelId: "o/m", variants: ["4.0"] });
