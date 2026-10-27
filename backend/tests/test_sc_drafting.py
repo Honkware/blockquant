@@ -81,8 +81,10 @@ def test_a_drafting_failure_falls_back_instead_of_losing_the_pod():
     assert block.count('stage("sc_trace"') >= 2, "there is no retry without -mtp"
 
 
-def test_tensor_parallel_is_still_only_for_multi_gpu():
+def test_the_trace_is_not_run_tensor_parallel():
+    # 2x A100 with -tp generated at 77 tok/s on the 27B: the native backend
+    # all-reduces through host memory, and it bought nothing measurable.
     src = SRC.read_text()
     i = src.index('trace_argv = ["-m", str(donor_dir)')
     j = src.index("sc_rfn_probe", i)
-    assert "gpu_count > 1" in src[i:j]
+    assert '"-tp"' not in src[i:j]

@@ -606,6 +606,12 @@ export async function handleQuant(interaction) {
       sc ? `**Self-calibration:** ${scLite ? 'trace only (no measurement)' : 'full'}  ·  **Donor:** ${
         donorRepo ? `\`${donorRepo}\`` : `builds ${donorBpw}bpw first`}` : '',
       pinned ? `**Pinned:** \`${pinned}\`` : '',
+      // The 27B's donor converted on 2x A100 in the time one card is quoted
+      // for, at twice the rate. Conversion goes layer by layer and needs one
+      // card whatever the size; SC wants the fp16 resident, ~1.2x its size.
+      (gpuCount || 1) > 1 && (!sc || (flight.sizeGb || 0) * 1.2 <= 80)
+        ? `**Note:** ${gpuCount} GPUs bill ${gpuCount}x the rate and have not been faster; this fits on one card.`
+        : '',
       `**Provider:** ${provider}`,
       costLine,
       `**Requested by:** <@${userId}>`,

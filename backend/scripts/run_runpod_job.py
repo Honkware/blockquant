@@ -834,12 +834,16 @@ def main():
     # our own create-then-raise strays, never another concurrent job's pods.
     run_tag = f"bq-{os.getpid()}-{int(time.time()) % 100000}"
 
-    # Try SECURE first (more reliable stock + network), then COMMUNITY, unless
-    # the user pinned a cloud. The --max-price cap already keeps both clouds on
-    # the cheap VRAM-appropriate tier, so SECURE-first costs nothing extra and
-    # just lands a pod faster.
-    cloud_order = [args.cloud] if cli_passed_cloud else ["SECURE", "COMMUNITY"]
-    candidate_pairs = [(g, c) for c in cloud_order for g in gpu_candidates]
+    # Per card, COMMUNITY before SECURE, unless the user pinned a cloud. It was
+    # every card on SECURE before any on COMMUNITY, under a comment saying that
+    # cost nothing extra since the cap keeps both pools on the same tier. The
+    # cap keeps them on the same CARD, and the same card is 25-55% cheaper on
+    # community -- every pod for a month landed on secure, the 27B's 2x A100
+    # SXM at $3.18/hr among them. Card order is untouched, so this never trades
+    # down a card to save money; it only stops paying secure rates for a card
+    # community has in stock.
+    cloud_order = [args.cloud] if cli_passed_cloud else ["COMMUNITY", "SECURE"]
+    candidate_pairs = [(g, c) for g in gpu_candidates for c in cloud_order]
 
     provider = None
     instance_id = None

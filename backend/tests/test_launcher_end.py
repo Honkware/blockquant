@@ -49,3 +49,11 @@ def test_printed_is_bound_in_main_not_in_the_closure():
     binds = [n for n in ast.walk(fn) if isinstance(n, ast.AnnAssign)
              and getattr(n.target, "id", "") == "printed"]
     assert binds and all(id(n) not in in_inner for n in binds)
+
+
+def test_each_card_is_tried_on_community_before_secure():
+    # Every card on SECURE came before any card on COMMUNITY, so the same card
+    # was rented at secure rates whenever secure had it in stock.
+    _, src = _main()
+    assert 'cloud_order = [args.cloud] if cli_passed_cloud else ["COMMUNITY", "SECURE"]' in src
+    assert "for g in gpu_candidates for c in cloud_order" in src

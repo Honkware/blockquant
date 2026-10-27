@@ -594,7 +594,6 @@ def _has_mtp(model_dir: Path) -> bool:
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int,
                    timings: dict | None = None,
-                   gpu_count: int = 1,
                    on_built=None,
                    trace_only: bool = False) -> tuple[Path | None, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
@@ -673,18 +672,16 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
         if on_built is not None and name in ("sc_trace", "sc_rfn_probe", "sc_measure"):
             on_built(name)
 
-    # sc_trace takes exllamav3's model_init options, so on a multi-GPU pod the
-    # donor can load tensor-parallel. This is the only stage where that can
-    # help: it is batched generation, which is bandwidth-bound, and TP splits
-    # the weight reads. sc_measure is single device by construction
-    # (torch.device("cuda", args.device)) and sc_rfn_probe streams a module at
-    # a time. Measured on the 27B, though, 2x A100 with -tp did ~4,800 tok/min,
-    # no better than one card scaled from the L40S run predicts -- so a second
-    # GPU is for VRAM, not speed, until something shows otherwise.
+    # No -tp. The 27B's trace ran -tp on 2x A100 at 77 tok/s, and two things
+    # were wrong with that. exllamav3's native TP backend all-reduces through
+    # host shared memory, twice per layer per step. And on a model with
+    # recurrent state (GDN hybrids: Qwen3.5/3.8, Nemotron-H) the generator caps
+    # concurrency at the cache's state slots, which 1.5.0's sc_trace left at
+    # model_init's default of 1 -- so it generated one conversation at a time.
+    # 1.6.5 sets 32. Without -tp the donor loads on one card when it fits and
+    # layer-splits across the rest when it does not.
     trace_argv = ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
                   "-cr", str(cal_rows), "-cc", str(cal_cols)]
-    if gpu_count > 1:
-        trace_argv += ["-tp"]
     # Self-speculative decoding off the model's own MTP head, where it has one.
     # This stage is pure generation and the longest thing in the job, so it is
     # where drafting would pay if anywhere -- but nothing has timed it, and at
@@ -1790,7 +1787,7 @@ def main() -> int:
                     model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
                     cal_cols=sc_cal_cols, timings=sc_timings,
-                    gpu_count=gpu_count, on_built=_save, trace_only=sc_lite)
+                    on_built=_save, trace_only=sc_lite)
 
             print(f"[quantize] {variant} bpw ...", flush=True)
             _t_quant = time.time()

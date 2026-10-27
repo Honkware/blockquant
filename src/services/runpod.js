@@ -51,6 +51,12 @@ export async function terminatePod(id) {
 // 0.9-1.2 h: tensor parallel bought nothing over the one-card estimate, and
 // MTP did not engage. So it is anchored on the 27B now, the size where the
 // money is, and nothing assumes drafting helps.
+//
+// That trace also ran one conversation at a time: on a model with recurrent
+// state the generator's batch is the cache's state slots, which 1.5.0's
+// sc_trace left at 1. 1.6.5 sets 32, which should make the trace on Qwen3.5/
+// 3.8-family models a fraction of this. Nothing here assumes it until a run
+// measures it -- every guess in this file so far has been wrong.
 const CONVERT_MIN_PER_GB = 31.0 / 15.26;      // measured, one 3090
 const BIG_CARD_SPEEDUP = 1.8;                 // A100-class vs a 3090, convert
 const CONVERT_H_AT_72GB = 3.7;                // the older 35B anchor, kept as the ceiling
