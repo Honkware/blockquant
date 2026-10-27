@@ -90,6 +90,29 @@ function visionSummary(flight, bits) {
 // Fanning out meant N pods each generating the same 512,000 calibration
 // tokens: measured at ~25 min and ~16 min on a 0.8B, so three bitrates paid
 // for that twice over and got nothing back.
+// What a finished job achieved, judged on the variants that were asked for.
+// A self-calibrated job's own donor lands in `results` too, and on the first
+// 27B run it was the only thing that did: the 3.6bpw SC variant died in
+// sc_measure, the 4.0 donor pushed, the note read "partial upload success
+// (1/2)" without saying which, and the job was recorded as completed.
+// The donor is flagged rather than told apart by bitrate: a 4.0 SC target gets
+// a 4.0 donor, and by label alone the donor would pass for the SC variant.
+export function jobOutcome(variants, results) {
+  const asked = new Set(variants.map(String));
+  const label = (r) => String(r.variant ?? r.bpw);
+  const wanted = (r) => !r.donor && asked.has(label(r));
+  const requested = results.filter(wanted);
+  const failed = requested.filter((r) => !r.pushed);
+  const extras = results.filter((r) => !wanted(r) && r.pushed);
+  return {
+    status: requested.length && failed.length === requested.length ? 'failed' : 'completed',
+    allDone: requested.length > 0 && failed.length === 0,
+    failed: failed.map(label),
+    reason: failed.map((r) => r.error).find(Boolean) || null,
+    extras: extras.map((r) => r.url || label(r)),
+  };
+}
+
 // What to quantize as a donor when none exists. sc_trace samples the model
 // through it and sc_rfn_probe walks its module tree, so it has to be at least
 // the target bitrate -- and no more than that, because it is generated through
@@ -605,16 +628,23 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         embeds: [embeds.jobComplete({ url: modelId, userId, results })],
         components: [],
       });
-      const pushedCount = results.filter((r) => r.pushed).length;
+      const outcome = jobOutcome(variants, results);
       let completionNote;
-      if (pushedCount === results.length && pushedCount > 0) {
+      if (outcome.allDone) {
         completionNote = `<@${userId}> Your quantization is done! 🎉`;
-      } else if (pushedCount > 0) {
-        completionNote = `<@${userId}> Quantization finished with partial upload success (${pushedCount}/${results.length}).`;
+      } else if (outcome.status === 'completed') {
+        completionNote = `<@${userId}> Partly done -- ${outcome.failed.join(', ')} bpw failed.`;
       } else {
-        completionNote =
-          `<@${userId}> Quantization finished, but upload failed for all outputs. ` +
-          'Please retry upload or contact an admin.';
+        completionNote = `<@${userId}> The quantization you asked for failed (${outcome.failed.join(', ')} bpw).`;
+      }
+      if (outcome.reason) completionNote += ` Reason: ${String(outcome.reason).slice(0, 300)}`;
+      if (!outcome.allDone) {
+        // A self-calibrated retry finds the donor on the hub and the finished
+        // stages in the cache, so it does not start over.
+        completionNote += ' Running the same command again picks up what finished.';
+      }
+      if (outcome.extras.length) {
+        completionNote += `\nAlso published: ${outcome.extras.join(', ')}`;
       }
       await thread.send(completionNote);
 
@@ -651,7 +681,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       await db.saveModels(models);
 
       await db.patchJob(jobId, {
-        status: db.JOB_STATUS.completed,
+        status: db.JOB_STATUS[outcome.status],
         completedAt: Date.now(),
         partialResults: results,
       });
@@ -863,7 +893,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       }
       // It is a real published quant, not scaffolding, so it belongs in the
       // completion embed alongside the variant that was asked for.
-      donorResult = res[0];
+      donorResult = { ...res[0], donor: true };
       log.info(`built SC donor ${effDonorRepo} for ${modelId}`);
       await db.patchJob(jobId, { donorRepo: effDonorRepo })
         .catch((err) => log.debug(`could not record donor: ${err.message}`));
