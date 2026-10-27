@@ -524,6 +524,13 @@ export async function handleQuant(interaction) {
   // cap in claimRunSlot is the only thing between one of them and a wallet's
   // worth of pods.
   const slot = await claimRunSlot({ userId, member: interaction.member });
+  // Paused: a quanter's job waits for approval like anyone's, rather than
+  // starting on its own while an admin has said nothing new should.
+  const paused = !!(await db.loadSettings().catch(() => ({}))).paused;
+  if (paused && slot.quanter) {
+    releaseRunSlot(userId);
+    slot.quanter = false;
+  }
   if (!slot.ok) {
     return interaction.editReply({
       embeds: [
@@ -641,7 +648,8 @@ export async function handleQuant(interaction) {
       '',
       slot.quanter
         ? 'Starting now — the requester holds the quanter role. Stop it with the button or `/stop`.'
-        : 'An admin must approve before this runs.',
+        : paused ? 'The bot is paused. An admin can approve this after `/resume`.'
+          : 'An admin must approve before this runs.',
     ].filter(Boolean).join('\n')
   );
 

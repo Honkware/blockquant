@@ -174,6 +174,8 @@ async function start() {
   // 2. Init job queue
   jobQueue.setPresenceUpdater((payload) => applyPresence(client, payload));
   jobQueue.init();
+  // /pause is persisted, so a restart does not quietly resume.
+  if ((await db.loadSettings().catch(() => ({}))).paused) jobQueue.pause();
   // Controllers outlive the bot (services/detached.js), so a restart does not
   // kill the work -- but it used to kill the Discord half, freezing the embed
   // and marking a job that was still quantizing "failed". Everything needed to

@@ -2,7 +2,9 @@ import { MessageFlags } from 'discord.js';
 import os from 'node:os';
 import config from '../config.js';
 import * as db from '../services/db.js';
+import * as detached from '../services/detached.js';
 import * as jobQueue from '../services/queue.js';
+import { liveControllers } from '../services/jobView.js';
 import * as workspace from '../services/workspace.js';
 import * as embeds from '../utils/embeds.js';
 
@@ -46,9 +48,13 @@ export async function handlePause(interaction) {
       flags: MessageFlags.Ephemeral,
     });
   }
+  // Persisted, and checked where RunPod jobs start (approval and the quanter
+  // path). It used to pause only the local queue, which RunPod jobs never go
+  // through, so it said "no new jobs will start" and stopped none of them.
+  await db.patchSettings({ paused: true });
   jobQueue.pause();
   await interaction.reply({
-    embeds: [embeds.warning('⏸️ Queue Paused', 'No new jobs will start until resumed.')],
+    embeds: [embeds.warning('⏸️ Paused', 'New jobs wait for `/resume`. Running jobs keep going; `/stop` ends one.')],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -60,9 +66,10 @@ export async function handleResume(interaction) {
       flags: MessageFlags.Ephemeral,
     });
   }
+  await db.patchSettings({ paused: false });
   jobQueue.resume();
   await interaction.reply({
-    embeds: [embeds.success('▶️ Queue Resumed', 'Jobs will now continue processing.')],
+    embeds: [embeds.success('▶️ Resumed', 'Requests waiting for approval can be approved again.')],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -84,6 +91,7 @@ export async function handleDiag(interaction) {
   }, {});
   const mem = process.memoryUsage();
   const cache = await workspace.getCacheStats().catch(() => ({ entries: 0, totalBytes: 0 }));
+  const controllers = liveControllers(detached.list());
 
   await interaction.reply({
     embeds: [
@@ -92,14 +100,16 @@ export async function handleDiag(interaction) {
         [
           `**Host:** ${os.hostname()} (${os.platform()} ${os.release()})`,
           `**Node:** ${process.version}`,
-          `**Queue:** waiting=${q.waiting}, active=${q.active}, paused=${q.paused}`,
+          `**Controllers alive:** ${controllers.length}${controllers.length
+            ? ` (${controllers.map((c) => `${c.meta?.modelId ?? c.id} pid ${c.pid}`).join(', ').slice(0, 300)})` : ''}`,
+          `**Local queue:** waiting=${q.waiting}, active=${q.active}, paused=${q.paused}`,
           `**Job DB:** ${
             Object.entries(counts)
               .map(([k, v]) => `${k}=${v}`)
               .join(', ') || 'empty'
           }`,
           `**Memory:** rss=${(mem.rss / 1048576).toFixed(1)}MB heap=${(mem.heapUsed / 1048576).toFixed(1)}MB`,
-          `**Cache:** ${cache.entries} model(s), ${(cache.totalBytes / 1024 ** 3).toFixed(2)} GB`,
+          `**Local cache:** ${cache.entries} model(s), ${(cache.totalBytes / 1024 ** 3).toFixed(2)} GB`,
         ].join('\n')
       ),
     ],
