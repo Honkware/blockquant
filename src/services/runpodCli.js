@@ -219,9 +219,9 @@ export function runViaCli({
       // when none are free. Disk is auto-sized by the CLI (default).
       '--gpu', 'auto',
       '--min-vram', '24',
-      // Cap $/hr scaled to model size: small models stay on cheap cards, a big
-      // model reaches an A100/H100 (compute-bound, ~3x faster for ~same total
-      // cost). The CLI also orders big-model candidates capable-first.
+      // Cap $/hr scaled to model size, a safety rail rather than the choice:
+      // the CLI orders candidates by price over measured conversion speed, so
+      // a big model goes to an RTX PRO 6000 Blackwell when one is in stock.
       '--max-price', 'auto',
       // Be patient: stock is tight and blips per-GPU, so keep re-sweeping for
       // ~20 min before giving up rather than failing after a few minutes.

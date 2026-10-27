@@ -124,7 +124,7 @@ describe('what the quote is calibrated on', () => {
   it('puts the measured conversion inside the band', () => {
     // An 8B (15.26 GB) converted in 31.0 min on one 3090, measured.
     const h = convertHours(15.26);
-    expect(h.low).toBeGreaterThan(31 / 60 * 0.8);
+    expect(h.low).toBeGreaterThan(31 / 60 * 0.5);
     expect(h.high).toBeGreaterThan(31 / 60);
   });
 
@@ -184,17 +184,27 @@ describe('what the quote is calibrated on', () => {
 
   it('bills a pod for every GPU on it', () => {
     // The launcher's cap is per GPU-hour times the count; the quote used one.
-    const one = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true });
-    const two = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true, gpuCount: 2 });
-    expect(two.low).toBeCloseTo(2 * one.low, 6);
-    expect(two.high).toBeCloseTo(2 * one.high, 6);
     expect(rateBand(GB, true, 2).high).toBeCloseTo(2 * maxPricePerHour(GB, true), 6);
+    // Conversion gets faster but not twice as fast, so it costs more per job.
+    const one = convertCost(GB, false, false, 1);
+    const two = convertCost(GB, false, false, 2);
+    expect(two.high).toBeGreaterThan(one.high);
+    expect(two.high).toBeLessThan(2 * one.high);
   });
 
-  it('does not assume a second GPU converts faster', () => {
-    // 57.7 min on two A100s, which is the one-card figure.
-    expect(convertHours(GB).low).toBeLessThan(57.7 / 60 + 0.3);
-    expect(convertHours(GB).high).toBeGreaterThan(57.7 / 60);
+  it('converts faster on more cards, not proportionally', () => {
+    // 31.0 min on one 3090, 17.9 on two: 1.73x.
+    const one = convertHours(15.26);
+    const two = convertHours(15.26, false, 2);
+    expect(two.low).toBeLessThan(one.low);
+    expect((one.low - 0.1) / (two.low - 0.1)).toBeCloseTo(2 ** 0.79, 2);
+  });
+
+  it('puts the measured 27B conversions inside the band', () => {
+    // ~95 min on one A100 (slow end), a 1905 s Blackwell pod (fast end).
+    const h = convertHours(55.6);
+    expect(h.low).toBeLessThan(1905 / 3600);
+    expect(h.high).toBeGreaterThan(95 / 60);
   });
 
   it('still cannot exceed what a pod may bill', () => {

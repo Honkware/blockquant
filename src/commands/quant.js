@@ -213,10 +213,9 @@ export async function handleQuant(interaction) {
   // different artifact now, and 16 is the way back. preflight resolves which
   // off the generated table, so the name can say -V6 without asking.
   // exllamav3's converter runs one worker thread per device and tile-splits
-  // large tensors across them, so in principle more cards convert faster. The
-  // one multi-GPU convert timed so far, the 27B donor on 2x A100, took 57.7
-  // min, which is what the one-card estimate says; the price cap multiplies by
-  // the count regardless. So it stays opt-in, for when a model needs the VRAM.
+  // large tensors across them, and it shows: an 8B took 31.0 min on one 3090
+  // and 17.9 on two, a 27B ~95 min on one A100 and 57.7 on two. Not linear,
+  // so a second card is ~15-20% more per job for ~40% less wait. Opt-in.
   const gpuCount = interaction.options.getInteger('gpu_count');
   const visionBits = interaction.options.getInteger('vision_bits');
   // Only for repos that keep their model in a subdirectory. Preflight picks it
@@ -606,11 +605,12 @@ export async function handleQuant(interaction) {
       sc ? `**Self-calibration:** ${scLite ? 'trace only (no measurement)' : 'full'}  ·  **Donor:** ${
         donorRepo ? `\`${donorRepo}\`` : `builds ${donorBpw}bpw first`}` : '',
       pinned ? `**Pinned:** \`${pinned}\`` : '',
-      // The 27B's donor converted on 2x A100 in the time one card is quoted
-      // for, at twice the rate. Conversion goes layer by layer and needs one
-      // card whatever the size; SC wants the fp16 resident, ~1.2x its size.
-      (gpuCount || 1) > 1 && (!sc || (flight.sizeGb || 0) * 1.2 <= 80)
-        ? `**Note:** ${gpuCount} GPUs bill ${gpuCount}x the rate and have not been faster; this fits on one card.`
+      // Measured on 3090s and A100s: two cards convert ~1.7x faster for
+      // ~15-20% more per job. SC's trace and measurement use one card, so
+      // there the extra cards only speed up the conversion at the end.
+      (gpuCount || 1) > 1
+        ? `**GPUs:** ${gpuCount} — conversion ~${(gpuCount ** 0.79).toFixed(1)}x faster, `
+          + `~${Math.round((gpuCount ** 0.21 - 1) * 100)}% more per job${sc ? ' (calibration still runs on one)' : ''}`
         : '',
       `**Provider:** ${provider}`,
       costLine,

@@ -40,7 +40,9 @@ export async function terminatePod(id) {
 // quotes a band from community rates to secure ones because a job can land in
 // either pool.
 //
-//   conversion   an 8B (15.3 GB) took 31.0 min on one RTX 3090
+//   conversion   an 8B (15.3 GB) took 31.0 min on one RTX 3090, 17.9 on two;
+//                Qwen3.8-27B ~95 min on one A100 SXM, 57.7 on two, and a
+//                1905 s pod on an RTX PRO 6000 Blackwell
 //   sc_trace     Swift-Qwen3.8-27b (51.75 GB), 4.0bpw donor: 132.7 min on
 //                2x A100 SXM with -tp, ~4,800 tok/min
 //   sc_measure   that same job reached module 44/67 in 42.5 min, i.e. ~0.5x
@@ -58,7 +60,15 @@ export async function terminatePod(id) {
 // 3.8-family models a fraction of this. Nothing here assumes it until a run
 // measures it -- every guess in this file so far has been wrong.
 const CONVERT_MIN_PER_GB = 31.0 / 15.26;      // measured, one 3090
-const BIG_CARD_SPEEDUP = 1.8;                 // A100-class vs a 3090, convert
+// Against that 3090. The launcher ranks cards by price over speed, so a big
+// model lands on the fastest card per dollar when it is in stock (the RTX PRO
+// 6000 Blackwell, 4.5x: ~25 of its 1905 s pod converting 57 GB) and falls back
+// to an A100 (about 1x -- not the 1.8x this used to assume) when it is not.
+// Small models land on 4090/L40S-class cards or a 3090.
+const FAST_CARD = { big: 4.5, small: 2.0 };
+const SLOW_CARD = { big: 0.95, small: 1.0 };
+// Two 3090s converted 1.73x faster than one; two A100s about 1.65x.
+const GPU_SCALING = 0.79;                     // speedup = gpus ** this
 const CONVERT_H_AT_72GB = 3.7;                // the older 35B anchor, kept as the ceiling
 const TRACE_H_REF = 132.7 / 60;               // measured, 27B
 const TRACE_REF_GB = 51.75;
@@ -92,19 +102,26 @@ export function rateBand(sizeGb, sc = false, gpus = 1) {
 }
 
 /** Hours to convert one variant of a model this size. */
-export function convertHours(sizeGb, isMoe = false) {
+export function convertHours(sizeGb, isMoe = false, gpus = 1) {
   const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
-  const measured = (gb * CONVERT_MIN_PER_GB) / 60 / (gb > 20 ? BIG_CARD_SPEEDUP : 1);
+  const tier = gb > 20 ? 'big' : 'small';
+  const scale = Math.max(1, gpus || 1) ** GPU_SCALING;
+  const at = (speed) => (gb * CONVERT_MIN_PER_GB) / 60 / speed / scale;
+  const fast = at(FAST_CARD[tier]);
+  const measured = at(SLOW_CARD[tier]);
   // The 3.7h-at-72GB anchor is a 35B MoE on a community NVL. Our own timing --
   // 8B in 31 min on a 3090, a far slower card -- implies ~2.4h at that size,
   // and both cannot describe the same work: a MoE has many times the tensors
   // to quantize. So the anchor is the ceiling for MoE and irrelevant to a
   // dense model, where carrying it doubled the width of a term we have
   // measured directly.
-  const anchor = CONVERT_H_AT_72GB * (gb / 72);
-  const high = isMoe ? Math.max(measured, anchor) : measured * 1.6;
-  // Renting, image pull and the download, before a single layer is quantized.
-  return { low: 0.25 + measured, high: 0.4 + high };
+  const anchor = CONVERT_H_AT_72GB * (gb / 72) / scale;
+  // The slow end is already the slowest card measured (A100 PCIe, a 1.98 h
+  // pod for a 27B), so it gets a tenth for variance, not a third.
+  const high = isMoe ? Math.max(measured, anchor) : measured * 1.1;
+  // Renting, image pull, the download and the upload: ~6 min in the logs when
+  // nothing goes wrong, which is the low end.
+  return { low: 0.1 + fast, high: 0.4 + high };
 }
 
 /** Hours of self-calibration -- trace, probe, measure -- paid once per job. */
@@ -132,9 +149,9 @@ export function scCalibrationCost(sizeGb, gpus = 1, opts = {}) {
 
 /** Hours and dollars for converting one variant of a model this size. */
 export function convertCost(sizeGb, sc = false, isMoe = false, gpus = 1) {
-  // Hours do not shrink with gpus: the 27B donor converted in 57.7 min on two
-  // A100s, about what one is estimated at. A second card is for VRAM.
-  const h = convertHours(sizeGb, isMoe);
+  // More cards are faster but not proportionally: 1.73x for two 3090s, so a
+  // second one costs about 15% more per job and saves 40% of the wait.
+  const h = convertHours(sizeGb, isMoe, gpus);
   const r = rateBand(sizeGb, sc, gpus);
   return { low: h.low * r.low, high: h.high * r.high };
 }
