@@ -34,8 +34,8 @@ export const commands = [
         .setDescription('How much self-calibration to do. Implies sc. Default full')
         .setRequired(false)
         .addChoices(
-          { name: 'full — measure every tensor, per-tensor recipe', value: 'full' },
-          { name: 'trace — own-output calibration + -hq 2, no measure (big models)', value: 'trace' }
+          { name: 'full: measure every tensor, per-tensor recipe', value: 'full' },
+          { name: 'trace: own-output calibration + -hq 2, no measure (big models)', value: 'trace' }
         )
     )
     .addStringOption((opt) =>

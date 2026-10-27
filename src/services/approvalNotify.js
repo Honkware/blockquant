@@ -43,7 +43,7 @@ export async function remindPending(client, { now = Date.now() } = {}) {
     const h = Math.round((now - j.createdAt) / HOUR);
     const url = cardUrl(j);
     return `• \`${j.modelId}\` ${(j.variants || []).join(', ')}${j.sc ? ' SC' : ''} by ${j.username || j.userId}, `
-      + `waiting ${h}h${url ? ` — ${url}` : ''}`;
+      + `waiting ${h}h${url ? `: ${url}` : ''}`;
   });
   await notifyAdmins(client, `Still awaiting approval:\n${lines.join('\n')}`);
   for (const j of due) await db.patchJob(j.id, { remindedAt: now });

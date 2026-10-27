@@ -625,7 +625,7 @@ export async function handleQuant(interaction) {
       // ~15-20% more per job. SC's trace and measurement use one card, so
       // there the extra cards only speed up the conversion at the end.
       (gpuCount || 1) > 1
-        ? `**GPUs:** ${gpuCount} — conversion ~${(gpuCount ** 0.79).toFixed(1)}x faster, `
+        ? `**GPUs:** ${gpuCount}, conversion ~${(gpuCount ** 0.79).toFixed(1)}x faster, `
           + `~${Math.round((gpuCount ** 0.21 - 1) * 100)}% more per job${sc ? ' (calibration still runs on one)' : ''}`
         : '',
       `**Provider:** ${provider}`,

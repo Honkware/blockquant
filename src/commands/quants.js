@@ -17,7 +17,7 @@ function line(q) {
     q.branches?.length ? `branches: ${q.branches.slice(0, 6).join(', ')}${q.branches.length > 6 ? ', …' : ''}` : null,
   ].filter(Boolean).join(' · ');
   const dl = q.downloads ? ` · ⬇ ${fmtN(q.downloads)}` : '';
-  return `${ours(q.id) ? '🧱 ' : ''}[\`${q.id}\`](https://huggingface.co/${q.id})${tags ? ` — ${tags}` : ''}${dl}`;
+  return `${ours(q.id) ? '🧱 ' : ''}[\`${q.id}\`](https://huggingface.co/${q.id})${tags ? ` · ${tags}` : ''}${dl}`;
 }
 
 // Not ephemeral: the point is that everyone can see what already exists before
