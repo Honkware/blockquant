@@ -25,7 +25,7 @@ logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod import RunPodProvider
 
 
 FIX_SCRIPT = r'''#!/usr/bin/env python3

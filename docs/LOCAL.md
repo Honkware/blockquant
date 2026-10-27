@@ -1,4 +1,6 @@
-# BlockQuant Setup Guide (Windows + RTX 4090)
+# Local GPU setup (Windows + RTX 4090)
+
+For the local pipeline (`python -m blockquant`, the API and Celery). The Discord bot does not use it; it runs every job on RunPod, which the README covers.
 
 ## Prerequisites
 

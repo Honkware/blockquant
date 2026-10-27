@@ -1,132 +1,128 @@
 # BlockQuant
 
-Discord bot and CLI for quantizing HuggingFace models to EXL3, publishing one repo per
-bitrate with cross-linked model cards and a collection.
+A Discord bot that quantizes Hugging Face models to EXL3 on rented RunPod GPUs and publishes one repo per bitrate.
 
-Quantization is [ExLlamaV3](https://github.com/turboderp-org/exllamav3). This repo covers
-job queueing and approval, GPU provisioning, KL measurement against the unquantized model,
-and publishing. Jobs run on a local GPU or a rented pod; the provider is a flag.
+The conversion itself is [ExLlamaV3](https://github.com/turboderp-org/exllamav3). This repo is everything around it: approval, picking and renting the pod, self-calibration, KL measurement against the unquantized model, and the model cards.
 
-## Pipeline
-
-```
-request ──► approval ──► download ──► convert.py ──► measure ──► upload
-                                        (per bpw)      │
-                                                       ├─ KL vs unquantized (qbench)
-                                                       └─ optional test prompt
-```
-
-Each bitrate is a separate repo, `{model}-exl3-{bpw}bpw`, and can be re-run on its own.
-A quantized vision tower appends `-V{n}`; its absence means the tower was copied at fp16.
-After upload, every card for the model is regenerated with the full quants table and added
-to the collection.
-
-## Usage
+## Running it
 
 ```bash
-# local GPU
-python -m blockquant.cli quant --model Qwen/Qwen3-8B --bpw 4.0
-
-# rented pod: provisions, runs, syncs results, terminates
-python backend/scripts/run_runpod_job.py \
-    --model Qwen/Qwen3-8B --bpw 3.0,4.0,6.0 --hf-org yourorg
+cp .env.example .env          # BOT_TOKEN, CLIENT_ID, GUILD_ID, HF_TOKEN, RUNPOD_API_KEY, ADMIN_IDS, RUNPOD_IMAGE
+npm ci
+python3 -m venv backend/venv  # the bot runs backend/venv/bin/python unless PYTHON_BIN says otherwise
+backend/venv/bin/pip install -r backend/requirements.txt
+npm start
 ```
 
-Slash commands:
+Node 20+, Python 3.10+. Pods need `~/.ssh/id_rsa{,.pub}` on the bot's host; the public key is handed to each pod.
 
-| Command | Purpose |
+## /quant
+
+```
+/quant url:Qwen/Qwen3-8B bpw:4.0
+/quant url:ukisai/Swift-Qwen3.8-27b bpw:low sc:True head_bits:5
+```
+
+| Option | What it does |
 | --- | --- |
-| `/quant` | Request a quantization (admin approves) |
-| `/stop` | Stop a job and terminate its pods |
-| `/config` | (Admin) Set the role that may quant without approval |
-| `/catbench` | Compare bitrates by SVG/Python cat drawings |
-| `/queue` | Queue state |
-| `/health` | Bot and service status |
-| `/info` | Model metadata lookup |
+| `url` | HF model URL or `org/name` |
+| `bpw` | Comma-separated, 1-8, or a preset: `low` (2.0-3.5), `mid` (4.0-5.0), `high` (6.0, 8.0), `ladder` (2.0-6.0) |
+| `sc` | Self-calibrated: measure the model and convert from a per-tensor recipe. Needs `head_bits` |
+| `sc_mode` | `full` (default) or `trace`: calibrate on the model's own output with `-hq 2` and skip the measurement. Implies `sc` |
+| `head_bits` | 1-8, or 16 for an unquantized head. exllamav3's default (6) when unset |
+| `vision_bits` | 1-8, or 16 to copy the tower. Unset lets the arch decide: 6 where exllamav3 marks the tower validated, 16 elsewhere |
+| `mtp_bits`, `ngram_bits`, `hq` | Passed to convert as `-mb`, `-ngb`, `-hq` |
+| `codebook` | `auto` (mul1 for dense, mcg for MoE), `mul1`, `mcg`, `3inst` |
+| `gpu_count` | Cards per pod. Two convert about 1.7x faster for 15-20% more per job |
+| `subfolder` | For repos that ship `BF16/`, `FP8/`, `GGUF/` side by side. Picked automatically when only one is usable |
+| `draft_model` | A drafter (e.g. a DFlash2 repo) to quantize at 4bpw on the same pod |
+| `prompt` | Run on each finished quant; the reply shows in the thread |
 
-A member holding the quanter role skips approval and may run one job at a time. Admins
-stop any job; a quanter stops their own. Stopping terminates the pod before the
-controller, since the reaper will not touch a pod younger than 15 minutes.
+Requests wait for an admin to approve them, unless the requester has the role set with `/config quanter-role`, which runs one job at a time without approval. The request card shows the quote, the card it expects to land on, and any quants others have already published at those bitrates.
 
-`/quant` options:
+Repos are named `{model}-exl3-{bpw}bpw`. A self-calibrated one is `-exl3-SC-{bpw}bpw-H{n}`, or `-SCT-` for `sc_mode:trace`. `-V{n}`, `-M{n}`, `-NG{n}` and `-HQ{n}` are added only when that setting was pinned and took effect, so a plain name always means exllamav3's defaults.
 
-| Option | Values | Default |
-| --- | --- | --- |
-| `url` | HF model URL or ID | required |
-| `bpw` | comma-separated bitrates, 1–8 | required |
-| `prompt` | test prompt run on each finished quant | none |
-| `subfolder` | directory holding the model | detected |
-| `vision_bits` | 1–8, or 16 to copy the tower unquantized | the arch decides |
-| `head_bits` | 1–8, or 16 to leave the head unquantized | 6 |
-| `codebook` | `auto`, `mul1`, `mcg`, `3inst` | `auto` |
+## Other commands
 
-Unset means exllamav3 decides, rather than a copy of its default pinned here. `head_bits`
-is 6. `vision_bits` is the tower's own `default_vision_bits`, which is 6 on the
-architectures that declare their tower validated — Qwen3-VL, Gemma4, GLM4V, Step3,
-DeepSeek-V4-Vision, MuseGlimmer — and 16 everywhere else, so most towers are copied whole.
-`codebook: auto` picks `mul1` for dense and `mcg` for MoE, whose fused expert kernel was
-`mcg`-only on older images.
+| Command | |
+| --- | --- |
+| `/quants [model]` | Every EXL3 quant of a model on HF, ours and the community's. With no model, the bot's latest |
+| `/stop [job]` | Stop a job and terminate its pods. Admins stop any; a quanter stops their own |
+| `/queue`, `/history` | What is running or waiting, and what finished and what it cost |
+| `/health`, `/diag` | Uptime, live controllers, RunPod balance; `/diag` is admin-only and more verbose |
+| `/pause`, `/resume` | Admin. Paused, approvals are refused and quanter jobs wait for approval. Running jobs keep going |
+| `/catbench [model]` | Ask a model for a cute kitten twice, as SVG and as Python, and post what comes out |
+| `/config quanter-role`, `/cache` | Admin settings |
 
-`subfolder` is for repos that ship several formats side by side (`BF16/`, `FP8/`,
-`GGUF/`). Pre-flight picks the one unquantized directory whose architecture exllamav3
-knows, and only that subtree is downloaded. An already-quantized directory is never
-chosen: it has been rounded once, and quantizing it again compounds that.
+## What a job does
 
-## Providers
+```
+/quant ─► approval ─► rent pod ─► download (pinned commit) ─► [SC: trace ─► probe ─► measure ─► optimize]
+                                                                        │
+                       cards + chart + collection ◄─ upload ◄─ KL ◄─ convert (per bpw)
+```
 
-`local` runs against the GPUs on the host. `runpod` rents one per job.
+Plain jobs get a pod per bitrate. SC jobs run every bitrate on one pod after a single calibration, and build a 6.0bpw donor first if the model has no quant of its own to trace through.
 
-Pod selection orders candidates by model size: cheapest-first under 25 GB, capable-first
-above. Datacenter Blackwell (B200/B300), AMD and low-power inference
-cards are excluded. Pods are terminated on
-every exit path and swept by name prefix. Downloads run under a stall watchdog.
+Each published repo carries `blockquant.json` (the base model's commit, the exllamav3 version and commit, every setting) and, when KL was measured, `bq_quality.json`. The completion message links each repo at the commit it had once its card went up, which is the one to pin.
 
-## Image
+## Which card, and what it costs
 
-`docker/Dockerfile.runpod` — one image for every supported architecture, listed in
-`backend/arch_support.json`.
+`backend/gpu_table.json` holds each card's fallback price and its conversion speed against an RTX 3090, measured where the file says so and estimated from the architecture otherwise. The launcher sorts candidates by price over speed and tries each on community before secure, under a per-size price cap. A plain job also needs enough VRAM to load the unquantized model for its KL number, so a 27B goes to an 80-96 GB card, not the cheapest 24 GB one.
 
-- exllamav3 pinned to a release commit (`EXLLAMAV3_REF`); bump behind an end-to-end run,
-  and bump `selfcal/VENDOR_MANIFEST.json` with it or the vendor test fails
-- Python 3.12 — fla's Triton kernels fail to import on 3.11
-- the CUDA extension is compiled at build time, not JITed on the pod's first boot
-- flash-attn not installed; exllamav3's Triton attention handles sliding window
-- wikitext-2 is warmed into the dataset cache so a paid pod cannot lose its KL number
-  to a Hugging Face outage
+The bot's quote runs the same selection against RunPod's live prices and stock. Every pod reports what it actually cost when it exits, and the completion message puts that next to the quote.
+
+From the logs: a Qwen3.8-27B converted in a 1905 s pod on an RTX PRO 6000 Blackwell ($1.16) and in 5748-6135 s on an A100 SXM ($2.54-2.71).
 
 ## Measurement
 
-KL is measured with [qbench](https://github.com/turboderp-org/exllamav3/tree/master/eval/qbench),
-vendored under `backend/src/blockquant/selfcal/eval/qbench/`, so the number can be read
-against turboderp's and ezexl3's rather than being ours alone. wiki2 at 10×2048, which is
-what qbench's own example project uses and the only corpus `sc_measure` implements.
+KL against the unquantized model, with [qbench](https://github.com/turboderp-org/exllamav3/tree/master/eval/qbench) vendored under `backend/src/blockquant/selfcal/eval/qbench/` so the numbers read against turboderp's and ezexl3's. Scored on the model's own sampled output when an SC trace exists, wiki2 at 10x2048 otherwise. The card says which, and the KL-vs-bpw chart is only drawn when every quant in the family was scored on the same one.
 
-Cards quote the **median**, not the mean. Per qbench's own note, the mean is dominated by
-tokens where the reference itself is undecided, where any perturbation is amplified; the
-median and the high-confidence buckets are what isolate quantization damage. The full
-spread and the buckets go in each repo's `bq_quality.json`.
+Cards quote the median, not the mean: per qbench's own note, the mean is dominated by tokens the reference is itself unsure of. The full spread and the confidence buckets are in `bq_quality.json`.
 
-Two passes, one model resident at a time: the unquantized model writes reference logits to
-disk, then the quant is streamed against them. That is qbench's arrangement and it is what
-lets a 35B reference fit on an 80 GB card.
+One model is resident at a time. The reference writes its logits to disk, then the quant runs against them.
 
-wiki2's test split is not what EXL3 calibrates on — that is `standard_cal_data/wiki.utf8`,
-a general Wikipedia dump. 393 sampled 12-word shingles from the test split appear in it
-zero times.
+## Without Discord
+
+```bash
+# what the bot runs, one controller per pod
+backend/venv/bin/python backend/scripts/run_runpod_job.py \
+    --model Qwen/Qwen3-8B --variants 4.0 --hf-org yourorg --image ghcr.io/honkware/blockquant:sha-<commit>
+
+# local GPU pipeline (the bot does not use it)
+cd backend/src && ../venv/bin/python -m blockquant --model Qwen/Qwen3-8B --variants 4.0 --provider local
+```
+
+`run_runpod_job.py --help` has the rest, including `--sc`, `--sc-lite`, `--gpu`, `--max-price` and `--keep-pod` (leave the pod up after a failure, to rescue the output with `rescue_upload.py`).
+
+## Image
+
+`docker/Dockerfile.runpod`, built by `.github/workflows/build-runpod-image.yml` on a tag or by hand. One image for every architecture in `backend/arch_support.json`.
+
+- exllamav3 is pinned to a commit (`EXLLAMAV3_REF`, 1.6.5 now). The self-calibration scripts in `backend/src/blockquant/selfcal/` are vendored from the same commit, and the vendor test fails if the two drift. Bump both behind a real run.
+- Python 3.12 and torch 2.8/cu129. fla's Triton kernels do not import on 3.11.
+- The CUDA extension is built in the image for sm 8.0-12.0, so pods do not compile it on first boot. B200/B300 (sm 10.0) are not covered and never rented.
+- wikitext-2 is cached in the image so a pod cannot lose its KL number to an HF outage.
 
 ## Layout
 
 ```
-src/                        Discord bot: commands, queue, embeds
-backend/src/blockquant/     download → quantize → verify → quality → report → upload
-  providers/                local, runpod
-  remote/quant.py           runs on the pod
-  selfcal/                  vendored exllamav3 self-calibration + qbench (see its manifest)
-backend/scripts/            run_runpod_job.py, publish_quant.py
-docker/                     RunPod image
+src/                          Discord bot: commands, quoting, job state (data/jobs.json)
+scripts/                      Python the bot shells out to: preflight, donor lookup, HF helpers
+backend/scripts/              run_runpod_job.py (one controller per pod), publish_quant.py, pod_watchdog.py (cron)
+backend/src/blockquant/
+  remote/quant.py             what runs on the pod
+  providers/runpod/           renting, SSH, health checks, prices
+  cards.py                    repo names and model cards
+  selfcal/                    vendored exllamav3 scripts, see VENDOR_MANIFEST.json
+  pipeline.py, stages/        the local GPU pipeline
+backend/src/api/              FastAPI + Celery front end for the local pipeline
+docker/                       the RunPod image
 ```
 
-## Requirements
+## Known limits
 
-Python 3.10+ and Node 20+. A CUDA GPU for local runs, or `RUNPOD_API_KEY` for pods. An HF
-token with write access goes in `.env`.
+- Self-calibration runs turboderp's scripts as shipped, but ezexl3 notes that MoE sensitivity measurement is still unvalidated, and most of the SC figures in the quote come from one 27B run.
+- A model whose unquantized weights do not fit one 96 GB card gets no KL number unless the job asks for more GPUs.
+- Card speeds not marked measured in `gpu_table.json` are estimates. A wrong one costs money, not quality.
+- The API dashboard and `python -m blockquant` only see the local pipeline, not RunPod jobs.

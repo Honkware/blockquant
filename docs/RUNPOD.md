@@ -1,135 +1,47 @@
-# RunPod notes
+# Running and rescuing RunPod jobs
 
-The RunPod provider is for running the same backend pipeline on an ephemeral GPU pod. It launches a pod, waits for SSH, uploads the remote runner, starts the quant job, polls progress, syncs outputs, and terminates the pod unless told not to.
+Operator notes. The README covers what a job does; this is what to look at when one goes wrong.
 
-Implementation lives in:
+## Controllers
 
-```text
-backend/src/blockquant/providers/runpod/
+Each pod has one controller, `backend/scripts/run_runpod_job.py`, started detached by the bot so a bot restart does not kill it. On restart the bot reattaches to any controller still running.
+
+```
+backend/logs/ctrl-<model>-<bpw>-<ts>.log     controller output, what the embed is parsed from
+backend/logs/controllers/<id>.json           pid, log path, job id; read by /diag and on restart
 ```
 
-The old `backend/src/blockquant/providers/runpod_provider.py` file is only a compatibility import.
+The last line of a controller log is `[cost] <secs>s on <card> (<cloud>) at $<rate>/h = $<total>`, on success and on failure. Billing is timed from pod creation.
 
-## Required environment
+## On the pod
 
-```dotenv
-HF_TOKEN=...
-RUNPOD_API_KEY=...
-EXLLAMAV3_DIR=./exllamav3
+| Path | |
+| --- | --- |
+| `/root/quant.py` | the pod script, uploaded fresh each job over the baked copy |
+| `/root/bq.log` | its log; the controller relays only lines with a known `[tag]` |
+| `/root/bq-result.json` | the result the controller fetches at the end |
+| `/quant/blockquant/model` | the unquantized download |
+| `/quant/output-<bpw>bpw` | a finished quant, deleted once it uploads |
+
+Pods are only reachable over SSH with the key in `~/.ssh/id_rsa`.
+
+## When a job fails
+
+- The pod is terminated on every exit path unless the controller ran with `--keep-pod`. Start a job with that by hand when you expect trouble.
+- A quant that converted but did not upload is still in `/quant/output-<bpw>bpw` on a kept pod. `backend/scripts/rescue_upload.py --pod <id> --repo <org/name> --remote-dir /quant/output-<bpw>bpw --terminate` pushes it and tears the pod down.
+- If the pod is already gone, the controller checks HF for the job's repo before calling it a failure, and reports the last progress line it saw.
+- Self-calibration artifacts are cached to `<org>/<model>-exl3-selfcal` after each stage, so rerunning the same `/quant` starts at the stage that failed.
+
+## Leaked pods
+
+The bot reaps `bq-<pid>-*` pods whose controller is gone, every two minutes while it is up. `backend/scripts/pod_watchdog.py` is the backstop, from cron:
+
+```
+*/10 * * * * /root/blockquant/backend/venv/bin/python /root/blockquant/backend/scripts/pod_watchdog.py >> /root/watchdog.log 2>&1
 ```
 
-The provider also expects an SSH key, defaulting to:
+It only reports unless run with `--enforce`, and keeps any pod it cannot prove abandoned.
 
-```text
-~/.ssh/id_rsa
-~/.ssh/id_rsa.pub
-```
+## Choosing cards by hand
 
-The public key is injected into the pod on create. The private key is used by Paramiko for SSH/SFTP.
-
-## CLI path
-
-```bash
-./backend/venv/bin/python backend/scripts/run_runpod_job.py \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --variants 4.5 \
-  --profile balanced \
-  --gpu "NVIDIA H100 NVL" \
-  --gpu-fallback "NVIDIA H100 PCIe,NVIDIA A100-SXM4-80GB" \
-  --hf-org ""
-```
-
-Dry-run the resolved config and estimated cost:
-
-```bash
-./backend/venv/bin/python backend/scripts/run_runpod_job.py \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --variants 4.5 \
-  --profile balanced \
-  --tune
-```
-
-Use the prebuilt image to avoid the normal bootstrap step:
-
-```bash
-./backend/venv/bin/python backend/scripts/run_runpod_job.py \
-  --image ghcr.io/honkware/blockquant:latest \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --variants 4.5
-```
-
-## Profiles
-
-`--profile` is a convenience preset. Individual flags still win.
-
-| Profile | Use when | Notes |
-|---|---|---|
-| `fast` | cheap test quant or smoke run | smaller calibration set |
-| `balanced` | normal run | default |
-| `quality` | final publish run | larger calibration set and more conservative cloud preference |
-
-Useful overrides:
-
-- `--cal-rows`
-- `--cal-cols`
-- `--cloud COMMUNITY|SECURE`
-- `--gpu`
-- `--gpu-fallback`
-- `--network-volume-id`
-- `--data-center-id`
-
-## GPU fallback
-
-The CLI tries `--gpu` first, then each value in `--gpu-fallback`. It only falls through on capacity/out-of-stock errors. Other errors abort because they usually mean bad credentials, bad image config, or a provider-side problem that retrying on another GPU will not fix.
-
-## Pod lifecycle
-
-Normal flow:
-
-1. create pod with the requested GPU/image/disk settings
-2. wait for SSH
-3. bootstrap dependencies unless using the prebuilt image or an already-bootstrapped pod
-4. upload the remote quant script
-5. run the remote pipeline
-6. poll logs/result metadata
-7. sync output files and result JSON
-8. terminate pod
-
-Use `--keep-pod` when debugging. Remember to terminate the pod manually afterward.
-
-## Remote files
-
-The provider keeps pod-local files under `/root`:
-
-| Path | Use |
-|---|---|
-| `/root/quant.py` | uploaded remote runner |
-| `/root/bq.log` | remote job log |
-| `/root/bq-result.json` | remote result payload |
-| `/root/.bq-bootstrapped` | bootstrap marker |
-
-These constants live in `backend/src/blockquant/providers/runpod/constants.py`.
-
-## Pricing
-
-`backend/src/blockquant/providers/runpod/pricing.py` first asks the RunPod SDK for live pricing. If that fails, it falls back to the small static table in the same file. Treat CLI estimates as planning numbers, not billing records.
-
-## Failure handling
-
-The provider has retries for transient RunPod API, SSH, and SFTP failures. Tests cover:
-
-- transient `get_pod` retry
-- non-transient `get_pod` no-retry
-- SSH exec retry
-- SFTP retry
-- tokens not appearing on command lines
-
-Run the provider tests without touching real cloud resources:
-
-```bash
-PYTHONPATH=backend/src .venv/bin/pytest backend/tests/providers -q
-```
-
-## Token handling
-
-The RunPod API key and HF token are passed through controlled environment/config paths. They should not be placed on remote shell command lines or persisted into receipts/manifests. Regression tests check both paths.
+`--gpu auto` is the default and what the bot uses. `--gpu "<RunPod id>" --gpu-fallback "<id>,<id>"` pins cards instead, `--cloud COMMUNITY|SECURE` pins a pool, and `--max-price` takes a number for the pod's $/hr ceiling. Card prices and conversion speeds are in `backend/gpu_table.json`; add a measured speed there when a new card has run a job.

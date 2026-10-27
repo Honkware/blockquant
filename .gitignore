@@ -46,7 +46,7 @@ output-*/
 dist/
 build/
 
-# Vendored upstreams — users clone these themselves (see SETUP.md)
+# Vendored upstreams, cloned by hand (see docs/LOCAL.md)
 exllamav3/
 
 # Python venv aliases (just in case)

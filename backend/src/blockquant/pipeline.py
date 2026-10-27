@@ -82,8 +82,8 @@ def _run_remote_pipeline(
     def _predicted_hf_url(variant: str) -> str:
         """URL for the repo the remote script will upload this variant to.
 
-        Matches the convention baked into runpod_provider._QUANT_SCRIPT:
-        ``{org_or_user}/{basename}-{format}-{variant}bpw``.
+        A plain quant's name, ``{org_or_user}/{basename}-{format}-{variant}bpw``;
+        cards.exl3_repo_slug has the full rule.
         """
         basename = config.model_id.split("/")[-1]
         slug = f"{basename}-{config.format.value}-{variant}bpw"

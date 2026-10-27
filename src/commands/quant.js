@@ -17,12 +17,13 @@ import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
 import { isApiAvailable, submitJob, pollJob } from '../services/api-client.js';
 import {
-  costPreflightLine, getBalance, quoteCost, convertHours, calibrationHours,
+  getBalance, convertHours, calibrationHours,
 } from '../services/runpod.js';
 import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from '../services/runpodCli.js';
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { findExl3Quants } from '../services/exl3Index.js';
+import { costPreflightLine, quoteCost } from '../services/gpuQuote.js';
 import { notifyAdmins, cardUrl } from '../services/approvalNotify.js';
 import { stopButtons, stoppedEmbed } from './stop.js';
 
@@ -524,6 +525,13 @@ export async function handleQuant(interaction) {
   // cap in claimRunSlot is the only thing between one of them and a wallet's
   // worth of pods.
   const slot = await claimRunSlot({ userId, member: interaction.member });
+  // Paused: a quanter's job waits for approval like anyone's, rather than
+  // starting on its own while an admin has said nothing new should.
+  const paused = !!(await db.loadSettings().catch(() => ({}))).paused;
+  if (paused && slot.quanter) {
+    releaseRunSlot(userId);
+    slot.quanter = false;
+  }
   if (!slot.ok) {
     return interaction.editReply({
       embeds: [
@@ -641,7 +649,8 @@ export async function handleQuant(interaction) {
       '',
       slot.quanter
         ? 'Starting now — the requester holds the quanter role. Stop it with the button or `/stop`.'
-        : 'An admin must approve before this runs.',
+        : paused ? 'The bot is paused. An admin can approve this after `/resume`.'
+          : 'An admin must approve before this runs.',
     ].filter(Boolean).join('\n')
   );
 

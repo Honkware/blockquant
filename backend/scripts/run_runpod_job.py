@@ -26,7 +26,7 @@ for stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod import RunPodProvider
 from blockquant.poll import poll_remote, DEFAULT_MAX_RUNTIME_S, DEFAULT_STALL_TIMEOUT_S
 from dotenv import load_dotenv
 
@@ -236,18 +236,6 @@ def _drain_failure(provider, instance_id, outcome: str) -> str:
         return ("pod exited without a result file and nothing reached HF; remote log ends at: "
                 + (exc or (lines[-1][-200:] if lines else 'no output at all')))
     return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
-
-
-# Cards worth renting, best first. --gpu/--gpu-fallback override this; without
-# them the launcher walks the list on a stock-out. Cloud defaults to ALL so both
-# the community and secure pools are searched -- stock blips per pool and half
-# the fleet is invisible if you pin one.
-_PREFERRED_GPUS = [
-    "NVIDIA H100 80GB HBM3",
-    "NVIDIA H100 NVL",
-    "NVIDIA H100 PCIe",
-    "NVIDIA A100-SXM4-80GB",
-]
 
 
 def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
@@ -525,12 +513,13 @@ def main():
         help="Optional prompt to run on each finished quant; the reply is echoed for the bot.",
     )
     parser.add_argument(
-        "--gpu", default="NVIDIA H100 80GB HBM3",
-        help="RunPod GPU type, or 'auto' to pick the cheapest in-stock card with enough VRAM.",
+        "--gpu", default="auto",
+        help="RunPod GPU type, or 'auto' (default) to rank every card with enough VRAM by "
+             "price over conversion speed (backend/gpu_table.json) and take the first in stock.",
     )
     parser.add_argument(
         "--gpu-fallback",
-        default="NVIDIA H100 NVL,NVIDIA H100 PCIe,NVIDIA A100-SXM4-80GB",
+        default="",
         help="Comma-separated GPU types to try if --gpu is out of stock. Ignored when --gpu auto.",
     )
     parser.add_argument(
@@ -551,9 +540,8 @@ def main():
         help="Ceiling on the POD's $/hr -- the card's rate times --gpu-count, "
              "which is what RunPod actually bills. With --gpu auto, any card "
              "whose pod would cost more is skipped. 'auto' scales the cap to the "
-             "model size (small models -> cheap cards; a big model -> A100/H100 "
-             "since it's compute-bound and ~3x faster for ~the same total cost) "
-             "and then by --gpu-count. A number pins it; 0 disables the cap.",
+             "model size and then by --gpu-count; it is a safety rail, the ranking "
+             "is what picks the card. A number pins it; 0 disables the cap.",
     )
     parser.add_argument(
         "--container-disk", default="auto",
@@ -706,17 +694,11 @@ def main():
 
     # Only apply the built-in preferences when the user didn't pass their own.
     cli_passed_cloud = "--cloud" in sys.argv
-    cli_passed_gpu = "--gpu" in sys.argv
-    cli_passed_fallback = "--gpu-fallback" in sys.argv
 
     # Unset means the converter is never given --cal_rows/--cal_cols, so it
     # uses its own 250x2048 rather than a copy of those numbers pinned here.
     cal_rows = args.cal_rows
     cal_cols = args.cal_cols
-    if not cli_passed_gpu and not cli_passed_fallback:
-        args.gpu = _PREFERRED_GPUS[0]
-        args.gpu_fallback = ",".join(_PREFERRED_GPUS[1:])
-
     if args.gpu_count < 1:
         print(f"ERROR: --gpu-count must be at least 1 (got {args.gpu_count})")
         sys.exit(1)

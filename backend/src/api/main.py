@@ -1,7 +1,7 @@
 """FastAPI server — the Discord bot calls this instead of running locally.
 
 SECURITY: this service intentionally has no authentication. It is designed
-to bind to ``127.0.0.1`` (see SETUP.md and README.md) and be reached only
+to bind to ``127.0.0.1`` (see docs/API.md) and be reached only
 from the local Discord bot or the local CLI. Exposing it on a public
 interface would let any caller submit quant jobs against the operator's
 RunPod credits. If you need a public surface, put it behind a reverse

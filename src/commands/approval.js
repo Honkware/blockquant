@@ -87,6 +87,15 @@ export async function handleApproval(interaction) {
       return true;
     }
 
+    if (action === 'approve' && (await db.loadSettings().catch(() => ({}))).paused) {
+      // Left pending, so the same button works once /resume has run.
+      await interaction.reply({
+        content: 'The bot is paused. Approve this after `/resume`.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return true;
+    }
+
     if (action === 'approve') {
       // Flip status to running BEFORE launching anything. The pending_approval
       // guard above only blocks repeat clicks once this is persisted, so doing

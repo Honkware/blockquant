@@ -9,7 +9,7 @@ fastest path to a merged PR is to match the existing shapes.
 git clone https://github.com/Honkware/blockquant.git
 cd blockquant
 
-# Vendored upstream — kept out of this repo
+# Only for regenerating backend/arch_support.json and the local pipeline
 git clone https://github.com/turboderp-org/exllamav3.git
 
 # Python backend
@@ -17,7 +17,7 @@ cd backend
 python -m venv venv
 ./venv/bin/pip install -r requirements.txt
 
-# Node bot (optional — only if you're touching the Discord side)
+# Node bot
 cd .. && npm install
 
 # Config
@@ -37,17 +37,16 @@ cd backend
 PYTHONPATH=src ./venv/bin/pytest tests -q
 ```
 
-The provider tests are fully mocked — no GPU, no real RunPod / HF API
-calls — so they run anywhere CI can install the lightweight test deps.
-`pytest tests/providers -q` should collect 40 tests.
+The provider tests are fully mocked: no GPU, no real RunPod or HF API
+calls, so they run anywhere CI can install the lightweight test deps.
 
 The local cached-model pipeline test is opt-in. Set `BLOCKQUANT_TEST_WORKSPACE`
 to a workspace that already contains `{model_id}/model/config.json` under the
 normal BlockQuant cache layout. Override the default model with
 `BLOCKQUANT_TEST_MODEL_ID` if needed.
 
-CI (`.github/workflows/test.yml`) runs the provider tests on Python 3.10,
-3.11, and 3.12. Run `npm run check` locally before touching the Discord bot.
+CI (`.github/workflows/test.yml`) runs the backend tests on Python 3.10,
+3.11 and 3.12, and `npm run check` for the bot.
 
 ## Adding a new provider
 
@@ -74,9 +73,10 @@ Checklist for a new provider PR:
    modelled on `test_runpod_provider.py` (~25 tests, full mock coverage).
 4. **Register the provider** in
    [`backend/src/blockquant/providers/__init__.py`](backend/src/blockquant/providers/__init__.py).
-5. **Add the CLI option** in
-   [`src/commands/definitions.js`](src/commands/definitions.js)
-   under the `provider` choices.
+5. **Wire it into the bot.** `/quant` has no provider option; `src/commands/quant.js`
+   sets `provider = 'runpod'` and only that path is live, so a new provider
+   means adding the option in
+   [`src/commands/definitions.js`](src/commands/definitions.js) and a path for it there.
 6. **Add config fields** to `QuantConfig` in
    [`backend/src/blockquant/models.py`](backend/src/blockquant/models.py)
    and the corresponding pass-through in

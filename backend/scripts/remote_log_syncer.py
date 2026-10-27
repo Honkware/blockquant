@@ -32,7 +32,7 @@ except Exception:
 logging.getLogger("paramiko.transport").setLevel(logging.ERROR)
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from blockquant.providers.runpod_provider import RunPodProvider
+from blockquant.providers.runpod import RunPodProvider
 
 
 def main():

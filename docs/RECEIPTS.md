@@ -1,12 +1,14 @@
 # Receipts and manifests
 
-BlockQuant writes small JSON files next to each job so an operator can answer three questions quickly:
+The local pipeline writes small JSON files next to each job so an operator can answer three questions quickly:
 
 1. What was this job trying to build?
 2. Which stage failed or skipped?
 3. What outputs were produced and how were they verified?
 
 The receipt is updated while the job runs. The manifest is the final summary.
+
+Jobs from the Discord bot run on RunPod and write neither. What they leave is in each published repo: `blockquant.json` (base model commit, exllamav3 commit, settings) and `bq_quality.json` (KL).
 
 ## Files
 
