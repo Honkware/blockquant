@@ -1,6 +1,6 @@
-# qbench/data.py, vendored from turboderp-org/exllamav3 at 0740edc (v1.5.0).
-# turboderp's code, unmodified. Only the tensor/test-row helpers are used.
-# Read VENDOR_MANIFEST.json.
+# data.py, vendored verbatim from turboderp-org/exllamav3 at cdc785d (v1.6.5).
+# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/eval/qbench/data.py
+# turboderp's code. Read VENDOR_MANIFEST.json before editing or re-vendoring.
 
 """
 Project spec handling, test data preparation and the central cache.
@@ -20,11 +20,11 @@ from exllamav3.util.misc import prepend_hf_chat_context
 
 DATASETS = {
     "wiki2": {
-        "path": "wikitext", "name": "wikitext-2-raw-v1", "split": "test",
+        "path": "Salesforce/wikitext", "name": "wikitext-2-raw-v1", "split": "test",
         "text_column": "text", "display_name": "wikitext2",
     },
     "wikitext2": {
-        "path": "wikitext", "name": "wikitext-2-raw-v1", "split": "test",
+        "path": "Salesforce/wikitext", "name": "wikitext-2-raw-v1", "split": "test",
         "text_column": "text", "display_name": "wikitext2",
     },
     "openwebtext10k": {

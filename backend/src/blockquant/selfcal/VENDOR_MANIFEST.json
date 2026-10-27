@@ -1,53 +1,51 @@
 {
   "_about": "Upstream scripts vendored into blockquant, not our work. sc_*.py are turboderp's self-calibration pipeline; they live at the root of the exllamav3 repo and are not part of the pip package, so they cannot be imported from the installed exllamav3 and have to be copied in. The streaming patch on sc_measure.py is UnstableLlama's (ezexl3). Licensing follows the upstreams: exllamav3 is MIT, ezexl3 is MIT.",
-  "_ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-  "_ref_note": "The exllamav3 commit docker/Dockerfile.runpod pins in ARG EXLLAMAV3_REF (v1.5.0). Vendored scripts and the installed exllamav3 must move together -- they reach into exllamav3.modules.* internals -- so re-vendor whenever that ARG is bumped.",
+  "_ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+  "_ref_note": "The exllamav3 commit docker/Dockerfile.runpod pins in ARG EXLLAMAV3_REF (v1.6.5). Vendored scripts and the installed exllamav3 must move together -- they reach into exllamav3.modules.* internals -- so re-vendor whenever that ARG is bumped.",
   "_hashing": "sha256 is of the pristine upstream file. Each vendored copy carries a short '#' header we prepend at vendoring time; backend/tests/test_selfcal_vendor.py strips that leading comment block before hashing, so an unmodified file hashes to the upstream sha256. A patched file records local_sha256 (the bytes on disk, header stripped) and local_patch (what changed and why); sha256 stays pristine so the drift check against GitHub keeps working.",
   "files": {
     "sc_trace.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_trace.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-      "sha256": "2e53d53217611200bf02d704231c4e48639224b29cd5aad41c71e4804cd9182a",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_trace.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+      "sha256": "fb268f9c6ab1453475c2b7d32cf7c23b9e9c428ede400679a9dbd07d14022edc",
       "note": "Generates a self-sampled calibration trace (safetensors) that sc_measure.py can eval on. Imports `eval.qbench_prompts`, which is not in the exllamav3 wheel, so that module is vendored alongside it; run the script by path (python .../selfcal/sc_trace.py) so its own directory lands on sys.path.",
-      "local_sha256": "28d7016d78dbe8d217ea8c9ad5fb447748d320db9930b85aa23fe2538cf79990",
+      "local_sha256": "e6d9aeabe09a94d0484a04ef9d9a1cf02bc60d20d1b5df80e46902c527e31fda",
       "local_patch": "Wave sizing. Upstream checks the token target only at turn-wave boundaries, and a wave is every live conversation at once, so crossing the target early in a wave still generates the whole wave: measured at 798,117 tokens for a 512,000 target on Qwen3.5-0.8B, the last wave almost all surplus. Rows are pooled, shuffled and sliced to cal_rows x cal_cols at the end, so surplus is not waste -- it is mixing -- but 1.56x is whatever wave granularity happened to give, not a chosen figure. The patch keeps a running mean of tokens per conversation and enqueues only as many of the wave's conversations as a deliberate 1.15x pool needs (over-provisioned 1.25x, since falling short costs another whole wave), picking them by stride rather than prefix because the seed set is ordered by domain. Simulated at ~1.2x generated instead of ~1.6-1.9x. Marked BLOCKQUANT LOCAL PATCH at all three sites. Drop this if upstream ever cancels in-flight jobs once the target is met."
     },
     "sc_rfn_probe.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_rfn_probe.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_rfn_probe.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
       "sha256": "008dc10c0ec67e579d618cd9589f34a350d5798eb0541c62d4fde892d27e9ae4",
       "note": "Unmodified. Measures the real weight-space rfn of an existing EXL3 quant, to calibrate the noise levels sc_measure.py injects."
     },
     "sc_measure.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_measure.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-      "sha256": "6d9b79c62b7d1099e6ab1b7fa90aeb04a57f5e0c1b924d796e8842ed9306c513",
-      "local_sha256": "539dffaee0045a7f766cd53af5b298be9670641144828416d5b05b4f1178895f",
-      "local_patch": "UnstableLlama's streaming rework, taken whole from ezexl3 branch pr/sc-measure-no-workers (https://github.com/UnstableLlama/ezexl3/blob/pr/sc-measure-no-workers/ezexl3/vendor/sc_measure.py). Replaces the hand-cherry-picked streaming hunks we carried before. Adds --load-mode auto|resident|streaming, --streaming/--no-streaming, and -ms/--max-sys (RAM budget for pass splitting, adapted from measure_model.py; defaults to half of available RAM). Auto loads the whole model into VRAM when it fits and streams otherwise. Carries NO worker-sharding flags -- we rent single-GPU pods, and multi-GPU fan-out can be lifted from the same branch when there is something to fan out to. Validated by UnstableLlama on Qwen3.5-0.8b against upstream: KL, realized noise and weight norms identical, inj_rfn differing by at most 1.87e-9; 1.75x faster than their earlier streaming version on a 49-tensor slice of a 27B. We have still not run it ourselves -- no GPU on the controller.",
-      "note": "Per-tensor sensitivity measurement by weight-space noise injection. Vendored from the pinned ref, then patched with the layer-streaming half of UnstableLlama's fork (https://raw.githubusercontent.com/UnstableLlama/ezexl3/main/ezexl3/vendor/sc_measure.py). ezexl3 forked this file at the same content we pin (its manifest records upstream sha256 6d9b79c6..., which matches), so the fork diffs cleanly against our copy: +283/-29 lines over 21 hunks, of which the streaming half is +207 and the rest is worker sharding."
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_measure.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+      "sha256": "a1146b9b1156efb5628f32d1efb5c50e1d7133168f0a596147d456c6635efc11",
+      "note": "Per-tensor sensitivity measurement by weight-space noise injection. Unmodified. UnstableLlama's layer streaming (--load-mode, -ms/--max-sys), which we used to carry as a local patch taken from ezexl3, was merged upstream as PR #364 with turboderp's target-grouping followup, so the pristine file now takes every flag quant.py passes."
     },
     "sc_optimize.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/sc_optimize.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-      "sha256": "9702b68ad7df8dfd9c287f80d811740269a262b831900a356424bc172a5acdfe",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_optimize.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+      "sha256": "86470811770c8dfdf1aed8d46d24ef2455deca7dc2e90fb425163d324cbad709",
       "note": "Unmodified. Turns an sc_measure.py sensitivity JSON into a per-tensor bitrate recipe. Pure stdlib."
     },
     "eval/qbench_prompts.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/eval/qbench_prompts.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-      "sha256": "9863dcd0f03d0ab7a3a6409e15db06d210a87c07c52a9a0b3fa5353df8013014",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/eval/qbench_prompts.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+      "sha256": "3d7527b8d64f761225ea2d054b1dc4a0c8f840d57d6530d6821e742e08bb8966",
       "note": "Unmodified. Only here because sc_trace.py imports it; exllamav3 ships it under eval/ at the repo root and the wheel does not carry it."
     },
     "eval/qbench/measure.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/eval/qbench/measure.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/eval/qbench/measure.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
       "sha256": "4ada99e11f998719aa77db249b7ef994fd1b217206efe54870fcadd2e829c111",
       "note": "Measurement half of turboderp's qbench harness. Kept because it is the eval both turboderp and ezexl3 report against, so our KL numbers are comparable to theirs instead of being our own private figure. eval/qbench.py (YAML orchestration), engines.py (transformers/llamacpp backends we do not use) and plot.py are deliberately NOT vendored -- plot.py alone would drag matplotlib, numpy, pandas and seaborn into the pod image to draw charts that do not go on a card. Unmodified."
     },
     "eval/qbench/data.py": {
-      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/0740edc2da569fb99174023c1d2988b1e98cb41e/eval/qbench/data.py",
-      "ref": "0740edc2da569fb99174023c1d2988b1e98cb41e",
-      "sha256": "b6c79d06e9a0f4977981d727b71772e2fe7a770412054d35c67411dd7001e0e8",
+      "source": "https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/eval/qbench/data.py",
+      "ref": "cdc785db89e263e65e5849cb53e1ada156411414",
+      "sha256": "cf638604fa2e56d59d843588b951b91fd6827290886d9c9ab3acdd1f2d6943f3",
       "note": "Measurement half of turboderp's qbench harness. Kept because it is the eval both turboderp and ezexl3 report against, so our KL numbers are comparable to theirs instead of being our own private figure. eval/qbench.py (YAML orchestration), engines.py (transformers/llamacpp backends we do not use) and plot.py are deliberately NOT vendored -- plot.py alone would drag matplotlib, numpy, pandas and seaborn into the pod image to draw charts that do not go on a card. Unmodified."
     }
   }

@@ -1,5 +1,5 @@
-# sc_rfn_probe.py, vendored verbatim from turboderp-org/exllamav3 at 5be8865 (v1.4.9).
-# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/5be886578ec80324c2c715269387be2058724b6e/sc_rfn_probe.py
+# sc_rfn_probe.py, vendored verbatim from turboderp-org/exllamav3 at cdc785d (v1.6.5).
+# Upstream: https://raw.githubusercontent.com/turboderp-org/exllamav3/cdc785db89e263e65e5849cb53e1ada156411414/sc_rfn_probe.py
 # turboderp's code. Read VENDOR_MANIFEST.json before editing or re-vendoring.
 
 import sys, os

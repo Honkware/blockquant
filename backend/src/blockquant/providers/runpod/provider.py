@@ -37,9 +37,11 @@ logger = get_logger(__name__)
 
 # Minimum ExLlamaV3 a pre-baked image must ship. Older bakes are rejected at
 # boot so they can't silently quantize with outdated kernels or fail on newer
-# model architectures. Keep in sync with EXLLAMAV3_VERSION in
-# docker/Dockerfile.runpod.
-_MIN_EXLLAMAV3 = (1, 4, 9)
+# model architectures. Keep in sync with EXLLAMAV3_REF in
+# docker/Dockerfile.runpod. quant.py passes -mb/-ngb and a leveled -hq, which
+# 1.5 rejects outright, so an older bake has to fail here rather than at
+# convert time with the pod already billing.
+_MIN_EXLLAMAV3 = (1, 6, 5)
 
 
 class RunPodProvider(Provider):
