@@ -115,13 +115,9 @@ def test_sc_measure_is_not_forced_onto_the_streaming_path():
     VRAM first and still falls back to streaming, both on the estimate and if
     the load OOMs, so forcing it only ever gave up speed.
     """
-    src = SRC.read_text()
-    for node in ast.walk(ast.parse(src)):
-        if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "stage"
-                and node.args and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "sc_measure"):
-            argv = [a.value for a in node.args[1].elts if isinstance(a, ast.Constant)]
-            assert "--streaming" not in argv, "sc_measure pinned to the CPU-bound path"
-            assert "auto" in argv, f"sc_measure should pick its load mode: {argv}"
-            return
-    pytest.fail("no sc_measure stage() call in quant.py")
+    # The argv is built in a variable now (it grows a conditional --max-sys),
+    # so read it through the resolver that follows the assignments.
+    from test_sc_invocation import _stage_argv
+    argv = _stage_argv("sc_measure")
+    assert "--streaming" not in argv, "sc_measure pinned to the CPU-bound path"
+    assert "auto" in argv, f"sc_measure should pick its load mode: {argv}"

@@ -25,14 +25,50 @@ SRC = Path(__file__).resolve().parent.parent / "src/blockquant/remote/quant.py"
 MEASURE = Path(__file__).resolve().parent.parent / "src/blockquant/selfcal/sc_measure.py"
 
 
-def _stage_argv(name: str) -> list:
+def _runner():
     for node in ast.walk(ast.parse(SRC.read_text())):
-        if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "stage"
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_sc_stages":
+            return node
+    pytest.fail("_run_sc_stages is gone from quant.py")
+
+
+def _elts(lst):
+    return [e.value if isinstance(e, ast.Constant) else ast.unparse(e) for e in lst.elts]
+
+
+def _stage_argv(name: str) -> list:
+    """Every argv element stage(name, ...) can receive, in source order.
+
+    The argv is a list literal for some stages and a variable for others --
+    sc_measure's grows by a conditional --max-sys -- so a variable is followed
+    to its assignment and every += on it inside _run_sc_stages.
+    """
+    fn = _runner()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "stage"
                 and node.args and isinstance(node.args[0], ast.Constant)
                 and node.args[0].value == name):
-            return [a.value if isinstance(a, ast.Constant) else "<expr>"
-                    for a in node.args[1].elts]
+            continue
+        arg = node.args[1]
+        if isinstance(arg, ast.BinOp):          # e.g. trace_argv + ["-mtp"]
+            arg = arg.left
+        if isinstance(arg, ast.List):
+            return _elts(arg)
+        if isinstance(arg, ast.Name):
+            parts = []
+            for n in ast.walk(fn):
+                if (isinstance(n, ast.Assign) and isinstance(n.value, ast.List)
+                        and any(getattr(t, "id", "") == arg.id for t in n.targets)):
+                    parts.append((n.lineno, _elts(n.value)))
+                elif (isinstance(n, ast.AugAssign) and isinstance(n.value, ast.List)
+                        and getattr(n.target, "id", "") == arg.id):
+                    parts.append((n.lineno, _elts(n.value)))
+            return [e for _, elts in sorted(parts) for e in elts]
     pytest.fail(f"no stage({name!r}) call in quant.py")
+
+
+def _follows(argv, flag, value) -> bool:
+    return any(a == flag and b == value for a, b in zip(argv, argv[1:]))
 
 
 def test_the_measurement_uses_shaped_noise():
@@ -62,10 +98,8 @@ def test_the_probe_output_is_what_gets_passed():
     # -rr takes sc_rfn_probe's JSON. Handing it anything else is the same class
     # of error as feeding sc_measure the trace JSON instead of the packed
     # safetensors, which is documented in _run_sc_stages.
-    src = SRC.read_text()
-    i = src.index('stage("sc_measure"')
-    j = src.index("done=", i)
-    assert re.search(r'"-rr",\s*str\(rfn\)', src[i:j]), src[i:j]
+    argv = _stage_argv("sc_measure")
+    assert _follows(argv, "-rr", "str(rfn)"), argv
 
 
 def test_optimize_still_gets_its_own_anchors():
@@ -77,10 +111,8 @@ def test_the_trace_is_the_packed_safetensors_not_the_json():
     # Already true, and worth keeping true: -tr is documented as "Packed
     # self-sampled trace (safetensors from sc_trace.py)", and the JSON would
     # fall back to the bundled corpus without saying so.
-    src = SRC.read_text()
-    i = src.index('stage("sc_measure"')
-    j = src.index("done=", i)
-    assert re.search(r'"-tr",\s*str\(cal\)', src[i:j]), src[i:j]
+    argv = _stage_argv("sc_measure")
+    assert _follows(argv, "-tr", "str(cal)"), argv
 
 
 def test_a_shaped_measurement_cannot_be_served_from_an_iid_cache():
@@ -91,3 +123,10 @@ def test_a_shaped_measurement_cannot_be_served_from_an_iid_cache():
     key = body[i:j]
     assert "noise" in key, "cache key does not record the noise model"
     assert '"schema": 2' in key, "cache schema was not bumped past the iid entries"
+
+
+def test_the_measurement_is_told_what_ram_it_actually_has():
+    """sc_measure sizes its fan-out from /proc/meminfo, which in a container is
+    the host. The 27B run planned one pass, held 566 states at module 44 of 67,
+    and lost the pod. The budget has to be passed in from the cgroup."""
+    assert "--max-sys" in _stage_argv("sc_measure")

@@ -373,8 +373,21 @@ def _heartbeat(proc, name: str, every: float = 30.0) -> list[str]:
             parts = re.split(r"[\r\n]", buf)
             buf = parts.pop()
             for frag in parts:
-                if frag.strip():
-                    keep.append(frag.strip())
+                f = frag.strip()
+                if not f:
+                    continue
+                keep.append(f)
+                # turboderp's scripts mark one-off status with "--" and
+                # warnings with "!!": the fan-out plan and its RAM budget,
+                # Streaming vs Loading, a short trace. Waiting for the next
+                # beat meant these were overwritten by whatever printed after
+                # them, so the line that would have explained the 27B
+                # sc_measure failure never left the pod -- and the pod went
+                # with it.
+                if f.startswith(("--", "!!")):
+                    t = time.monotonic()
+                    print(f"[sc] {name}: {int(t - start)}s {f[:150]}", flush=True)
+                    last = t
         now = time.monotonic()
         if now - last >= every:
             # The live state of a tqdm bar is the UNTERMINATED fragment: it only
@@ -497,6 +510,57 @@ def _sc_cache_save(api, repo_id: str, key: dict, work_root: Path) -> None:
         print(f"[sc] WARN could not cache ({type(e).__name__}: {e})", flush=True)
 
 
+def _container_ram_budget_gb(frac: float = 0.4,
+                             root: str = "/sys/fs/cgroup") -> float | None:
+    """System RAM sc_measure may give its pending states, from the cgroup.
+
+    Its own default is half of MemAvailable from /proc/meminfo, and inside a
+    container that is the host's memory, not ours. On the first 27B run it
+    planned a single pass and kept every module's states in RAM -- 566 pending
+    at module 44 of 67 and still climbing -- and then the pod stopped answering
+    mid-measure, sshd included, which is what hitting a cgroup limit looks
+    like from outside. The budget has to come from the limit the container is
+    actually held to.
+
+    None means no limit was found, and sc_measure's own default is then right.
+    """
+    def num(path):
+        try:
+            v = Path(path).read_text().strip()
+        except OSError:
+            return None
+        return None if v in ("", "max") else int(v)
+
+    def stat(path, key):
+        try:
+            for line in Path(path).read_text().splitlines():
+                k, _, v = line.partition(" ")
+                if k == key:
+                    return int(v)
+        except (OSError, ValueError):
+            pass
+        return 0
+
+    r = Path(root)
+    if (r / "memory.max").exists():                         # cgroup v2
+        limit = num(r / "memory.max")
+        used = num(r / "memory.current") or 0
+        reclaim = stat(r / "memory.stat", "inactive_file")
+    else:                                                   # cgroup v1
+        limit = num(r / "memory" / "memory.limit_in_bytes")
+        used = num(r / "memory" / "memory.usage_in_bytes") or 0
+        reclaim = stat(r / "memory" / "memory.stat", "total_inactive_file")
+    # v1 reports about 2^63 when nothing is set.
+    if not limit or limit >= 1 << 60:
+        return None
+    # Page cache from reading the weights is charged to the cgroup but gives
+    # way under pressure, so it is not counted as used.
+    avail = limit - max(0, used - reclaim)
+    if avail <= 0:
+        return None
+    return max(4.0, round(avail * frac / 1024 ** 3, 1))
+
+
 def _has_mtp(model_dir: Path) -> bool:
     """Does this model carry usable multi-token-prediction weights?
 
@@ -522,7 +586,8 @@ def _has_mtp(model_dir: Path) -> bool:
 def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float,
                    head_bits: int, cal_rows: int, cal_cols: int,
                    timings: dict | None = None,
-                   gpu_count: int = 1) -> tuple[Path, Path]:
+                   gpu_count: int = 1,
+                   on_built=None) -> tuple[Path, Path]:
     """Self-calibration: produce (recipe.yaml, cal.safetensors) for one bitrate.
 
     Four of turboderp's scripts in order, each a subprocess so a crash in one
@@ -588,22 +653,34 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
         # measured SC run has ever justified. Recorded per run so the estimate
         # can be fitted from real jobs instead.
         print(f"[sc] {name} done -> {produces.name} ({_el / 60:.1f}m)", flush=True)
+        # Cache what just landed rather than waiting for the whole chain. The
+        # first 27B run finished sc_trace (133 minutes) and sc_rfn_probe, then
+        # lost its pod in sc_measure, and the cache had saved nothing because
+        # it only ran once all four were done. A retry should start at the
+        # stage that failed, not at the beginning.
+        if on_built is not None and name in ("sc_trace", "sc_rfn_probe", "sc_measure"):
+            on_built(name)
 
     # sc_trace takes exllamav3's model_init options, so on a multi-GPU pod the
-    # donor can load tensor-parallel. Worth doing here and nowhere else in the
-    # chain: this stage is batched generation, which is bandwidth-bound, and TP
-    # splits the weight reads as well as the compute. sc_measure is single
-    # device by construction (torch.device("cuda", args.device)) and
-    # sc_rfn_probe streams a module at a time, so neither gains.
+    # donor can load tensor-parallel. This is the only stage where that can
+    # help: it is batched generation, which is bandwidth-bound, and TP splits
+    # the weight reads. sc_measure is single device by construction
+    # (torch.device("cuda", args.device)) and sc_rfn_probe streams a module at
+    # a time. Measured on the 27B, though, 2x A100 with -tp did ~4,800 tok/min,
+    # no better than one card scaled from the L40S run predicts -- so a second
+    # GPU is for VRAM, not speed, until something shows otherwise.
     trace_argv = ["-m", str(donor_dir), "-o", str(trace), "-co", str(cal),
                   "-cr", str(cal_rows), "-cc", str(cal_cols)]
     if gpu_count > 1:
         trace_argv += ["-tp"]
     # Self-speculative decoding off the model's own MTP head, where it has one.
     # This stage is pure generation and the longest thing in the job, so it is
-    # the one place drafting pays. Speculative decoding samples from the same
-    # distribution, so the corpus stays on-policy -- it will not be the same
-    # token sequence for a given seed, but it is the same kind of text.
+    # where drafting would pay if anywhere -- but nothing has timed it, and at
+    # a batch of ~150 rows generation is closer to compute-bound, where drafts
+    # buy much less than at batch 1. The estimate does not count on it.
+    # Speculative decoding samples from the same distribution, so the corpus
+    # stays on-policy -- it will not be the same token sequence for a given
+    # seed, but it is the same kind of text.
     #
     # Retried without it on failure rather than trusted: drafting is the most
     # model-specific thing here, and losing a pod to it would cost more than
@@ -649,9 +726,19 @@ def _run_sc_stages(model_dir: Path, donor_dir: Path, work_root: Path, bpw: float
     # Measured consequence, on Qwen3.5-0.8B at 3.0bpw against a plain quant of
     # the same bitrate and head/vision bits: SC came out at 0.1200 median KL
     # against plain's 0.0782. Worse, from a pipeline that ran clean.
-    stage("sc_measure", ["-m", str(model_dir), "-o", str(measure),
-                         "--load-mode", "auto", "-tr", str(cal),
-                         "--shaped", "-rr", str(rfn)], measure,
+    measure_argv = ["-m", str(model_dir), "-o", str(measure),
+                    "--load-mode", "auto", "-tr", str(cal),
+                    "--shaped", "-rr", str(rfn)]
+    sys_gb = _container_ram_budget_gb()
+    if sys_gb:
+        # A budget below the full fan-out splits the work into passes, and
+        # sc_measure writes its results after every pass and resumes from a
+        # partial file -- so this also turns a late crash into lost minutes
+        # rather than lost hours.
+        measure_argv += ["--max-sys", str(sys_gb)]
+        print(f"[sc] sc_measure system RAM budget {sys_gb} GB (from the cgroup limit)",
+              flush=True)
+    stage("sc_measure", measure_argv, measure,
           done=lambda p: _measured_all(p, rfn))
     stage("sc_optimize", ["-m", str(measure), "-b", str(bpw), "-hb", str(head_bits),
                           "-rr", str(rfn), "-o", str(recipe)], recipe)
@@ -1491,7 +1578,6 @@ def main() -> int:
 
 
         def _name_parts_for(rec: dict) -> dict:
-            import cards
             """Name the artifact from what the converter wrote, not what we asked for.
 
             The request is an intent and can be vague -- head bits unset means
@@ -1505,6 +1591,7 @@ def main() -> int:
             A plain quant still states nothing it did not choose, so it takes
             the suffix only when the requester pinned the tower themselves.
             """
+            import cards
             if sc:
                 return {"sc": True,
                         "head_bits": rec.get("_head_bits", head_bits),
@@ -1582,19 +1669,15 @@ def main() -> int:
                 _sc_work = sc_work
                 _cache_repo = sc_cache_repo if (api and owner) else None
                 _cache_key = sc_cache_key if (api and owner) else None
+                # Fires only for stages that actually ran, so a fully
+                # restored run uploads nothing.
+                _save = ((lambda _name: _sc_cache_save(api, _cache_repo, _cache_key, _sc_work))
+                         if _cache_repo else None)
                 sc_recipe, sc_cal = _run_sc_stages(
                     model_dir, donor_dir, work_root=_sc_work,
                     bpw=bpw, head_bits=head_bits, cal_rows=sc_cal_rows,
                     cal_cols=sc_cal_cols, timings=sc_timings,
-                    gpu_count=gpu_count)
-                # A stage that was skipped is recorded as 0.0, so this is
-                # "did this job build anything new". A run that restored
-                # everything has nothing to add and re-uploading would just
-                # churn the repo.
-                _built = any(sc_timings.get(n, 0) > 0
-                             for n in ("sc_trace", "sc_rfn_probe", "sc_measure"))
-                if _cache_repo and _built:
-                    _sc_cache_save(api, _cache_repo, _cache_key, _sc_work)
+                    gpu_count=gpu_count, on_built=_save)
 
             print(f"[quantize] {variant} bpw ...", flush=True)
             _t_quant = time.time()
