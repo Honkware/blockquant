@@ -15,24 +15,20 @@ describe('picking a donor to build', () => {
     }
   });
 
-  it('does not overshoot the target it has to serve', () => {
-    // The donor is generated through on every calibration row, so a fatter one
-    // is a slower trace for nothing.
-    expect(donorBitrateFor(4.5)).toBe('4.5');
+  it('traces through 6bpw at the least', () => {
+    // The calibration set is generated through the donor, so its errors are
+    // what the quant is calibrated toward. turboderp and ezexl3 use 6bpw or
+    // better; a 6bpw teacher measured no different from bf16 on Gemma 4.
+    // The 27B's 3.6 was traced through a 4.0.
+    expect(donorBitrateFor(3.6)).toBe('6.0');
+    expect(donorBitrateFor(2.0)).toBe('6.0');
+    expect(donorBitrateFor(4.5)).toBe('6.0');
     expect(donorBitrateFor(6.0)).toBe('6.0');
   });
 
-  it('rounds a fractional target up to a sensible artifact', () => {
-    // 3.6 would publish a 3.6bpw donor nobody asked for.
-    expect(donorBitrateFor(3.6)).toBe('4.0');
-    expect(donorBitrateFor(4.1)).toBe('4.5');
-  });
-
-  it('floors at 4.0 for low targets', () => {
-    // The donor writes the calibration corpus; a 2bpw model generating it is
-    // a worse starting point than the extra conversion time costs.
-    expect(donorBitrateFor(2.0)).toBe('4.0');
-    expect(donorBitrateFor(3.0)).toBe('4.0');
+  it('rounds a target above the floor up to a half bit', () => {
+    expect(donorBitrateFor(6.2)).toBe('6.5');
+    expect(donorBitrateFor(7.0)).toBe('7.0');
   });
 
   it('never exceeds what exllamav3 takes', () => {

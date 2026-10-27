@@ -155,17 +155,31 @@ describe('what the quote is calibrated on', () => {
     // before it died in sc_measure, so ~$14 spent without finishing. Running
     // to the end was another ~1.6 h, ~$19 all told. The old quote, built on
     // MTP halving the trace and one card's rate, said $5.60-7.70.
-    const e = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true, gpuCount: 2 });
+    const e = estimateCost(1, { sc: true, sizeGb: GB, needsDonor: true, gpuCount: 2, donorBpw: 4 });
     expect(e.high).toBeGreaterThan(19);
     expect(e.low).toBeLessThan(19);
   });
 
   it('puts the measured calibration inside the band', () => {
     // sc_trace 132.7 min, probe 0.6, sc_measure 42.5 min to module 44 of 67.
+    // That run traced through a 4.0 donor; quote it as one.
     const measured = (132.7 + 0.6 + 42.5 * 67 / 44) / 60;
-    const h = calibrationHours(GB);
+    const h = calibrationHours(GB, { donorBpw: 4 });
     expect(h.low).toBeLessThan(measured * 1.05);
     expect(h.high).toBeGreaterThan(measured);
+  });
+
+  it('quotes a slower trace through the 6.0 donor than the 4.0 it was timed on', () => {
+    expect(calibrationHours(GB).low).toBeCloseTo(1.5 * calibrationHours(GB, { donorBpw: 4 }).low, 6);
+  });
+
+  it('quotes sc_mode:trace without the measurement', () => {
+    // sc_measure is 0.5-0.8x of the trace; trace mode skips it.
+    const full = estimateCost(1, { sc: true, sizeGb: GB });
+    const lite = estimateCost(1, { sc: true, sizeGb: GB, scLite: true });
+    expect(lite.high).toBeLessThan(full.high);
+    expect(calibrationHours(GB, { traceOnly: true }).high)
+      .toBeLessThan(calibrationHours(GB).low);
   });
 
   it('bills a pod for every GPU on it', () => {

@@ -56,6 +56,8 @@ const BIG_CARD_SPEEDUP = 1.8;                 // A100-class vs a 3090, convert
 const CONVERT_H_AT_72GB = 3.7;                // the older 35B anchor, kept as the ceiling
 const TRACE_H_REF = 132.7 / 60;               // measured, 27B
 const TRACE_REF_GB = 51.75;
+const TRACE_REF_DONOR_BPW = 4.0;              // what that trace ran through
+const DONOR_BPW = 6.0;                        // what a trace runs through now
 
 /** Mirrors _recommend_max_price in backend/scripts/run_runpod_job.py. */
 export function maxPricePerHour(sizeGb, sc = false) {
@@ -100,20 +102,23 @@ export function convertHours(sizeGb, isMoe = false) {
 }
 
 /** Hours of self-calibration -- trace, probe, measure -- paid once per job. */
-export function calibrationHours(sizeGb) {
+export function calibrationHours(sizeGb, { donorBpw = DONOR_BPW, traceOnly = false } = {}) {
   const gb = Number(sizeGb) > 0 ? Number(sizeGb) : 0;
-  if (!gb) return { low: 0.75, high: 3.0 };
-  // sc_trace is bandwidth-bound generation through the donor, so it goes with
-  // the donor's size and that goes with the model's. The 27B's 132.7 min
-  // includes loading; a tiny model is mostly loading.
-  const traceH = Math.max(0.08, TRACE_H_REF * (gb / TRACE_REF_GB));
-  // Plus sc_measure at 0.5x and 0.8x of that; the probe is under a minute.
+  if (!gb) return traceOnly ? { low: 0.3, high: 1.5 } : { low: 0.75, high: 3.0 };
+  // sc_trace is generation through the donor, so it goes with the donor's
+  // size: the model's, times the donor's bits over the measured one's. The
+  // 27B's 132.7 min includes loading; a tiny model is mostly loading.
+  const donorScale = Number(donorBpw) / TRACE_REF_DONOR_BPW;
+  const traceH = Math.max(0.08, TRACE_H_REF * (gb / TRACE_REF_GB) * donorScale);
+  // sc_mode:trace stops there. Otherwise sc_measure at 0.5x and 0.8x of the
+  // trace; the probe is under a minute.
+  if (traceOnly) return { low: traceH, high: traceH * 1.15 };
   return { low: traceH * 1.5, high: traceH * 1.8 };
 }
 
 /** The one-off calibration cost band for a self-calibrated job. */
-export function scCalibrationCost(sizeGb, gpus = 1) {
-  const h = calibrationHours(sizeGb);
+export function scCalibrationCost(sizeGb, gpus = 1, opts = {}) {
+  const h = calibrationHours(sizeGb, opts);
   const r = rateBand(sizeGb, true, gpus);
   const ceiling = 8 * r.high;                          // a pod cannot outlive max_runtime
   return { low: Math.min(ceiling, h.low * r.low), high: Math.min(ceiling, h.high * r.high) };
@@ -166,14 +171,14 @@ export async function getBalance() {
 /** Conservative cost band for N variants, e.g. { low: 4.5, high: 9 }. */
 export function estimateCost(variantCount,
                              { sc = false, sizeGb = 0, needsDonor = false, isMoe = false,
-                               gpuCount = 1 } = {}) {
+                               gpuCount = 1, scLite = false, donorBpw = DONOR_BPW } = {}) {
   const n = Math.max(0, variantCount || 0);
   const per = convertCost(sizeGb, sc, isMoe, gpuCount);
   let low = n * per.low;
   let high = n * per.high;
   if (!sc) return { low, high, sc: false };
   // Once for the job, not once per bitrate.
-  const cal = scCalibrationCost(sizeGb, gpuCount);
+  const cal = scCalibrationCost(sizeGb, gpuCount, { traceOnly: scLite, donorBpw });
   low += cal.low;
   high += cal.high;
   // The donor is another whole conversion, and the job builds it itself now,

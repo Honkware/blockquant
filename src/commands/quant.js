@@ -113,17 +113,24 @@ export function jobOutcome(variants, results) {
   };
 }
 
-// What to quantize as a donor when none exists. sc_trace samples the model
-// through it and sc_rfn_probe walks its module tree, so it has to be at least
-// the target bitrate -- and no more than that, because it is generated through
-// on every calibration row and a fatter donor is a slower trace for no gain.
-// Rounded up to a half-bit so the donor is a sensible artifact in its own
-// right rather than, say, a 3.6bpw oddity nobody asked for.
+// The least a donor may be. sc_trace generates the whole calibration set
+// through it, so its errors are what the quant gets calibrated toward. This
+// used to be the target rounded up, floored at 4.0 for speed -- a 3.6 SC was
+// traced through a 4.0 -- while turboderp's SC branches and ezexl3 both trace
+// through 6bpw or better, and sharkwipf measured a 6bpw teacher against a full
+// bf16 one on Gemma 4 26B-A4B and found no difference outside noise. Nothing
+// says 4.0 is that close.
+export const DONOR_FLOOR_BPW = 6;
+
+// What to quantize as a donor when none exists: at least the floor, at least
+// the target (sc_rfn_probe walks its module tree against it), and rounded up to
+// a half-bit so it is a sensible artifact in its own right. A 6.0 is also the
+// quant people ask for most once there is an SC family.
 export function donorBitrateFor(targetBpw) {
   const t = Number(targetBpw);
   if (!Number.isFinite(t)) throw new TypeError(`Invalid target bpw: ${targetBpw}`);
   const half = Math.ceil(t * 2) / 2;
-  return Math.min(8, Math.max(4, half)).toFixed(1);
+  return Math.min(8, Math.max(DONOR_FLOOR_BPW, half)).toFixed(1);
 }
 
 export function podGroups(variants, sc) {
@@ -386,7 +393,8 @@ export async function handleQuant(interaction) {
   if (sc) {
     const wanted = Math.max(...bpws);
     try {
-      donorRepo = await hf.findDonorQuant(modelName, wanted);
+      // An existing 4.0 no longer qualifies; the job builds a 6.0 instead.
+      donorRepo = await hf.findDonorQuant(modelName, Math.max(DONOR_FLOOR_BPW, wanted));
     } catch (err) {
       return interaction.editReply({
         embeds: [embeds.error('Could not look for a donor', toUserMessage(err))],
@@ -406,9 +414,15 @@ export async function handleQuant(interaction) {
   // ── Cost gate: refuse if RunPod can't even afford the optimistic estimate ─
   // The work to actually do is the variants minus the ones already uploaded.
   const billable = Math.max(1, variants.length - alreadyUploaded.length);
+  // One set of options for the gate and the quote. The gate used to price a
+  // plain quant of unknown size, so an SC job on a 27B cleared it at $1.50.
+  const costOpts = {
+    sc, scLite, sizeGb: flight.sizeGb, needsDonor: !!donorBpw, isMoe: !!flight.isMoe,
+    gpuCount: gpuCount || 1,
+  };
   if (provider === 'runpod') {
     const bal = await getBalance();
-    const est = estimateCost(billable);
+    const est = estimateCost(billable, costOpts);
     if (bal && est.low > bal.balance) {
       return interaction.editReply({
         embeds: [
@@ -481,10 +495,7 @@ export async function handleQuant(interaction) {
   }
 
   const costLine = provider === 'runpod'
-    ? await costPreflightLine(variants.length, {
-        sc, sizeGb: flight.sizeGb, needsDonor: !!donorBpw, isMoe: !!flight.isMoe,
-        gpuCount: gpuCount || 1,
-      })
+    ? await costPreflightLine(variants.length, costOpts)
     : '';
 
   const requestEmbed = embeds.info(
