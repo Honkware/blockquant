@@ -1,6 +1,6 @@
 # HTTP API
 
-The FastAPI app is the service boundary used by the Discord bot. It accepts a quant request, queues a Celery job, and exposes a polling endpoint.
+The FastAPI app fronts the local pipeline: it accepts a quant request, queues a Celery job, and exposes a polling endpoint. The Discord bot does not submit jobs through it; it runs them on RunPod itself.
 
 It has no built-in authentication. Bind it to localhost unless another service handles auth.
 
