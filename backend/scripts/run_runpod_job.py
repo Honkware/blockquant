@@ -266,13 +266,16 @@ def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
         base = _recommend_max_price(base_gb)
         if not base_gb or base_gb <= 20:
             return max(1.30, base)
-        return max(2.10, base)
+        return max(2.60, base)
     if base_gb <= 20:
         return 0.80   # <= ~10B: cheap cards are fast enough
     if base_gb <= 50:
         return 1.30   # ~10-25B: RTX 5000 Ada / A40 / A6000 tier
     if base_gb <= 100:
-        return 1.80   # ~25-50B: A100 tier (worth it, ~3x faster)
+        # ~25-50B. Enough for an RTX PRO 6000 Blackwell on secure ($2.49): per
+        # hour it is dearer than an A100, per job it is about half, since it
+        # converted a 27B in a 1905 s pod against 5748-6135 s on an A100.
+        return 2.60
     return 2.80       # 50B+: A100 80GB / H100
 
 
@@ -881,8 +884,15 @@ def main():
     # parses the GPU id out of these lines and " x1" would just ride along.
     n_tag = f" x{args.gpu_count}" if args.gpu_count > 1 else ""
     sweeps = max(1, args.launch_retries)
+    # Set once a community pod fails to come up. The local-ai-registry's lab
+    # says RunPod community hosts cannot pull from ghcr.io, where our image
+    # lives, and no job of ours had run on community to say otherwise. One
+    # pod that never starts is the test; after that the job stays on secure.
+    community_failed = False
     for sweep in range(1, sweeps + 1):
         for candidate, cloud in candidate_pairs:
+            if cloud == "COMMUNITY" and community_failed and not cli_passed_cloud:
+                continue
             attempt = RunPodProvider(
                 api_key=args.runpod_api_key,
                 gpu_type=candidate,
@@ -968,6 +978,15 @@ def main():
                     attempt.terminate(instance_id)
                 except Exception:  # noqa: BLE001
                     pass
+                # It billed while RunPod tried, so it goes in the job's total.
+                _secs = time.time() - t_created
+                print(f"[cost] {_secs:.0f}s on {candidate}{n_tag} ({cloud}) at "
+                      f"${rate:.2f}/h = ${_secs / 3600 * rate:.2f}", flush=True)
+                t_created = None
+                if cloud == "COMMUNITY" and not community_failed:
+                    community_failed = True
+                    print("      community pod never came up; staying on secure for this job",
+                          flush=True)
                 last_err = RuntimeError(f"pod did not become active: {active}")
                 instance_id = None
                 continue

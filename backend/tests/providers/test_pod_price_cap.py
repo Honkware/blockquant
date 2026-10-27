@@ -34,7 +34,7 @@ def test_auto_cap_unchanged_for_a_single_gpu(cap):
 def test_auto_cap_scales_with_the_card_count(cap):
     """A 4-GPU pod bills 4x, so a cap left at the one-GPU figure would reject
     every candidate and spend the whole launch sweep finding that out."""
-    assert cap["_pod_price_cap"]("auto", 72.0, 4) == pytest.approx(4 * 1.80)
+    assert cap["_pod_price_cap"]("auto", 72.0, 4) == pytest.approx(4 * 2.60)
 
 
 def test_a_pinned_cap_already_names_the_pod(cap):

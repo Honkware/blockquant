@@ -141,13 +141,12 @@ def test_a_big_sc_job_can_reach_an_h100_or_h200(rj):
     assert "NVIDIA H200 NVL" in reachable
 
 
-def test_the_old_cap_could_not(rj):
-    # The plain tier for this size is $1.80 and both cards sit at $1.99-2.00,
-    # so a 20-cent cap was all that stood between a 52 GB model and a 143 GB
-    # card. Documents why the SC branch is not just max(1.30, tier).
-    plain = rj._recommend_max_price(51.75)
-    assert plain < 1.99
-    assert rj._recommend_max_price(51.75, sc=True) > 2.00
+def test_a_big_model_reaches_the_secure_blackwell_but_not_an_h100(rj):
+    # $2.49 secure is half an A100 per job; an H100 HBM3 at $3.49 stays out.
+    for sc in (False, True):
+        cap = rj._recommend_max_price(51.75, sc=sc)
+        assert cap >= 2.49
+        assert cap < 3.49
 
 
 def test_a_small_sc_job_stays_on_the_cheap_tier(rj):

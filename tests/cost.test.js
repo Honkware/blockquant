@@ -39,7 +39,7 @@ describe('what the requester is quoted', () => {
     // Drift here makes every estimate wrong in the same direction.
     expect(maxPricePerHour(15)).toBe(0.80);
     expect(maxPricePerHour(40)).toBe(1.30);
-    expect(maxPricePerHour(72)).toBe(1.80);
+    expect(maxPricePerHour(72)).toBe(2.60);
     expect(maxPricePerHour(200)).toBe(2.80);
     // SC floors the cap so a faster card is reachable at all.
     expect(maxPricePerHour(15, true)).toBe(1.30);

@@ -82,13 +82,13 @@ export function maxPricePerHour(sizeGb, sc = false) {
   if (!gb) cap = 1.5;
   else if (gb <= 20) cap = 0.80;
   else if (gb <= 50) cap = 1.30;
-  else if (gb <= 100) cap = 1.80;
+  else if (gb <= 100) cap = 2.60;
   else cap = 2.80;
   // Self-calibration is allowed more card than a plain convert of the same
   // model: sc_trace is bandwidth-bound and sc_measure drops to a CPU-bound
   // streaming path unless the fp16 weights fit resident.
   if (!sc) return cap;
-  return !gb || gb <= 20 ? Math.max(1.30, cap) : Math.max(2.10, cap);
+  return !gb || gb <= 20 ? Math.max(1.30, cap) : Math.max(2.60, cap);
 }
 
 /** Community and secure rates for the pod a job this size will land on. */
