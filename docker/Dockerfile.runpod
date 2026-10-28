@@ -19,11 +19,16 @@
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
 # Built and pushed by .github/workflows/build-runpod-image.yml.
+#
+# Two stages. Everything is installed and the CUDA extension compiled on the
+# devel image, then the Python packages are copied onto CUDA's base image. The
+# single-stage build was 11.3 GB compressed, 6.3 GB of it the devel image's
+# toolkit, runtime libraries and cuDNN, none of which a pod uses: torch ships
+# its own CUDA libraries. A community RTX 3090 never got it started in 15
+# minutes where a Docker Hub image was up in 21 s.
 
-# ---- Base (ubuntu24.04 -> Python 3.12) ------------------------------------
-# devel because exllamav3's C++/CUDA extension JIT-compiles on the pod (nvcc +
-# ninja), cached at /root/.cache/torch_extensions.
-FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+# ---- Build stage (ubuntu24.04 -> Python 3.12) -----------------------------
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -50,6 +55,7 @@ RUN python -m pip install \
 # hf_transfer gives parallel, Rust-backed weight downloads (the 70GB+ pull is
 # the longest part of a run); remote/quant.py turns it on when it is present.
 RUN python -m pip install \
+        "setuptools>=77" "wheel" "ninja" \
         "hf_transfer>=0.1.6" \
         "huggingface-hub>=0.21" \
         "transformers>=4.56.0,<5" \
@@ -73,11 +79,16 @@ RUN python -m pip install \
 # Pinned to a git ref, not a PyPI release, so the image carries architectures
 # merged upstream but not yet released. --no-deps stops pip resolving torch and
 # fla again; both are installed explicitly here.
-# The CUDA ext is built here, not on the pod. _get_cuda_arch_flags reads
-# TORCH_CUDA_ARCH_LIST before it tries to detect a device, so naming the arches
-# is what lets a GPU-less CI builder compile -- the IndexError that pushed this
-# to a JIT build was the fallback path, not a hard limit. Building once in CI
-# takes the compile off every pod boot, where it was billed GPU time.
+#
+# --no-build-isolation is what makes the extension precompile. exllamav3's
+# build requirements do not list torch, so an isolated build cannot import it,
+# setup.py prints "Cannot precompile unless torch is installed", and the
+# package installs without exllamav3_ext. The old image got away with that:
+# its import check JIT-built the extension into torch_extensions, and the
+# toolkit was still there for torch's loader at run time. Precompiled, the pod
+# needs no toolkit, which is what lets the runtime stage drop it.
+# _get_cuda_arch_flags reads TORCH_CUDA_ARCH_LIST before it looks for a
+# device, so a GPU-less CI builder compiles for the arches named.
 #
 # Arches cover everything the GPU selector can pick at >=24 GB: A100 (8.0),
 # A40/A5000/3090 (8.6), L40S/4090/6000-Ada (8.9), H100 (9.0), 5090 and
@@ -115,8 +126,9 @@ ENV MAX_JOBS=${MAX_JOBS}
 # validated ones. The vision_bits option on the command is what makes that
 # choice visible and reversible.
 ARG EXLLAMAV3_REF=cdc785db89e263e65e5849cb53e1ada156411414
-RUN python -m pip install --no-cache-dir --no-deps \
-        "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
+RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation \
+        "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}" \
+    && python -c "import importlib.util as u; assert u.find_spec('exllamav3_ext'), 'exllamav3_ext was not precompiled'"
 
 # ---- flash-linear-attention (linear-attention archs) ----------------------
 # exllamav3 lists it in install_requires; the gated-delta-net path uses its
@@ -147,6 +159,35 @@ RUN mkdir -p /opt/blockquant/datasets \
                   d=load_dataset('Salesforce/wikitext','wikitext-2-raw-v1',split='test'); \
                   print('wikitext-2 test rows:', len(d))"
 
+# ---- Runtime stage --------------------------------------------------------
+# CUDA's base image: the driver hooks and a cudart, no toolkit. gcc and the
+# Python headers stay, because Triton compiles a small launcher stub for the
+# fla kernels the first time they run. pip and procps because the provider
+# tops up hf_transfer and checks for a running job with pgrep.
+FROM nvidia/cuda:12.9.1-base-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_DATASETS_CACHE=/opt/blockquant/datasets
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3-pip \
+        gcc libc6-dev git wget ca-certificates procps \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+# System Python, not a venv: the provider drives the pod over SSH, and a login
+# shell there does not see this image's ENV PATH.
+COPY --from=build /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+COPY --from=build /usr/local/bin /usr/local/bin
+COPY --from=build /opt/blockquant/datasets /opt/blockquant/datasets
+
 # ---- Verify the stack at build time ---------------------------------------
 RUN python - <<'PY'
 import sys, torch, importlib.metadata as m
@@ -170,8 +211,10 @@ except RuntimeError as e:
     assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
     print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
-# exllamav3's CUDA ext JITs on import (ninja present) -> best-effort GPU-less.
-RUN python -c "import exllamav3; print('exllamav3 import ok')"
+# The extension has to be the precompiled one: there is no toolkit here to
+# JIT it with, so a missing exllamav3_ext would only show up on a paid pod.
+RUN python -c "import importlib.util as u; assert u.find_spec('exllamav3_ext'), 'no precompiled exllamav3_ext'; \
+               import exllamav3; print('exllamav3 import ok')"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 RUN mkdir -p /opt/blockquant
