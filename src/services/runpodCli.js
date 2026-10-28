@@ -329,7 +329,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
     const total = variants.length;
     const results = new Map(); // bpw -> url
     let drafterUrl = null;
-    let podCost = null;
+    const podCosts = []; // every pod this controller rented, dead ones included
     const pins = new Map(); // bpw -> 40-hex commit
     const samples = new Map(); // bpw -> decoded smoke-test reply
     let curBpw = variants[0];
@@ -401,7 +401,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         return;
       }
       if ((m = RE.podCost.exec(line))) {
-        podCost = { secs: Number(m[1]), gpu: m[2], cloud: m[3], rate: Number(m[4]), cost: Number(m[5]) };
+        podCosts.push({ secs: Number(m[1]), gpu: m[2], cloud: m[3], rate: Number(m[4]), cost: Number(m[5]) });
         return;
       }
       if ((m = RE.drafterDone.exec(line))) {
@@ -547,7 +547,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
                    pushed: true, reused: false, duration: '', sample: null, error: null, drafter: true });
       }
       // On the first result only: one pod, billed once, however many bitrates.
-      if (podCost && out.length) out[0].podCost = podCost;
+      if (podCosts.length && out.length) out[0].podCosts = podCosts;
       if (results.size > 0) {
         resolve(out); // full or partial success
       } else {
@@ -560,7 +560,7 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         err.signal = signal || null;
         err.podCreated = !!podId;
         err.retryable = isControllerRetryable({ signal, podId });
-        err.podCost = podCost;
+        err.podCosts = podCosts;
         reject(err);
       }
     });

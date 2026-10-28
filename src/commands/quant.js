@@ -1060,10 +1060,10 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               ...over,
               onProgress: onGroupProgress(vs),
             }).catch((err) => {
-              if (err.podCost) spent.push(err.podCost);
+              if (err.podCosts) spent.push(...err.podCosts);
               throw err;
             });
-            if (res[0]?.podCost) spent.push(res[0].podCost);
+            if (res[0]?.podCosts) spent.push(...res[0].podCosts);
             markComplete(vs, res);
             return res;
           },

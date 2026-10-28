@@ -75,7 +75,7 @@ describe('attachToCli', () => {
       + '[cost] 1905s on NVIDIA RTX PRO 6000 Blackwell Workstation Edition (COMMUNITY) at $1.69/h = $0.89\n');
     await new Promise((r) => setTimeout(r, 30));
     h.finish(0, null);
-    expect((await p)[0].podCost).toMatchObject({ secs: 1905, cloud: 'COMMUNITY', cost: 0.89 });
+    expect((await p)[0].podCosts[0]).toMatchObject({ secs: 1905, cloud: 'COMMUNITY', cost: 0.89 });
 
     handle = fakeHandle();
     p = attachToCli(handle, { variants: ['3.6'], onProgress: () => {} });
@@ -83,7 +83,7 @@ describe('attachToCli', () => {
       + '[cost] 11520s on NVIDIA A100-SXM4-80GB x2 (SECURE) at $3.18/h = $10.18\n');
     await new Promise((r) => setTimeout(r, 30));
     h.finish(1, null);
-    await expect(p).rejects.toMatchObject({ podCost: { cost: 10.18, gpu: 'NVIDIA A100-SXM4-80GB x2' } });
+    await expect(p).rejects.toMatchObject({ podCosts: [{ cost: 10.18, gpu: 'NVIDIA A100-SXM4-80GB x2' }] });
   });
 
   it("links the pinned commit, not the moving branch", async () => {
