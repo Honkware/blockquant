@@ -2,8 +2,8 @@
 //
 // The old band multiplied a per-size price CAP by 0.66-1.0, because the bot had
 // no idea which card a job would land on. It can know: the launcher ranks
-// cards by static price over conversion speed and tries each on secure, then
-// community, under the cap, all of which is in backend/gpu_table.json and RunPod's
+// cards by static price over conversion speed and tries each on community then
+// secure under the cap, all of which is in backend/gpu_table.json and RunPod's
 // live listing. So this runs the same selection against live prices and stock
 // and quotes the first card that would be taken, with the next as the
 // fallback. Mirrors _auto_gpu_ids, _kl_min_vram, _sc_min_vram and the cloud
@@ -52,12 +52,9 @@ export function planPods(gpuTypes, { sizeGb = 0, sc = false, kl = true, gpus = 1
   if (!cards.length) cards = usable(MIN_VRAM);
   cards.sort((a, b) => staticPrice(a.id) / convertSpeed(a.id) - staticPrice(b.id) / convertSpeed(b.id)
     || (b.memoryInGb || 0) - (a.memoryInGb || 0));
-  // Every card on secure, then every card on community, as the launcher sweeps:
-  // community hosts do not start our image.
   const out = [];
-  for (const cloud of ['secure', 'community']) {
-    for (const g of cards) {
-      const price = cloud === 'secure' ? g.securePrice : g.communityPrice;
+  for (const g of cards) {
+    for (const [cloud, price] of [['community', g.communityPrice], ['secure', g.securePrice]]) {
       if (!price || price * n > cap) continue;
       out.push({ id: g.id, name: g.displayName || g.id, cloud, rate: price * n, speed: convertSpeed(g.id),
                  inStock: !!g.lowestPrice?.stockStatus, memoryInGb: g.memoryInGb });

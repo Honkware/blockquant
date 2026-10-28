@@ -859,15 +859,16 @@ def main():
     # our own create-then-raise strays, never another concurrent job's pods.
     run_tag = f"bq-{os.getpid()}-{int(time.time()) % 100000}"
 
-    # Every card on SECURE, then every card on COMMUNITY, unless the user
-    # pinned a cloud. Community is 25-55% cheaper for the same card, but it
-    # does not start our image: a community 3090 with it never exposed SSH in
-    # 15 minutes, where the same card with runpod/pytorch from Docker Hub was up
-    # in 21 s (2026-10-28). The local-ai-registry's lab says the same of ghcr.io
-    # images on community hosts. Size could be part of it; either way,
-    # community is the fallback until the image lives somewhere it can pull.
-    cloud_order = [args.cloud] if cli_passed_cloud else ["SECURE", "COMMUNITY"]
-    candidate_pairs = [(g, c) for c in cloud_order for g in gpu_candidates]
+    # Per card, COMMUNITY before SECURE, unless the user pinned a cloud. It was
+    # every card on SECURE before any on COMMUNITY, under a comment saying that
+    # cost nothing extra since the cap keeps both pools on the same tier. The
+    # cap keeps them on the same CARD, and the same card is 25-55% cheaper on
+    # community -- every pod for a month landed on secure, the 27B's 2x A100
+    # SXM at $3.18/hr among them. Card order is untouched, so this never trades
+    # down a card to save money; it only stops paying secure rates for a card
+    # community has in stock.
+    cloud_order = [args.cloud] if cli_passed_cloud else ["COMMUNITY", "SECURE"]
+    candidate_pairs = [(g, c) for g in gpu_candidates for c in cloud_order]
 
     provider = None
     instance_id = None
