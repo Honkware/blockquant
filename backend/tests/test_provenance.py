@@ -66,14 +66,14 @@ def test_the_exllamav3_commit_comes_from_pips_record(monkeypatch):
     dist = types.SimpleNamespace(version="1.6.5", read_text=lambda f: json.dumps(
         {"url": "https://github.com/turboderp-org/exllamav3", "vcs_info": {"vcs": "git", "commit_id": "d" * 40}}))
     monkeypatch.setattr(md, "distribution", lambda name: dist)
-    f = _lift("_exllamav3_source", {"json": json})
+    f = _lift("_exllamav3_source", {"json": json, "Path": Path})
     assert f() == {"version": "1.6.5", "commit": "d" * 40}
 
 
 def test_a_missing_exllamav3_does_not_fail_the_upload(monkeypatch):
     import importlib.metadata as md
     monkeypatch.setattr(md, "distribution", lambda name: (_ for _ in ()).throw(md.PackageNotFoundError()))
-    assert _lift("_exllamav3_source", {"json": json})() == {"version": None, "commit": None}
+    assert _lift("_exllamav3_source", {"json": json, "Path": Path})() == {"version": None, "commit": None}
 
 
 def test_the_commit_recorded_is_the_attempt_that_succeeded(monkeypatch, capsys):
@@ -108,3 +108,27 @@ def test_main_downloads_at_the_resolved_revision_and_records_no_branch():
     assert "revision=base_revision" in dl
     assert 'rec["hf_revision"] = "main"' not in src
     assert "_pin_heads(api, outputs)" in src
+
+
+def test_a_wheel_install_takes_its_commit_from_the_image(monkeypatch, tmp_path):
+    # pip records no commit for a prebuilt wheel; the image writes the ref.
+    import importlib.metadata as md
+    dist = types.SimpleNamespace(version="1.6.5+cu128.torch2.8.0",
+                                 read_text=lambda f: json.dumps({"url": "file:///tmp/x.whl"}))
+    monkeypatch.setattr(md, "distribution", lambda name: dist)
+    ref = tmp_path / "exllamav3_ref"
+    ref.write_text("c" * 40 + "\n")
+    real = Path
+    fake = lambda p: ref if str(p) == "/opt/blockquant/exllamav3_ref" else real(p)
+    f = _lift("_exllamav3_source", {"json": json, "Path": fake})
+    assert f() == {"version": "1.6.5+cu128.torch2.8.0", "commit": "c" * 40}
+
+
+def test_the_health_gate_reads_a_wheel_version():
+    # "1.6.5+cu128.torch2.8.0".split(".") made the patch "5+cu128", which the
+    # gate dropped, so 1.6.5 read as (1, 6) and failed a (1, 6, 5) minimum.
+    src = (SRC.parent.parent / "providers/runpod/provider.py").read_text()
+    assert "v.split('+')[0].split('.')" in src
+    v = "1.6.5+cu128.torch2.8.0"
+    p = tuple(int(x) for x in v.split("+")[0].split(".")[:3] if x.isdigit())
+    assert p == (1, 6, 5)

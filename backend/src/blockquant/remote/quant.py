@@ -1143,9 +1143,9 @@ _UPLOAD_TERMINAL = {400, 401, 403, 404, 413}
 
 
 def _exllamav3_source() -> dict:
-    """The exllamav3 this conversion ran on: version, and the commit pip
-    installed it from. The image installs from git at a pinned ref, and pip
-    records that ref in direct_url.json, so this needs nothing from the image.
+    """The exllamav3 this conversion ran on: version, and the commit it was
+    built from. pip records the commit for a git install; for the prebuilt
+    wheel the image uses, the image writes it to /opt/blockquant/exllamav3_ref.
     """
     import importlib.metadata as md
     out = {"version": None, "commit": None}
@@ -1156,6 +1156,12 @@ def _exllamav3_source() -> dict:
         out["commit"] = (du.get("vcs_info") or {}).get("commit_id")
     except Exception:
         pass
+    # A wheel install records no commit; the image writes the ref it installed.
+    if not out["commit"]:
+        try:
+            out["commit"] = Path("/opt/blockquant/exllamav3_ref").read_text().strip() or None
+        except OSError:
+            pass
     return out
 
 
