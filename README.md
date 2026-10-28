@@ -68,7 +68,7 @@ Each published repo carries `blockquant.json` (the base model's commit, the exll
 
 ## Which card, and what it costs
 
-`backend/gpu_table.json` holds each card's fallback price and its conversion speed against an RTX 3090, measured where the file says so and estimated from the architecture otherwise. The launcher sorts candidates by price over speed and tries each on community before secure, under a per-size price cap. A plain job also needs enough VRAM to load the unquantized model for its KL number, so a 27B goes to an 80-96 GB card, not the cheapest 24 GB one.
+`backend/gpu_table.json` holds each card's fallback price and its conversion speed against an RTX 3090, measured where the file says so and estimated from the architecture otherwise. The launcher sorts candidates by price over speed and tries every one on secure before any on community, under a per-size price cap. Community is cheaper but its hosts do not start our image: a community 3090 never came up with it in 15 minutes, where a Docker Hub image was up in 21 s. A plain job also needs enough VRAM to load the unquantized model for its KL number, so a 27B goes to an 80-96 GB card, not the cheapest 24 GB one.
 
 The bot's quote runs the same selection against RunPod's live prices and stock. Every pod reports what it actually cost when it exits, and the completion message puts that next to the quote.
 

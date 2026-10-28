@@ -22,9 +22,9 @@ const LIVE = [
 ];
 
 describe('which pod the launcher would rent', () => {
-  it('puts a 27B on the Blackwell, community first', () => {
+  it('puts a 27B on the Blackwell, on secure', () => {
     const pods = planPods(LIVE, { sizeGb: 55.6 });
-    expect(pods[0]).toMatchObject({ id: 'NVIDIA RTX PRO 6000 Blackwell Server Edition', cloud: 'community', rate: 1.69 });
+    expect(pods[0]).toMatchObject({ id: 'NVIDIA RTX PRO 6000 Blackwell Server Edition', cloud: 'secure', rate: 2.49 });
     // 24-48 GB cards cannot hold the fp16 for the KL eval.
     expect(pods.some((p) => p.memoryInGb < 64)).toBe(false);
   });
@@ -38,7 +38,8 @@ describe('which pod the launcher would rent', () => {
     // An 8B is capped at $0.80/GPU, so the A100 and Blackwell are out.
     const pods = planPods(LIVE, { sizeGb: 16.4 });
     expect(pods.every((p) => p.rate <= 0.80)).toBe(true);
-    expect(pods[0].id).toBe('NVIDIA GeForce RTX 4090');
+    // The 4090 is $0.89 on secure, over the cap, so the 3090 is first.
+    expect(pods[0]).toMatchObject({ id: 'NVIDIA GeForce RTX 3090', cloud: 'secure' });
   });
 
   it('holds an SC job to a card the fp16 fits on', () => {
@@ -54,7 +55,7 @@ describe('the quote', () => {
     const q = quoteJob(LIVE, { variants: 1, sizeGb: 55.6 });
     expect(q.hours.low * 3600).toBeGreaterThan(1905 * 0.85);
     expect(q.hours.low * 3600).toBeLessThan(1905 * 1.25);
-    expect(q.low).toBeCloseTo(q.hours.low * 1.69, 6);
+    expect(q.low).toBeCloseTo(q.hours.low * 2.49, 6);
   });
 
   it('prices the fallback when the first card is taken', () => {

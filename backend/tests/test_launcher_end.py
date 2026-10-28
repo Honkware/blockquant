@@ -51,12 +51,13 @@ def test_printed_is_bound_in_main_not_in_the_closure():
     assert binds and all(id(n) not in in_inner for n in binds)
 
 
-def test_each_card_is_tried_on_community_before_secure():
-    # Every card on SECURE came before any card on COMMUNITY, so the same card
-    # was rented at secure rates whenever secure had it in stock.
+def test_secure_comes_first_because_community_does_not_start_the_image():
+    # A community 3090 with our ghcr image never exposed SSH in 15 minutes;
+    # the same card with a Docker Hub image was up in 21 s.
     _, src = _main()
-    assert 'cloud_order = [args.cloud] if cli_passed_cloud else ["COMMUNITY", "SECURE"]' in src
-    assert "for g in gpu_candidates for c in cloud_order" in src
+    assert 'cloud_order = [args.cloud] if cli_passed_cloud else ["SECURE", "COMMUNITY"]' in src
+    assert "for c in cloud_order for g in gpu_candidates" in src
+    assert "community_failed = True" in src
 
 
 def test_every_exit_says_what_the_pod_cost():
