@@ -100,8 +100,9 @@ cd backend/src && ../venv/bin/python -m blockquant --model Qwen/Qwen3-8B --varia
 `docker/Dockerfile.runpod`, built by `.github/workflows/build-runpod-image.yml` on a tag or by hand. One image for every architecture in `backend/arch_support.json`.
 
 - exllamav3 is pinned to a commit (`EXLLAMAV3_REF`, 1.6.5 now). The self-calibration scripts in `backend/src/blockquant/selfcal/` are vendored from the same commit, and the vendor test fails if the two drift. Bump both behind a real run.
-- Python 3.12 and torch 2.8/cu129. fla's Triton kernels do not import on 3.11.
-- The CUDA extension is built in the image for sm 8.0-12.0, so pods do not compile it on first boot. B200/B300 (sm 10.0) are not covered and never rented.
+- Python 3.12 and torch 2.8/cu128 on the CUDA runtime base image, with exllamav3 from turboderp's prebuilt wheel (sm 7.5-12.0, sha256 checked). fla's Triton kernels do not import on 3.11.
+- No nvcc in the image, so nothing compiles on a pod. B200/B300 have kernels in the wheel but are untested and never rented.
+- RunPod Community hosts do not pull from ghcr.io: a Community 3090 never started the ghcr image in 15 minutes, and the same image from Docker Hub was up in 118 s. Point `RUNPOD_IMAGE` at the Docker Hub copy (`docker.io/honkware69/blockquant:sha-<commit>`). Secure pulls either.
 - wikitext-2 is cached in the image so a pod cannot lose its KL number to an HF outage.
 
 ## Layout

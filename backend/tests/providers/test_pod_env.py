@@ -1,10 +1,8 @@
 """The pod's SSH sessions must carry the image's load-bearing ENV.
 
 sshd on a RunPod pod runs outside the container's process tree, so an SSH
-session inherits none of the Docker ENV. Both of these failed silently: torch
-recompiled exllamav3's CUDA extension on every pod because TORCH_CUDA_ARCH_LIST
-was unset (missing the cache the image built), and qbench could not see the
-wikitext-2 warmed into the image because HF_DATASETS_CACHE was unset.
+session inherits none of the Docker ENV. This failed silently: qbench could not
+see the wikitext-2 warmed into the image because HF_DATASETS_CACHE was unset.
 """
 from __future__ import annotations
 
@@ -26,7 +24,7 @@ def _dockerfile_env(name: str) -> str:
 
 def test_pod_env_matches_the_image():
     """POD_ENV is a second copy of what the Dockerfile sets, so it can drift.
-    A wrong arch list is worse than none: it would silently rebuild."""
+    A wrong path is worse than none: qbench would look in the wrong place."""
     for name, value in RunPodProvider.POD_ENV.items():
         assert _dockerfile_env(name) == value, (
             f"{name} is {value!r} in provider.py but {_dockerfile_env(name)!r} in the Dockerfile"
@@ -42,8 +40,9 @@ def test_every_remote_exec_carries_the_env():
         assert "_with_pod_env" in s, f"a remote exec skips the pod env: {s}"
 
 
-def test_the_export_is_shell_safe():
-    """The arch list contains semicolons; unquoted they would end the command."""
+def test_the_export_is_shell_safe(monkeypatch):
+    """An arch list had semicolons; unquoted they would end the command."""
+    monkeypatch.setattr(RunPodProvider, "POD_ENV", {"X": "8.0;12.0+PTX"})
     out = RunPodProvider._with_pod_env("echo hi")
     assert out.endswith("; echo hi")
-    assert "'8.0;8.6;8.9;9.0;12.0+PTX'" in out
+    assert "'8.0;12.0+PTX'" in out

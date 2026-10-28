@@ -6,34 +6,39 @@
 # One image for every architecture. exllamav3 1.6.5 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
-# else needs a separate bake. The old three-image split (stable 0.0.38 +
-# qwen35 0.0.43 + a master image for LFM2) is gone.
+# else needs a separate bake.
 #
 # **Python 3.12** is load-bearing. fla's triton kernels trip triton bug #5224
 # (multi-decorator @triton.jit -> inspect.getsource returns only the decorators
 # -> `import fla` AttributeError) on Python 3.11 but not on 3.12. So
-# ubuntu24.04 (native py3.12), torch 2.8/cu129, triton at its native 3.4.0.
+# ubuntu24.04 (native py3.12), torch 2.8, triton at its native 3.4.0.
 #
 # flash-attn is NOT installed and is no longer needed: exllamav3 ships
 # Triton attention kernels that lead the dispatch order and handle sliding
 # window, so Gemma3/Gemma4/Mellum no longer depend on a prebuilt FA2 wheel.
 #
+# Small on purpose. The old build sat on the CUDA devel image to compile
+# exllamav3's extension and came to 11.3 GB compressed, 6.3 GB of it toolkit,
+# runtime libraries and cuDNN that no pod uses, since torch ships its own. A
+# community RTX 3090 took 790 s to pull and start it, past the launcher's
+# 10-minute SSH wait. exllamav3 now comes from turboderp's prebuilt wheel, so
+# there is nothing to compile and the base is CUDA's runtime-only image.
+#
 # Built and pushed by .github/workflows/build-runpod-image.yml.
 
-# ---- Base (ubuntu24.04 -> Python 3.12) ------------------------------------
-# devel because exllamav3's C++/CUDA extension JIT-compiles on the pod (nvcc +
-# ninja), cached at /root/.cache/torch_extensions.
-FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
+# gcc and the Python headers because Triton compiles a small launcher stub for
+# the fla kernels the first time they run. pip and procps because the provider
+# tops up hf_transfer and checks for a running job with pgrep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-dev python3-pip \
-        git wget ca-certificates \
-        ninja-build build-essential \
+        gcc libc6-dev git wget ca-certificates procps \
         openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd \
@@ -41,10 +46,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
 
-# ---- torch 2.8 / cu129 (pip auto-selects the cp312 wheel) ------------------
+# ---- torch 2.8 / cu128 (pip auto-selects the cp312 wheel) ------------------
+# cu128 to match the exllamav3 wheel below, which is built against it.
 RUN python -m pip install \
         "torch==2.8.0" \
-        --index-url https://download.pytorch.org/whl/cu129
+        --index-url https://download.pytorch.org/whl/cu128
 
 # ---- Python deps ----------------------------------------------------------
 # hf_transfer gives parallel, Rust-backed weight downloads (the 70GB+ pull is
@@ -70,27 +76,19 @@ RUN python -m pip install \
         "einops"
 
 # ---- ExLlamaV3 ------------------------------------------------------------
-# Pinned to a git ref, not a PyPI release, so the image carries architectures
-# merged upstream but not yet released. --no-deps stops pip resolving torch and
-# fla again; both are installed explicitly here.
-# The CUDA ext is built here, not on the pod. _get_cuda_arch_flags reads
-# TORCH_CUDA_ARCH_LIST before it tries to detect a device, so naming the arches
-# is what lets a GPU-less CI builder compile -- the IndexError that pushed this
-# to a JIT build was the fallback path, not a hard limit. Building once in CI
-# takes the compile off every pod boot, where it was billed GPU time.
+# turboderp's own wheel for this release, torch 2.8 / cu128 / cp312, built for
+# 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX: every card the GPU selector can pick.
+# Compiling it here instead took the better part of 1.5 h on a 2-core runner
+# (177 .cu files x 5 arches), and pip's isolated build had been quietly
+# skipping it anyway, because exllamav3's build requirements do not list
+# torch. The wheel is checked against the digest GitHub reports for it.
 #
-# Arches cover everything the GPU selector can pick at >=24 GB: A100 (8.0),
-# A40/A5000/3090 (8.6), L40S/4090/6000-Ada (8.9), H100 (9.0), 5090 and
-# RTX PRO 6000 Blackwell (12.0). +PTX leaves a JIT path for anything newer.
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX"
-ARG MAX_JOBS=2
-ENV MAX_JOBS=${MAX_JOBS}
-# Bump EXLLAMAV3_REF behind an end-to-end validation pass. The controller's
-# health check enforces a minimum reported version (_MIN_EXLLAMAV3 in
-# providers/runpod/provider.py); this ref reports 1.6.5.
-#
-# v1.6.5. Pinned to the tag's commit rather than the tag name, since a tag can
-# be moved.
+# Bump EXLLAMAV3_REF behind an end-to-end validation pass, with the wheel and
+# its digest. The controller's health check enforces a minimum reported
+# version (_MIN_EXLLAMAV3 in providers/runpod/provider.py); this reports
+# 1.6.5+cu128.torch2.8.0. EXLLAMAV3_REF is the commit the v1.6.5 tag points
+# at, which the vendored selfcal scripts are pinned to. pip records no commit
+# for a wheel, so it is written out for blockquant.json to read.
 #
 # 1.5.0 -> 1.6.5 is 469 commits. What matters here: new archs (bailing_hybrid
 # for Ling 3.x, kimi_linear, mimo_v2, lfm2_vl, dflash2, gemma4_assistant);
@@ -99,8 +97,6 @@ ENV MAX_JOBS=${MAX_JOBS}
 # sc_trace packs one calibration row per trace row from position 0 rather than
 # slicing a concatenated stream, because a window cut mid-conversation made
 # Gemma4-it unstable. That last one changes what an SC quant comes out as.
-# sc_measure's layer streaming is upstream now, so selfcal/ carries one local
-# patch instead of two.
 #
 # 1.4.9 -> 1.5.0 replaces the single-token and batched MoE paths with one
 # two-stage cooperative kernel and makes MoE output deterministic, and swaps in
@@ -111,12 +107,14 @@ ENV MAX_JOBS=${MAX_JOBS}
 # Vision, carried over from the 1.4.2 -> 1.4.9 bump: --vision_bits used to
 # default to 16 (tower copied unquantized) and now defaults to auto, so a tower
 # the arch declares validated goes to 6 bpw and every other tower stays at 16.
-# Qwen3-VL, Gemma4, GLM4V, Step3, DeepSeek-V4-Vision and MuseGlimmer are the
-# validated ones. The vision_bits option on the command is what makes that
-# choice visible and reversible.
 ARG EXLLAMAV3_REF=cdc785db89e263e65e5849cb53e1ada156411414
-RUN python -m pip install --no-cache-dir --no-deps \
-        "exllamav3 @ git+https://github.com/turboderp-org/exllamav3@${EXLLAMAV3_REF}"
+ARG EXLLAMAV3_WHEEL=https://github.com/turboderp-org/exllamav3/releases/download/v1.6.5/exllamav3-1.6.5%2Bcu128.torch2.8.0-cp312-cp312-linux_x86_64.whl
+ARG EXLLAMAV3_WHEEL_SHA256=30358a7a86bebf4ba898980e947065ceaebe6dab01c2db262b58ab43accc4869
+RUN wget -q -O /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl "${EXLLAMAV3_WHEEL}" \
+    && echo "${EXLLAMAV3_WHEEL_SHA256}  /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl" | sha256sum -c - \
+    && python -m pip install --no-deps /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl \
+    && rm /tmp/exllamav3-*.whl \
+    && mkdir -p /opt/blockquant && echo "${EXLLAMAV3_REF}" > /opt/blockquant/exllamav3_ref
 
 # ---- flash-linear-attention (linear-attention archs) ----------------------
 # exllamav3 lists it in install_requires; the gated-delta-net path uses its
@@ -152,7 +150,7 @@ RUN python - <<'PY'
 import sys, torch, importlib.metadata as m
 assert sys.version_info[:2] == (3, 12), f"need python 3.12, got {sys.version}"
 assert torch.__version__.startswith("2.8"), f"torch not 2.8: {torch.__version__}"
-_exl = tuple(int(x) for x in m.version("exllamav3").split(".")[:2])
+_exl = tuple(int(x) for x in m.version("exllamav3").split("+")[0].split(".")[:2])
 assert _exl >= (1, 6), f"exllamav3 older than 1.6: {m.version('exllamav3')}"
 print("python", sys.version.split()[0], "| torch", torch.__version__,
       "| triton", m.version("triton"), "| fla", m.version("flash-linear-attention"),
@@ -170,11 +168,12 @@ except RuntimeError as e:
     assert "driver" in str(e).lower(), f"unexpected fla import error: {e!r}"
     print("FLA parse OK; reached GPU driver init (expected GPU-less on CI):", e)
 PY
-# exllamav3's CUDA ext JITs on import (ninja present) -> best-effort GPU-less.
-RUN python -c "import exllamav3; print('exllamav3 import ok')"
+# There is no toolkit here to JIT the extension with, so a missing
+# exllamav3_ext would only show up on a paid pod.
+RUN python -c "import importlib.util as u; assert u.find_spec('exllamav3_ext'), 'no precompiled exllamav3_ext'; \
+               import exllamav3; print('exllamav3 import ok')"
 
 # ---- BlockQuant remote entrypoint ----------------------------------------
-RUN mkdir -p /opt/blockquant
 COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
 COPY backend/src/blockquant/cards.py /opt/blockquant/cards.py
 COPY backend/templates/card_template.md /opt/blockquant/card_template.md
@@ -186,9 +185,6 @@ RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
 # the wheel, so the installed exllamav3 above does not carry them. Copied in at
 # the same ref the wheel is pinned to (they import exllamav3.modules internals);
 # backend/tests/test_selfcal_vendor.py fails if the two drift apart.
-#
-# Nothing in the pipeline calls these yet. They are here so a pod that already
-# has the model on disk can run a sensitivity measurement without a second image.
 # No new pip deps: sc_measure wants datasets, sc_trace wants safetensors, both
 # are installed above; sc_optimize is stdlib only.
 COPY backend/src/blockquant/selfcal /opt/blockquant/selfcal
@@ -201,8 +197,8 @@ LABEL org.opencontainers.image.title="BlockQuant RunPod" \
       org.opencontainers.image.licenses="MIT" \
       blockquant.exllamav3_ref="${EXLLAMAV3_REF}" \
       blockquant.python_version="3.12" \
-      blockquant.torch_version="2.8.0+cu129" \
-      blockquant.cuda_runtime="12.9.1"
+      blockquant.torch_version="2.8.0+cu128" \
+      blockquant.cuda_runtime="12.8.1"
 
 # ---- Default workdir + ports ---------------------------------------------
 WORKDIR /workspace

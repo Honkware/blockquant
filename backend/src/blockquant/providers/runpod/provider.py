@@ -452,15 +452,12 @@ class RunPodProvider(Provider):
         return {"stdout": out, "stderr": err, "code": exit_code}
 
     # sshd on a RunPod pod is started outside the container's process tree, so
-    # an SSH session inherits none of the image's ENV. Two of them are load
-    # bearing and both failed silently: without TORCH_CUDA_ARCH_LIST torch JITs
-    # exllamav3's CUDA extension for the local arch only, which misses the cache
-    # the image built and recompiles it on every pod (~10 min of paid GPU, and
-    # the whole point of precompiling it); without HF_DATASETS_CACHE qbench
-    # cannot see the wikitext-2 warmed into the image and goes back to the
-    # network for it mid-job. Prepend them to everything we run.
+    # an SSH session inherits none of the image's ENV. Without HF_DATASETS_CACHE
+    # qbench cannot see the wikitext-2 warmed into the image and goes back to
+    # the network for it mid-job, silently. Prepend it to everything we run.
+    # (TORCH_CUDA_ARCH_LIST used to live here too, for the JIT build. The image
+    # installs the prebuilt wheel now and has no nvcc to JIT with.)
     POD_ENV = {
-        "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0;12.0+PTX",
         "HF_DATASETS_CACHE": "/opt/blockquant/datasets",
     }
 
@@ -740,7 +737,10 @@ class RunPodProvider(Provider):
                 "    v = getattr(exllamav3, '__version__', '') or "
                 "getattr(getattr(exllamav3, 'version', None), '__version__', '') or ''\n"
                 "print('[ok] exllamav3', v or '(version unknown)')\n"
-                "p = tuple(int(x) for x in v.split('.')[:3] if x.isdigit())\n"
+                # A wheel reports 1.6.5+cu128.torch2.8.0; the local part after
+                # "+" made "5+cu128" non-numeric, so 1.6.5 read as (1, 6) and
+                # failed a (1, 6, 5) minimum.
+                "p = tuple(int(x) for x in v.split('+')[0].split('.')[:3] if x.isdigit())\n"
                 f"sys.exit(7 if (p and p < {mn}) else 0)\n"
             )
             health = self.run(instance_id, f"{py} -c {shlex.quote(health_code)}")

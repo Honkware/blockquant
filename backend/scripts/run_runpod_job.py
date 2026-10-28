@@ -40,11 +40,10 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=True)
 # (src/services/gpuQuote.js) so both pick the same card.
 _GPU_TABLE = json.loads((Path(__file__).resolve().parent.parent / "gpu_table.json").read_text())
 
-# Datacenter Blackwell (sm_100). The image compiles for 8.0/8.6/8.9/9.0/12.0,
-# so consumer and pro Blackwell (sm_120: RTX 5090, RTX PRO Blackwell) run, but
-# sm_100 has no kernels and 12.0's PTX does not JIT down to it. Add 10.0 to
-# TORCH_CUDA_ARCH_LIST to take these off the list. Matched as substrings of the
-# RunPod GPU id.
+# Datacenter Blackwell (sm_100). The image used to compile 8.0-9.0 and 12.0
+# only, so these had no kernels. The prebuilt wheel it installs now covers 10.0
+# too, but no job has run on one and they cost $5+/h, so they stay off until
+# one is tried by hand. Matched as substrings of the RunPod GPU id.
 #
 # sm_120 was excluded again on 09-15 for having no kernels under "torch
 # 2.6/cu124". The image had been torch 2.8/cu129 built for 12.0 since before

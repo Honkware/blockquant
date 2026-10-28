@@ -42,7 +42,8 @@ def _excluded(m, gid: str) -> bool:
 # substring rule would drop perfectly good cards we rely on.
 @pytest.mark.parametrize("gid", ["NVIDIA B200", "NVIDIA B300 SXM6 AC"])
 def test_datacenter_blackwell_is_refused(rj, gid):
-    # sm_100: not in TORCH_CUDA_ARCH_LIST, and 12.0's PTX does not JIT down.
+    # The wheel has sm_100 kernels, but nothing has run on one. Untested and
+    # $5+/h, so they stay off the list until a job proves them.
     assert _excluded(rj, gid)
 
 
@@ -53,14 +54,18 @@ def test_datacenter_blackwell_is_refused(rj, gid):
     "NVIDIA RTX PRO 4500 Blackwell",
 ])
 def test_sm120_blackwell_is_a_candidate(rj, gid):
-    # The image compiles 12.0. The Workstation Edition converted a Qwen3.8-27B
+    # The wheel ships 12.0. The Workstation Edition converted a Qwen3.8-27B
     # in a 1905 s pod for $1.16 on 2026-09-13.
     assert not _excluded(rj, gid)
 
 
-def test_the_image_still_compiles_what_that_assumes():
+def test_the_image_still_ships_what_that_assumes():
+    # turboderp's release wheels build 7.5-12.0+PTX. A source build or another
+    # wheel needs this rechecked before sm_120 cards stay on the list.
     df = (ROOT.parent / "docker/Dockerfile.runpod").read_text()
-    assert "12.0" in df.split("TORCH_CUDA_ARCH_LIST=")[1].split("\n")[0]
+    url = df.split("EXLLAMAV3_WHEEL=")[1].split("\n")[0]
+    assert url.startswith("https://github.com/turboderp-org/exllamav3/releases/download/")
+    assert "cu128" in url and "cp312" in url
 
 
 @pytest.mark.parametrize("gid", [

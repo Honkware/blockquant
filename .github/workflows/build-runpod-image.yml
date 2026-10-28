@@ -1,12 +1,14 @@
 name: build-runpod-image
 
-# Build + push the BlockQuant pre-baked RunPod image to GHCR.
+# Build + push the BlockQuant pre-baked RunPod image to GHCR, and to Docker Hub
+# when DOCKERHUB_USERNAME/DOCKERHUB_TOKEN are set. RunPod community hosts do
+# not pull from ghcr.io, so RUNPOD_IMAGE points at the Docker Hub copy.
 #
 # Triggered on:
 #   - push of any tag matching v*.*.*    (e.g. v0.1.0)  — produces :v0.1.0 + :latest
 #   - manual dispatch                                    — produces :sha-{shortsha}
 #
-# Image lands at: ghcr.io/honkware/blockquant
+# Image lands at: ghcr.io/honkware/blockquant, docker.io/<DOCKERHUB_USERNAME>/blockquant
 on:
   push:
     tags:
@@ -24,12 +26,15 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Empty unless both secrets are set, so half a setup skips Docker Hub
+      # instead of failing the login.
+      HUB_USER: ${{ secrets.DOCKERHUB_TOKEN != '' && secrets.DOCKERHUB_USERNAME || '' }}
     steps:
       - uses: actions/checkout@v4
 
-      # The image now compiles exllamav3's CUDA ext instead of deferring it to
-      # the pod, which needs far more room than a stock runner has free: the
-      # CUDA devel base and torch are ~10 GB before a single object file.
+      # torch alone is ~4.5 GB compressed; a stock runner is tight once the
+      # layers are unpacked and exported.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -48,11 +53,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: env.HUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Compute tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/blockquant
+          images: |
+            ghcr.io/${{ github.repository_owner }}/blockquant
+            name=docker.io/${{ env.HUB_USER }}/blockquant,enable=${{ env.HUB_USER != '' }}
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -69,10 +83,6 @@ jobs:
           context: .
           file: docker/Dockerfile.runpod
           push: true
-          # Two cores, and nvcc wants gigabytes per translation unit. Left
-          # unbounded, ninja fans out and the runner OOMs mid-compile.
-          build-args: |
-            MAX_JOBS=2
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
