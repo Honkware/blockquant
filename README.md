@@ -102,7 +102,7 @@ cd backend/src && ../venv/bin/python -m blockquant --model Qwen/Qwen3-8B --varia
 - exllamav3 is pinned to a commit (`EXLLAMAV3_REF`, 1.6.5 now). The self-calibration scripts in `backend/src/blockquant/selfcal/` are vendored from the same commit, and the vendor test fails if the two drift. Bump both behind a real run.
 - Python 3.12 and torch 2.8/cu128 on the CUDA runtime base image, with exllamav3 from turboderp's prebuilt wheel (sm 7.5-12.0, sha256 checked). fla's Triton kernels do not import on 3.11.
 - No nvcc in the image, so nothing compiles on a pod. B200/B300 have kernels in the wheel but are untested and never rented.
-- Kept small on purpose: Community hosts took 13 minutes to pull the old 11 GB devel image, past the launcher's SSH wait.
+- RunPod Community hosts do not pull from ghcr.io: a Community 3090 never started the ghcr image in 15 minutes, and the same image from Docker Hub was up in 118 s. Point `RUNPOD_IMAGE` at the Docker Hub copy (`docker.io/honkware69/blockquant:sha-<commit>`). Secure pulls either.
 - wikitext-2 is cached in the image so a pod cannot lose its KL number to an HF outage.
 
 ## Layout
