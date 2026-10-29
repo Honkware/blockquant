@@ -132,3 +132,21 @@ def test_the_health_gate_reads_a_wheel_version():
     v = "1.6.5+cu128.torch2.8.0"
     p = tuple(int(x) for x in v.split("+")[0].split(".")[:3] if x.isdigit())
     assert p == (1, 6, 5)
+
+
+def test_the_upload_already_has_the_config_fixup(tmp_path):
+    # publish_quant's fix-up committed config.json after the pin, so the pinned
+    # commit was never the final one. The pod now writes the same bytes first.
+    coerce = _lift("_coerce_quant_config", {"json": json, "Path": Path})
+    cfg = {"architectures": ["LlamaForCausalLM"], "quantization_config": {"quant_method": "exl3", "bits": 4.5, "head_bits": 6}}
+    (tmp_path / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    coerce(tmp_path, "4.5")
+    once = (tmp_path / "config.json").read_text(encoding="utf-8")
+    qc = json.loads(once)["quantization_config"]
+    assert qc["bits"] == 4 and qc["bits_per_weight"] == 4.5 and qc["head_bits"] == 6
+
+    # what fix_repo_card_and_config.py does to the file it downloads
+    fixed = json.loads(once)
+    fixed["quantization_config"]["bits"] = int(float("4.5"))
+    fixed["quantization_config"]["bits_per_weight"] = float("4.5")
+    assert json.dumps(fixed, indent=2, ensure_ascii=False) + "\n" == once

@@ -1283,6 +1283,21 @@ def _written_quant_config(out_dir) -> dict:
         return {}
 
 
+def _coerce_quant_config(out_dir, variant) -> None:
+    """The int `bits` + `bits_per_weight` that fix_repo_card_and_config.py
+    writes after publish. Done here as well so the upload already holds it:
+    that fix-up was a commit after the pinned head, so the pin was never the
+    repo's final state. Same bytes as the fix-up, so its re-upload is a no-op.
+    """
+    p = Path(out_dir) / "config.json"
+    cfg = json.loads(p.read_text(encoding="utf-8"))
+    qc = cfg.get("quantization_config", {})
+    qc["bits"] = int(float(variant))
+    qc["bits_per_weight"] = float(variant)
+    cfg["quantization_config"] = qc
+    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def _repo_quant_config(repo_id: str, hf_token: str) -> dict:
     """A published quant's own quantization_config, or {} if unreadable."""
     try:
@@ -1837,6 +1852,7 @@ def main() -> int:
                 codebook=codebook, cal_rows=cal_rows, cal_cols=cal_cols,
                 donor_repo=donor_repo, exllamav3=exllamav3_src, job_id=job_id), indent=2),
                 encoding="utf-8")
+            _coerce_quant_config(out_dir, variant)
             print(f"[upload] {variant} -> {repo_id} ...", flush=True)
             api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=False)
             commit = _upload_folder_hb(api, str(out_dir), repo_id, variant)
