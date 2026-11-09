@@ -128,14 +128,12 @@ class RunPodProvider(Provider):
 
         Only the subfolder when there is one. Summing the whole repo priced and
         floored the nerkyor job as a 434 GB model and sized its disk to match,
-        when it pulled the 57 GB BF16 folder and nothing else.
+        when it pulled the 57 GB BF16 folder and nothing else. Only the indexed
+        shards, too: GGUFs and a stale shard set made a 55.6 GB model 240 GB.
         """
-        want = f"{subfolder.strip('/')}/" if subfolder else ""
         try:
-            from huggingface_hub import HfApi
-            info = HfApi(token=token or None).model_info(model_id, files_metadata=True)
-            base_gb = sum((s.size or 0) for s in (info.siblings or [])
-                          if s.rfilename.startswith(want)) / 1e9
+            from blockquant.weights import repo_weights
+            base_gb = repo_weights(model_id, token, subfolder)[2] / 1e9
         except Exception:
             return None
         return base_gb if base_gb > 0 else None
@@ -981,6 +979,7 @@ class RunPodProvider(Provider):
     # can produce the polished README. parents[2] is the blockquant package;
     # parents[4] is the backend/ root that holds templates/.
     _CARDS_PATH = Path(__file__).resolve().parents[2] / "cards.py"
+    _WEIGHTS_PATH = Path(__file__).resolve().parents[2] / "weights.py"
     _TEMPLATE_PATH = Path(__file__).resolve().parents[4] / "templates" / "card_template.md"
     _FLASH_PATCH = Path(__file__).resolve().parents[5] / "docker" / "patch_flash_attn.py"
     _CAL_DATA_FETCH = Path(__file__).resolve().parents[5] / "docker" / "fetch_cal_data.py"
@@ -1107,6 +1106,8 @@ class RunPodProvider(Provider):
         # Ship the card renderer + template next to the script (idempotent;
         # gives even pre-baked pods the current card without an image rebuild).
         script_dir = os.path.dirname(script_path)
+        # Not optional like the card: quant.py picks its download with it.
+        self._upload_bytes(instance_id, self._WEIGHTS_PATH.read_bytes(), f"{script_dir}/weights.py")
         try:
             self._upload_bytes(instance_id, self._CARDS_PATH.read_bytes(),
                                f"{script_dir}/cards.py")

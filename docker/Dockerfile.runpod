@@ -176,6 +176,7 @@ RUN python -c "import importlib.util as u; assert u.find_spec('exllamav3_ext'), 
 # ---- BlockQuant remote entrypoint ----------------------------------------
 COPY backend/src/blockquant/remote/quant.py /opt/blockquant/quant.py
 COPY backend/src/blockquant/cards.py /opt/blockquant/cards.py
+COPY backend/src/blockquant/weights.py /opt/blockquant/weights.py
 COPY backend/templates/card_template.md /opt/blockquant/card_template.md
 COPY docker/entrypoint.sh /opt/blockquant/entrypoint.sh
 RUN chmod +x /opt/blockquant/entrypoint.sh /opt/blockquant/quant.py
