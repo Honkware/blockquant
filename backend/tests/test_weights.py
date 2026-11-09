@@ -1,10 +1,4 @@
-"""Only the files that make up the model get sized, priced and downloaded.
-
-OBLITERATUS/Qwen3.8-27B-OBLITERATED ships its 28 indexed shards beside an older
-18-shard set and 128 GB of GGUFs. The launcher read that as a 240 GB model, gave
-up on the KL eval because nothing holds a 240 GB fp16, put the job on a 4090
-and downloaded all of it, both shard sets into one folder.
-"""
+"""Only the files that make up the model get sized, priced and downloaded."""
 import importlib.util
 import json
 import sys
@@ -18,11 +12,11 @@ spec.loader.exec_module(weights)
 GB = 10**9
 
 
-def _obliterated(prefix=""):
+def _two_shard_sets(prefix=""):
     files = {f"{prefix}model-{i:05d}-of-00028.safetensors": 2 * GB for i in range(1, 29)}
     files.update({f"{prefix}model-{i:05d}-of-00018.safetensors": 3 * GB for i in range(1, 19)})
     files[f"{prefix}model-extra-00001-of-00001.safetensors"] = GB
-    files.update({f"{prefix}Qwen3.8-27B-OBLITERATED-{q}.gguf": 16 * GB for q in ("Q4_K_M", "Q8_0")})
+    files.update({f"{prefix}model-{q}.gguf": 16 * GB for q in ("Q4_K_M", "Q8_0")})
     files.update({f"{prefix}{n}": 1000 for n in ("config.json", "tokenizer.json",
                                                    "chat_template.jinja", weights.INDEX)})
     shards = [f"model-{i:05d}-of-00028.safetensors" for i in range(1, 29)]
@@ -32,7 +26,7 @@ def _obliterated(prefix=""):
 
 
 def test_the_index_decides_which_shards_are_the_model():
-    files, index = _obliterated()
+    files, index = _two_shard_sets()
     paths, nbytes = weights.pick(files, index)
     assert nbytes == 57 * GB
     assert not any("of-00018" in p or p.endswith(".gguf") for p in paths)
@@ -56,7 +50,7 @@ def test_folders_beside_the_model_are_not_part_of_it():
 
 
 def test_a_subfolder_model_is_picked_the_same_way():
-    files, index = _obliterated("BF16/")
+    files, index = _two_shard_sets("BF16/")
     files["README.md"] = 1000
     paths, nbytes = weights.pick(files, index, "BF16/")
     assert nbytes == 57 * GB
@@ -89,7 +83,7 @@ def test_the_launcher_and_the_quote_size_from_the_same_files(monkeypatch):
     sys.path.insert(0, str(ROOT / "src"))
     import blockquant.weights
     from blockquant.providers.runpod.provider import RunPodProvider
-    files, index = _obliterated()
+    files, index = _two_shard_sets()
     monkeypatch.setattr(blockquant.weights, "repo_weights",
                         lambda *a, **k: (None, *weights.pick(files, index)))
     assert RunPodProvider._base_download_gb("o/m") == 57.0
