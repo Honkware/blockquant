@@ -4,7 +4,7 @@ process.env.CLIENT_ID ??= 'test';
 process.env.GUILD_ID ??= 'test';
 process.env.HF_TOKEN ??= 'test';
 
-const { planPods, quoteJob, vramFloor, convertHoursOn } = await import('../src/services/gpuQuote.js');
+const { planPods, quoteJob, vramFloor, convertHoursOn, klSplit } = await import('../src/services/gpuQuote.js');
 
 // RunPod's listing as it stood on 2026-10-27, trimmed.
 const card = (id, mem, secure, community, stock = 'High') =>
@@ -93,5 +93,45 @@ describe('the quote', () => {
     const fast = convertHoursOn({ speed: 2 }, { sizeGb: 16.4 });
     expect(slow.convert * 60).toBeCloseTo(31, 0);   // the 3090 run it is anchored on
     expect(fast.convert).toBeCloseTo(slow.convert / 2, 6);
+  });
+});
+
+describe('a big MoE', () => {
+  // NorthCUA-Mini: a 70.2 GB qwen3_5_moe that ran 6925 s on an RTX PRO 6000
+  // for $4.98, 108.8 min of it converting.
+  const moe = { variants: 1, sizeGb: 70.2, isMoe: true };
+
+  it('times the conversion at what the job measured', () => {
+    const h = convertHoursOn({ speed: 4.2 }, moe);
+    expect(h.convert * 60).toBeGreaterThan(108.8 * 0.9);
+    expect(h.convert * 60).toBeLessThan(108.8 * 1.1);
+  });
+
+  it('lands on the measured job when it runs on one pod', () => {
+    const q = quoteJob(LIVE, { ...moe, split: false });
+    expect(q.best.id).toBe('NVIDIA RTX PRO 6000 Blackwell Server Edition');
+    expect(q.hours.low * 3600).toBeGreaterThan(6925 * 0.9);
+    expect(q.hours.low * 3600).toBeLessThan(6925 * 1.1);
+  });
+
+  it('converts on the cheapest card and rents the Blackwell for KL', () => {
+    expect(klSplit(LIVE, moe)).toMatchObject({ floor: 81 });
+    const q = quoteJob(LIVE, moe);
+    expect(q.best.memoryInGb).toBeLessThan(81);
+    expect(q.klPod.pod.id).toBe('NVIDIA RTX PRO 6000 Blackwell Server Edition');
+    // A boot, the download and the eval: minutes, not the conversion.
+    expect(q.klPod.low).toBeLessThan(0.5);
+    expect(q.low).toBeLessThan(quoteJob(LIVE, { ...moe, split: false }).low);
+  });
+
+  it('keeps a dense 27B on one pod', () => {
+    expect(klSplit(LIVE, { sizeGb: 55.6 })).toBe(null);
+    expect(quoteJob(LIVE, { variants: 1, sizeGb: 55.6 }).klPod).toBe(null);
+  });
+
+  it('never splits SC or a job with KL off', () => {
+    expect(klSplit(LIVE, { ...moe, sc: true })).toBe(null);
+    expect(klSplit(LIVE, { ...moe, kl: false })).toBe(null);
+    expect(klSplit(LIVE, { ...moe, gpus: 2 })).toBe(null);
   });
 });

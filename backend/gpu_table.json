@@ -4,6 +4,10 @@
   "base_note": "RTX 3090: Qwen3-8B 4.0, 31.0 min converting 16.4 GB",
   "gpu_scaling": 0.79,
   "gpu_scaling_note": "speedup = gpus ** this; 1.73x for two 3090s, ~1.65x for two A100s",
+  "moe_factor": 3.45,
+  "moe_note": "MoE conversion time over the dense estimate for the same size: 3.44 for NorthCUA-Mini (35B qwen3_5_moe, 108.8 min on an RTX PRO 6000 WS), 3.48 for Qwen3.6-35B-A3B on an H100 NVL (~300 s a layer)",
+  "kl_split_min_saving": 0.5,
+  "kl_split_note": "Convert on the cheapest card and rent a card that holds the fp16 only for the KL eval, when that saves at least this many dollars at static prices",
   "exclude": {
     "no_kernels": [
       "B200",

@@ -13,6 +13,8 @@ import argparse
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -98,17 +100,21 @@ def _default_codebook(model_id: str, token: str) -> str:
     an image rolled back to 0.0.38, so it stays the MoE default until a mul1 MoE
     has been measured. Unreadable config gets mcg, the one nothing penalises.
     """
+    moe = _is_moe(model_id, token)
+    return "mul1" if moe is False else "mcg"
+
+
+def _is_moe(model_id: str, token: str) -> bool | None:
+    """Whether the model routes to experts, or None when its config can't be read."""
     try:
         import json as _json
         from huggingface_hub import hf_hub_download
         cfg = _json.loads(Path(hf_hub_download(model_id, "config.json", token=token or None)).read_text())
     except Exception:
-        return "mcg"
+        return None
     # Multimodal repos put the LM's geometry under text_config.
-    for scope in (cfg, cfg.get("text_config") or {}):
-        if any(scope.get(k) for k in ("num_local_experts", "num_experts", "n_routed_experts")):
-            return "mcg"
-    return "mul1"
+    return any(scope.get(k) for scope in (cfg, cfg.get("text_config") or {})
+               for k in ("num_local_experts", "num_experts", "n_routed_experts"))
 
 
 def _resolve_arch(model_id: str, token: str, revision: str = "", subfolder: str = ""):
@@ -392,11 +398,16 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
     about SC, so on a small model it still took the cheapest card and the
     raised cap bought nothing.
     """
-    from blockquant.providers.runpod.pricing import static_price
     import runpod
     runpod.api_key = api_key
+    return _rank_cards(runpod.get_gpus(), min_vram_gb)
+
+
+def _rank_cards(gpus: list[dict], min_vram_gb: int) -> list[str]:
+    """The cards in a RunPod listing a job may use, cheapest per job first."""
+    from blockquant.providers.runpod.pricing import static_price
     cards = []
-    for g in runpod.get_gpus():
+    for g in gpus:
         gid = (g.get("id") or "").strip()
         mem = g.get("memoryInGb") or 0
         if not gid or gid == "unknown" or "MIG" in gid or mem < min_vram_gb:
@@ -429,6 +440,30 @@ def _auto_gpu_ids(api_key: str, min_vram_gb: int, base_gb: float | None = None,
     # card that cannot hold what it needs.
     cards.sort(key=lambda c: (static_price(c[1]) / _convert_speed(c[1]), -c[0]))
     return [gid for _, gid in cards]
+
+
+def _kl_split_saving(gpus: list[dict], base_gb: float | None, kl_floor: int, min_vram: int,
+                     moe: bool, n_variants: int = 1) -> float:
+    """Dollars saved by converting on the cheapest card and renting a card that
+    holds the fp16 only for the KL eval, against doing both on the big card.
+
+    The KL floor is there so the number is not dropped, but it holds the whole
+    conversion to that card. NorthCUA-Mini, a 35B MoE, paid an RTX PRO 6000 at
+    $2.59/h for 6925 s so a KL eval that took minutes could fit. Hours are
+    gpuQuote.convertHoursOn's (boot and download, convert, 0.03 h of KL a
+    variant), at static prices, so the bot's quote makes the same call.
+    """
+    from blockquant.providers.runpod.pricing import static_price
+    big, small = _rank_cards(gpus, kl_floor), _rank_cards(gpus, min_vram)
+    if not base_gb or not big or not small or big[0] == small[0]:
+        return 0.0
+    convert = base_gb * _GPU_TABLE["base_min_per_gb"] / 60 * (_GPU_TABLE["moe_factor"] if moe else 1)
+    overhead = 0.08 + base_gb / 3600
+    kl = 0.03 * n_variants
+    whole = (overhead + n_variants * convert / _convert_speed(big[0]) + kl) * static_price(big[0])
+    split = ((overhead + n_variants * convert / _convert_speed(small[0])) * static_price(small[0])
+             + (overhead + kl) * static_price(big[0]))
+    return whole - split
 
 
 _GHCR_ACCEPT = ",".join((
@@ -621,6 +656,13 @@ def main():
                              "Omitted: --bits rounded")
     parser.add_argument("--job-id", default="",
                         help="The bot's job id, recorded in each quant's blockquant.json.")
+    parser.add_argument("--kl-only", default="",
+                        help="Comma-separated repos, one per --variants entry, that a conversion "
+                             "on a smaller card already published: rent a card that holds the "
+                             "fp16 and only measure their KL. The launcher passes this to itself.")
+    parser.add_argument("--drafter-repo", default="",
+                        help="With --kl-only: the drafter the conversion published, so the "
+                             "re-rendered cards still link it.")
     parser.add_argument("--draft-model", default="",
                         help="HF id of a drafter (DFlash2, MTP head, ...) to quantize at 4bpw "
                              "on the same pod and publish beside the model.")
@@ -688,6 +730,15 @@ def main():
         # not what was asked for and not what the requester would go looking for.
         print("[joberror] --sc-lite is a kind of --sc; pass both.", flush=True)
         sys.exit(2)
+    kl_repos = [r.strip() for r in args.kl_only.split(",") if r.strip()]
+    if kl_repos:
+        if len(kl_repos) != len([v for v in args.variants.split(",") if v.strip()]):
+            print("[kl] WARN --kl-only needs one repo per --variants entry", flush=True)
+            sys.exit(2)
+        # The conversion's controller forwards its SIGTERM here. Python's
+        # default handler exits without running the finally below, which is
+        # what terminates the pod.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     # Resolve the codebook before anything reads it: the summary, the [job]
     # header and the provider all want a concrete value, not "auto".
@@ -827,13 +878,29 @@ def main():
     header += f" codebook={args.codebook}"
     print(header, flush=True)
 
+    # The KL pod's VRAM floor, when this job converts on a smaller card and
+    # measures KL on a second pod afterwards. 0 means one pod does both.
+    split_kl = 0
+    _gpus = None
     if args.gpu.strip().lower() == "auto":
-        _kl_on = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
+        _kl_on = bool(kl_repos) or os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
         _min_vram = (_sc_min_vram(_base_gb, args.min_vram) if args.sc
                      else _kl_min_vram(_base_gb, args.min_vram, args.gpu_count) if _kl_on
                      else args.min_vram)
-        gpu_candidates = _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb,
-                                       sc=args.sc)
+        if (_kl_on and not kl_repos and not args.sc and args.gpu_count == 1
+                and _min_vram > args.min_vram
+                and os.environ.get("BLOCKQUANT_KL_SPLIT", "1").strip().lower() not in ("0", "false", "no", "")):
+            import runpod
+            runpod.api_key = args.runpod_api_key
+            _gpus = runpod.get_gpus()
+            _saving = _kl_split_saving(_gpus, _base_gb, _min_vram, args.min_vram,
+                                       bool(_is_moe(args.model, args.hf_token)), len(_variants))
+            if _saving >= _GPU_TABLE["kl_split_min_saving"]:
+                print(f"[kl] converting on the cheapest card, then KL on a >= {_min_vram}GB "
+                      f"pod (~${_saving:.2f} less than one pod for both)", flush=True)
+                split_kl, _min_vram = _min_vram, args.min_vram
+        gpu_candidates = (_rank_cards(_gpus, _min_vram) if _gpus is not None
+                          else _auto_gpu_ids(args.runpod_api_key, _min_vram, _base_gb, sc=args.sc))
         if not gpu_candidates and _min_vram > args.min_vram:
             # Nothing that big exists on the platform at all -- as opposed to
             # being out of stock, which the launch sweep handles. Take the
@@ -1049,6 +1116,12 @@ def main():
         print("      Bootstrap complete")
 
         print(f"[4/6] Starting remote quantization...")
+        # Stock-outs can push the sweep down to a card that holds the fp16
+        # after all. KL runs here then: a second pod would be the same card again.
+        if split_kl and next((g.get("memoryInGb") or 0 for g in _gpus
+                              if g.get("id") == chosen_gpu), 0) >= split_kl:
+            print(f"[kl] {chosen_gpu} holds the fp16; measuring KL on this pod", flush=True)
+            split_kl = 0
         variants = [v.strip() for v in args.variants.split(",") if v.strip()]
         launch_result = provider.run_pipeline(
             instance_id=instance_id,
@@ -1073,6 +1146,9 @@ def main():
             cal_cols=cal_cols,
             keep_pod=args.keep_pod,
             test_prompt=args.test_prompt,
+            kl_eval=False if split_kl else None,
+            kl_only_repos=kl_repos,
+            drafter_repo=args.drafter_repo,
         )
         if launch_result.get("status") != "started":
             print(f"[joberror] remote pipeline never started: {launch_result}", flush=True)
@@ -1192,6 +1268,56 @@ def main():
                 sys.exit(2)
         else:
             print(f"Pod {instance_id} kept alive (--keep-pod). Remember to terminate manually.")
+
+    if split_kl:
+        _run_kl_pod(args, result, split_kl)
+
+
+def _run_kl_pod(args, result: dict, kl_floor: int) -> int:
+    """KL for what the conversion pod just published, on a card that holds the fp16.
+
+    Its own controller, writing to this one's log: the bot reads its [cost]
+    and [upload] pinned lines like any other, /stop finds its Pod ID there, and
+    the reapers see a live run_runpod_job.py behind its pod. Best-effort, as KL
+    has always been: the quants are already up, so a failure costs the number
+    and nothing else.
+    """
+    outs = [o for o in result.get("outputs", []) if o.get("hf_repo_id")]
+    if not outs:
+        return 0
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve()),
+           "--model", args.model,
+           "--variants", ",".join(str(o["variant"]) for o in outs),
+           "--kl-only", ",".join(o["hf_repo_id"] for o in outs),
+           "--min-vram", str(kl_floor),
+           "--codebook", args.codebook,
+           # Minutes of KL after a download; an hour is already generous.
+           "--max-runtime", "3600"]
+    for flag, val in (("--hf-org", args.hf_org), ("--subfolder", args.subfolder),
+                      ("--job-id", args.job_id), ("--image", args.image),
+                      ("--head-bits", args.head_bits), ("--cal-rows", args.cal_rows),
+                      ("--drafter-repo", result.get("drafter_repo"))):
+        if val not in (None, ""):
+            cmd += [flag, str(val)]
+    # Keys through the environment, never argv, which ps shows to anyone.
+    env = {**os.environ, "HF_TOKEN": args.hf_token, "RUNPOD_API_KEY": args.runpod_api_key,
+           "PYTHONUNBUFFERED": "1"}
+    print(f"[kl] conversion done; renting a >= {kl_floor}GB card for KL", flush=True)
+    child = subprocess.Popen(cmd, env=env)
+
+    def _stop(*_):
+        child.terminate()
+        sys.exit(143)
+
+    prev = signal.signal(signal.SIGTERM, _stop)
+    try:
+        rc = child.wait()
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+    if rc:
+        print(f"[kl] WARN the KL pod exited {rc}; the quant is published without a KL number",
+              flush=True)
+    return rc
 
 
 if __name__ == "__main__":
