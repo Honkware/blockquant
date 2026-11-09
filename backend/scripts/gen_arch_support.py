@@ -23,7 +23,7 @@ from pathlib import Path
 
 # The ref the image is built at (docker/Dockerfile.runpod EXLLAMAV3_REF). Bump
 # both together, behind an end-to-end validation pass.
-IMAGE_REF = "cdc785db89e263e65e5849cb53e1ada156411414"
+IMAGE_REF = "bd1f519172406a9560bd5c90e61000691bb69a07"
 
 # What --check measures the committed file against: the branch releases are cut
 # from, matching what the image pins to.

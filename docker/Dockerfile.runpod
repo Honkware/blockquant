@@ -3,7 +3,7 @@
 # Bakes every gotcha we discovered the hard way so that a RunPod pod is
 # "quant-ready" the instant it boots — no apt-get, no pip during the run.
 #
-# One image for every architecture. exllamav3 1.6.5 covers every registered
+# One image for every architecture. exllamav3 1.6.6 covers every registered
 # archs from a single build: the linear-attention family (qwen3_5, qwen3_next,
 # nemotronh) needs flash-linear-attention, which is installed here, and nothing
 # else needs a separate bake.
@@ -73,7 +73,8 @@ RUN python -m pip install \
         "sentencepiece" \
         "pyyaml" \
         "typing_extensions" \
-        "einops"
+        "einops" \
+        "requests"
 
 # ---- ExLlamaV3 ------------------------------------------------------------
 # turboderp's own wheel for this release, torch 2.8 / cu128 / cp312, built for
@@ -86,9 +87,16 @@ RUN python -m pip install \
 # Bump EXLLAMAV3_REF behind an end-to-end validation pass, with the wheel and
 # its digest. The controller's health check enforces a minimum reported
 # version (_MIN_EXLLAMAV3 in providers/runpod/provider.py); this reports
-# 1.6.5+cu128.torch2.8.0. EXLLAMAV3_REF is the commit the v1.6.5 tag points
+# 1.6.6+cu128.torch2.8.0. EXLLAMAV3_REF is the commit the v1.6.6 tag points
 # at, which the vendored selfcal scripts are pinned to. pip records no commit
 # for a wheel, so it is written out for blockquant.json to read.
+#
+# 1.6.5 -> 1.6.6: much less VRAM during quantization (quantize.py), a
+# malloc_trim() after every expert block, which is host RAM on a big MoE, and a
+# faster capture pass. New archs DeepseekV41ForCausalLM, Lfm3ForCausalLM and
+# Lfm3VlForConditionalGeneration. sc_trace grew an --api_model mode that
+# imports eval/api_source.py (vendored, unused here). --moe_affinity_eps is new
+# and off by default; it needs a model calibrated with every expert active.
 #
 # 1.5.0 -> 1.6.5 is 469 commits. What matters here: new archs (bailing_hybrid
 # for Ling 3.x, kimi_linear, mimo_v2, lfm2_vl, dflash2, gemma4_assistant);
@@ -107,12 +115,12 @@ RUN python -m pip install \
 # Vision, carried over from the 1.4.2 -> 1.4.9 bump: --vision_bits used to
 # default to 16 (tower copied unquantized) and now defaults to auto, so a tower
 # the arch declares validated goes to 6 bpw and every other tower stays at 16.
-ARG EXLLAMAV3_REF=cdc785db89e263e65e5849cb53e1ada156411414
-ARG EXLLAMAV3_WHEEL=https://github.com/turboderp-org/exllamav3/releases/download/v1.6.5/exllamav3-1.6.5%2Bcu128.torch2.8.0-cp312-cp312-linux_x86_64.whl
-ARG EXLLAMAV3_WHEEL_SHA256=30358a7a86bebf4ba898980e947065ceaebe6dab01c2db262b58ab43accc4869
-RUN wget -q -O /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl "${EXLLAMAV3_WHEEL}" \
-    && echo "${EXLLAMAV3_WHEEL_SHA256}  /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl" | sha256sum -c - \
-    && python -m pip install --no-deps /tmp/exllamav3-1.6.5+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl \
+ARG EXLLAMAV3_REF=bd1f519172406a9560bd5c90e61000691bb69a07
+ARG EXLLAMAV3_WHEEL=https://github.com/turboderp-org/exllamav3/releases/download/v1.6.6/exllamav3-1.6.6%2Bcu128.torch2.8.0-cp312-cp312-linux_x86_64.whl
+ARG EXLLAMAV3_WHEEL_SHA256=974cc71e04defe35c939e7451a2b8ff923fbdd7133c4112d36f860dccb79bb0f
+RUN wget -q -O /tmp/exllamav3-1.6.6+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl "${EXLLAMAV3_WHEEL}" \
+    && echo "${EXLLAMAV3_WHEEL_SHA256}  /tmp/exllamav3-1.6.6+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl" | sha256sum -c - \
+    && python -m pip install --no-deps /tmp/exllamav3-1.6.6+cu128.torch2.8.0-cp312-cp312-linux_x86_64.whl \
     && rm /tmp/exllamav3-*.whl \
     && mkdir -p /opt/blockquant && echo "${EXLLAMAV3_REF}" > /opt/blockquant/exllamav3_ref
 
