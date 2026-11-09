@@ -42,14 +42,16 @@ export function vramFloor({ sizeGb = 0, sc = false, kl = true, gpus = 1 }) {
  * rate it would rent at. `inStock` is RunPod's own stock flag; a card it lists
  * with none is kept, last, since the sweep tries it anyway.
  */
-export function planPods(gpuTypes, { sizeGb = 0, sc = false, kl = true, gpus = 1 } = {}) {
+// minVram is the launcher's --min-vram: 24, or more on a retry after a job ran
+// out of memory on a smaller card.
+export function planPods(gpuTypes, { sizeGb = 0, sc = false, kl = true, gpus = 1, minVram = MIN_VRAM } = {}) {
   const n = Math.max(1, gpus || 1);
   const cap = maxPricePerHour(sizeGb, sc) * n;
   const usable = (floor) => (gpuTypes || []).filter((g) =>
     g?.id && !excluded(g.id) && (g.memoryInGb || 0) >= floor);
-  let cards = usable(vramFloor({ sizeGb, sc, kl, gpus: n }));
+  let cards = usable(Math.max(minVram, vramFloor({ sizeGb, sc, kl, gpus: n })));
   // The launcher drops back to the plain floor when nothing that big exists.
-  if (!cards.length) cards = usable(MIN_VRAM);
+  if (!cards.length) cards = usable(minVram);
   cards.sort((a, b) => staticPrice(a.id) / convertSpeed(a.id) - staticPrice(b.id) / convertSpeed(b.id)
     || (b.memoryInGb || 0) - (a.memoryInGb || 0));
   const out = [];
@@ -88,16 +90,16 @@ export function convertHoursOn(pod, { sizeGb = 0, isMoe = false, gpus = 1, kl = 
  * without the cap, one pod per bitrate.
  */
 export function klSplit(gpuTypes, { sizeGb = 0, isMoe = false, sc = false, kl = true, gpus = 1,
-  split = true } = {}) {
+  split = true, minVram = MIN_VRAM } = {}) {
   if (!split || sc || !kl || gpus !== 1 || !sizeGb) return null;
   const floor = vramFloor({ sizeGb });
-  if (floor <= MIN_VRAM) return null;
+  if (floor <= minVram) return null;
   const ranked = (min) => (gpuTypes || [])
     .filter((g) => g?.id && !excluded(g.id) && (g.memoryInGb || 0) >= min)
     .sort((a, b) => staticPrice(a.id) / convertSpeed(a.id) - staticPrice(b.id) / convertSpeed(b.id)
       || (b.memoryInGb || 0) - (a.memoryInGb || 0));
   const [big] = ranked(floor);
-  const [small] = ranked(MIN_VRAM);
+  const [small] = ranked(minVram);
   if (!big || !small || big.id === small.id) return null;
   const b = convertHoursOn({ speed: convertSpeed(big.id) }, { sizeGb, isMoe });
   const s = convertHoursOn({ speed: convertSpeed(small.id) }, { sizeGb, isMoe, kl: false });
@@ -118,12 +120,12 @@ const FALLBACK_DEPTH = 4;
  */
 export function quoteJob(gpuTypes, {
   variants = 1, sizeGb = 0, isMoe = false, sc = false, scLite = false,
-  needsDonor = false, gpus = 1, kl = true, split = true,
+  needsDonor = false, gpus = 1, kl = true, split = true, minVram = MIN_VRAM,
 } = {}) {
   const n = Math.max(0, variants || 0);
   // A split job converts with KL off and pays a second, short pod for it.
-  const splitKl = klSplit(gpuTypes, { sizeGb, isMoe, sc, kl, gpus, split });
-  const pods = planPods(gpuTypes, { sizeGb, sc, kl: kl && !splitKl, gpus });
+  const splitKl = klSplit(gpuTypes, { sizeGb, isMoe, sc, kl, gpus, split, minVram });
+  const pods = planPods(gpuTypes, { sizeGb, sc, kl: kl && !splitKl, gpus, minVram });
   if (!pods.length) return null;
   const best = pods[0];
   const opts = { sizeGb, isMoe, gpus, kl: kl && !splitKl };

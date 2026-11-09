@@ -12,6 +12,7 @@ import * as queue from '../services/queue.js';
 import * as quantizer from '../services/quantizer.js';
 import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
+import * as cards from '../utils/cards.js';
 import { sanitizeErrorText, toUserMessage } from '../errors/taxonomy.js';
 import { defaultHeadBits } from '../utils/archSupport.js';
 import { exl3RepoName } from '../utils/hfExl3.js';
@@ -23,9 +24,9 @@ import { runViaCli, attachToCli, runVariantWithRetry, finalizeCollection } from 
 import { answerOf, extractSvg, renderSvgToPng } from '../utils/svg.js';
 import { claimRunSlot, releaseRunSlot } from '../services/access.js';
 import { findExl3Quants } from '../services/exl3Index.js';
-import { costPreflightLine, quoteCost } from '../services/gpuQuote.js';
+import { quoteCost } from '../services/gpuQuote.js';
 import { notifyAdmins, cardUrl } from '../services/approvalNotify.js';
-import { stopButtons, stoppedEmbed } from './stop.js';
+import { stopButtons } from './stop.js';
 
 const log = getLogger('cmd:quant');
 
@@ -80,14 +81,6 @@ function approvalButtons(jobId) {
  * running immediately. The actual quantization runs from runApprovedJob once
  * an admin clicks Approve (see approval.js).
  */
-// What the tower gets, in the terms the requester cares about -- a bitrate or
-// an untouched copy. Which of the two came from the arch and which they typed
-// is not interesting once it is settled.
-function visionSummary(flight, bits) {
-  if (!flight.hasVision) return 'none';
-  return bits >= 1 && bits <= 8 ? `${bits} bpw` : 'fp16, copied';
-}
-
 // One pod per bitrate is right for plain quants: the work is independent and
 // they finish in parallel. Under SC it is not -- sc_trace, sc_rfn_probe and
 // sc_measure depend on the model, not the bitrate, and quant.py already shares
@@ -178,6 +171,87 @@ export function podRuntimeHours({ sc = false, scLite = false, sizeGb = 0, isMoe 
 
 export function podGroups(variants, sc) {
   return sc ? [variants.slice()] : variants.map((v) => [v]);
+}
+
+// ── What the request card says ──────────────────────────────────────────────
+
+/** "27.8B dense with vision, 55.6 GB". */
+export function modelLine({ paramsB = null, isMoe = false, hasVision = false, sizeGb = 0, subfolder = null }) {
+  const kind = isMoe ? 'MoE' : 'dense';
+  const head = paramsB ? `${paramsB}B ${kind}` : kind === 'MoE' ? 'MoE' : 'Dense';
+  return `${head}${hasVision ? ' with vision' : ''}`
+    + (sizeGb ? `, ${Number(sizeGb).toFixed(1)} GB` : '')
+    + (subfolder ? `, from ${subfolder}/` : '');
+}
+
+/** Only what differs from a plain quant, one per line. */
+export function optionsLine(j) {
+  const o = [];
+  if (j.sc) {
+    o.push(j.scLite ? 'Self-calibration, trace only' : 'Self-calibration');
+    o.push(j.donorRepo ? `Donor ${j.donorRepo}` : `Builds a ${j.donorBpw} bpw donor first`);
+  }
+  if (j.headBits != null) o.push(`Head ${j.headBits} bits`);
+  if (j.visionBits != null) o.push(`Vision ${j.visionBits} bits`);
+  if (j.codebook && j.codebook !== config.CODEBOOK) o.push(`Codebook ${j.codebook}`);
+  if (j.mtpBits != null) o.push(`MTP ${j.mtpBits} bits`);
+  if (j.ngramBits != null) o.push(`N-gram ${j.ngramBits} bits`);
+  if (j.hq) o.push(`HQ ${j.hq}`);
+  if (j.draftModel) o.push(`Drafter ${j.draftModel}`);
+  if ((j.gpuCount || 1) > 1) o.push(`${j.gpuCount} GPUs`);
+  if ((j.minVram || 24) > 24) o.push(`At least ${j.minVram} GB of VRAM`);
+  if (j.testPrompt) o.push('Test prompt');
+  if (j.alreadyUploaded?.length) o.push(`Reuses ${j.alreadyUploaded.join(', ')}`);
+  return o.join('\n') || null;
+}
+
+/** The quote as the card shows it: the card it rests on and a range. */
+export function quoteFacts(q) {
+  if (!q) return { gpu: null, estimate: null };
+  const range = q.high > q.low * 1.15
+    ? `${cards.money(q.low)} to ${cards.money(q.high)}` : cards.money(q.low);
+  if (!q.live) return { gpu: null, estimate: range };
+  const kl = q.klPod ? `, KL on ${cards.gpuName(q.klPod.pod.name)}` : '';
+  return { gpu: `${cards.gpuName(q.best.name)}${kl}`, estimate: range };
+}
+
+/** Post a request card for `job` in its channel, pending or already started. */
+async function postRequest({ channel, client, job, quanter = false }) {
+  const card = await channel.send({
+    embeds: [cards.requestCard(job, { state: quanter ? 'started' : 'pending', at: quanter ? Date.now() : null })],
+    components: [quanter ? stopButtons(job.id) : approvalButtons(job.id)],
+  });
+  await db.patchJob(job.id, { cardMessageId: card.id });
+  if (!quanter) {
+    const est = job.card?.estimate ? ` (est. ${job.card.estimate})` : '';
+    notifyAdmins(client,
+      `\`${job.modelId}\` ${job.variants.join(', ')}${job.sc ? (job.scLite ? ' SC (trace)' : ' SC') : ''} from `
+        + `${job.username} is awaiting approval${est}: `
+        + `${cardUrl({ channelId: job.channelId, cardMessageId: card.id })}`).catch(() => {});
+  }
+  return card;
+}
+
+/** Retry for what failed: the whole job, or just the bitrates that did not land. */
+export function retryButtons(jobId, failed, variants) {
+  const some = failed.length && failed.length < variants.length;
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`bq:retry:${jobId}`)
+      .setLabel(some ? `Retry ${failed.join(', ')}` : 'Retry')
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+/** Where a stopped job had got to, for its card. */
+export function whereNow(rows) {
+  const r = rows.find((x) => x.stage === 'Quantizing' && x.layer)
+    || rows.find((x) => !['Complete', 'Failed'].includes(x.stage));
+  if (!r) return null;
+  if (r.stage === 'Quantizing' && r.layer) return `at layer ${r.layer} of ${r.layers}`;
+  return { Downloading: 'while downloading', Calibrating: 'during self-calibration',
+           'Measuring KL': 'during the KL eval', Uploading: 'while uploading',
+           Provisioning: 'before the quant started' }[r.stage] || null;
 }
 
 export async function handleQuant(interaction) {
@@ -589,17 +663,10 @@ export async function handleQuant(interaction) {
     releaseRunSlot(userId);
   }
 
-  const costLine = provider === 'runpod'
-    ? await costPreflightLine(variants.length, costOpts)
-    : '';
-  // Kept on the job so the completion can put what it cost beside it.
-  if (provider === 'runpod') {
-    const q = await quoteCost(variants.length, costOpts).catch(() => null);
-    if (q) {
-      await db.patchJob(jobId, { quote: { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null } })
-        .catch(() => {});
-    }
-  }
+  // What the card says beyond the job itself, worked out once and kept on the
+  // job, so it reads the same after approval, a restart, or a retry.
+  const q = provider === 'runpod' ? await quoteCost(billable, costOpts).catch(() => null) : null;
+  const bal = provider === 'runpod' ? await getBalance().catch(() => null) : null;
 
   // Someone else may already have made it. Said on the card so an admin is not
   // paying for a copy by accident -- #quant-bot has had two people uploading the
@@ -608,65 +675,35 @@ export async function handleQuant(interaction) {
   const community = await Promise.race([
     findExl3Quants(modelId),
     new Promise((r) => setTimeout(() => r([]), 5000)),
-  ]).then((qs) => qs.filter((q) => q.bpw != null
-      && !ourOrgs.some((o) => q.id.toLowerCase().startsWith(o))
-      && bpws.some((b) => Math.abs(q.bpw - b) < 0.051)))
+  ]).then((qs) => qs.filter((x) => x.bpw != null
+      && !ourOrgs.some((o) => x.id.toLowerCase().startsWith(o))
+      && bpws.some((b) => Math.abs(x.bpw - b) < 0.051)))
     .catch(() => []);
-  const pinned = [
-    draftModel ? `drafter ${draftModel}` : '',
-    mtpBits != null ? `-mb ${mtpBits}` : '',
-    ngramBits != null ? `-ngb ${ngramBits}` : '',
-    hq ? `-hq ${hq}` : '',
-  ].filter(Boolean).join(' · ');
 
-  const requestEmbed = embeds.info(
-    slot.quanter ? 'Quantization request · starting' : 'Quantization request · awaiting approval',
-    [
-      `**Model:** [\`${modelId}\`](https://huggingface.co/${modelId})`,
-      `**Variants:** ${variants.join(', ')}  ·  **Format:** ${format.toUpperCase()}`,
-      subfolder ? `**Subfolder:** \`${subfolder}\`` : '',
-      `**Head bits:** ${effHeadBits ?? defaultHeadBits()}  ·  **Codebook:** \`${codebook}\`  ·  **Vision:** ${visionSummary(flight, effVisionBits)}`,
-      sc ? `**Self-calibration:** ${scLite ? 'trace only (no measurement)' : 'full'}  ·  **Donor:** ${
-        donorRepo ? `\`${donorRepo}\`` : `builds ${donorBpw}bpw first`}` : '',
-      pinned ? `**Pinned:** \`${pinned}\`` : '',
-      // Measured on 3090s and A100s: two cards convert ~1.7x faster for
-      // ~15-20% more per job. SC's trace and measurement use one card, so
-      // there the extra cards only speed up the conversion at the end.
-      (gpuCount || 1) > 1
-        ? `**GPUs:** ${gpuCount}, conversion ~${(gpuCount ** 0.79).toFixed(1)}x faster, `
-          + `~${Math.round((gpuCount ** 0.21 - 1) * 100)}% more per job${sc ? ' (calibration still runs on one)' : ''}`
-        : '',
-      `**Provider:** ${provider}`,
-      costLine,
-      `**Requested by:** <@${userId}>`,
-      alreadyUploaded.length ? `**Reuses existing:** ${alreadyUploaded.join(', ')}` : '',
-      community.length
-        ? `**Already on HF from others:** ${community.slice(0, 3)
-          .map((q) => `[${q.id}](https://huggingface.co/${q.id}) (${q.bpw}${q.kind ? ` ${q.kind}` : ''})`).join(', ')}`
-          + (community.length > 3 ? ` +${community.length - 3} more, see \`/quants\`` : '')
-        : '',
-      `**Job:** \`${jobId.slice(0, 8)}\``,
-      '',
-      slot.quanter
-        ? 'Starting now — the requester holds the quanter role. Stop it with the button or `/stop`.'
-        : paused ? 'The bot is paused. An admin can approve this after `/resume`.'
-          : 'An admin must approve before this runs.',
-    ].filter(Boolean).join('\n')
-  );
+  const stored = (await db.loadJobs())[jobId];
+  const card = {
+    model: modelLine({ ...flight, subfolder }),
+    ...quoteFacts(q),
+    balance: bal?.balance ?? null,
+    options: optionsLine(stored),
+    community: community.slice(0, 3).map((x) => `[${x.id}](https://huggingface.co/${x.id})`)
+      .concat(community.length > 3 ? [`${community.length - 3} more, see \`/quants\``] : []),
+    note: paused ? 'The bot is paused. Approval waits for `/resume`.' : null,
+  };
+  await db.patchJob(jobId, {
+    card,
+    // For a retry to quote again with.
+    costOpts,
+    // Kept on the job so the completion can put what it cost beside it.
+    ...(q ? { quote: { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null } } : {}),
+  });
+  const job = (await db.loadJobs())[jobId];
 
   // The card is posted either way, so a quanter's unapproved job is still
   // something an admin can see and stop.
-  const card = await interaction.channel.send({
-    embeds: [requestEmbed],
-    components: [slot.quanter ? stopButtons(jobId) : approvalButtons(jobId)],
+  const posted = await postRequest({
+    channel: interaction.channel, client: interaction.client, job, quanter: slot.quanter,
   });
-  await db.patchJob(jobId, { cardMessageId: card.id });
-  if (!slot.quanter) {
-    notifyAdmins(interaction.client,
-      `\`${modelId}\` ${variants.join(', ')}${sc ? (scLite ? ' SC (trace)' : ' SC') : ''} from `
-        + `${interaction.user.username} is awaiting approval${costLine ? ` (${costLine.replace(/\*\*/g, '')})` : ''}: `
-        + `${cardUrl({ channelId: interaction.channelId, cardMessageId: card.id })}`).catch(() => {});
-  }
 
   if (slot.quanter) {
     await interaction.editReply({
@@ -677,9 +714,13 @@ export async function handleQuant(interaction) {
         ),
       ],
     });
-    const job = (await db.loadJobs())[jobId];
     try {
-      await runApprovedJob({ interaction, job });
+      await runApprovedJob({
+        interaction,
+        job: (await db.loadJobs())[jobId],
+        onThread: (t) => posted.edit({ components: [cards.threadRow(t.url, stopButtons(jobId).components)] })
+          .catch(() => {}),
+      });
     } catch (err) {
       log.error(`Failed to start quanter job ${jobId}`, { error: err.message });
       await db.patchJob(jobId, {
@@ -726,7 +767,7 @@ export function resumeJob({ client, job, resumeFrom }) {
   return runApprovedJob({ interaction: { channel: null, client }, job, resumeFrom });
 }
 
-export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
+export async function runApprovedJob({ interaction, job, resumeFrom = null, onThread = null }) {
   const {
     id: jobId,
     userId,
@@ -753,11 +794,14 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     donorBpw = null,
     sizeGb = 0,
     isMoe = false,
+    minVram = null,
     categories,
     provider,
     precheckedRepos = {},
   } = job;
   const category = (categories && categories[0]) || 'General';
+  const startedAt = resumeFrom ? job.startedAt ?? job.approvedAt ?? Date.now() : Date.now();
+  const estimate = job.card?.estimate ?? null;
 
   const channel =
     interaction.channel ||
@@ -771,15 +815,17 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
   const thread = resumeFrom
     ? await channel.threads.fetch(job.threadId).catch(() => null)
     : await channel.threads.create({
-        name: `⚡ ${modelId.split('/').pop()} [${username || 'request'}]`,
+        name: `${modelId.split('/').pop()} [${username || 'request'}]`,
         autoArchiveDuration: 1440,
       });
   if (!thread) throw new Error(`Progress thread ${job.threadId} is gone; nothing to resume into.`);
+  if (!resumeFrom) onThread?.(thread);
 
+  const firstRows = variants.map((v) => ({ variant: v, stage: 'Provisioning', overall: 0, provStep: 1 }));
   const progressMsg = resumeFrom
     ? await thread.messages.fetch(job.progressMessageId)
     : await thread.send({
-        embeds: [embeds.jobQueued({ url: modelId, bpws: variants, categories: [category], userId })],
+        embeds: [cards.progressCard(job, { rows: firstRows, startedAt, estimate })],
         components: [stopButtons(jobId)],
       });
 
@@ -793,6 +839,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         progressMessageId: progressMsg.id,
       });
 
+  // The local and API paths, which only know a stage and a percent.
   const updateEmbed = throttle(async (data) => {
     try {
       await progressMsg.edit({ embeds: [embeds.jobProgress({ url: modelId, userId, ...data })] });
@@ -801,66 +848,64 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     }
   });
 
-  // Assigned by the runpod path below; declared here so handleComplete/
-  // handleError can cancel its pending render before writing the final embed.
+  // Assigned by the runpod path below; declared here so finish() can cancel
+  // its pending render before the result goes up.
   let renderParallel = null;
 
-  async function handleComplete(results) {
-    try {
-      // Drop any pending throttled progress render so it can't fire after this
-      // and overwrite the final "Complete" embed with a stale frame.
-      renderParallel?.cancel();
-      await progressMsg.edit({
-        embeds: [embeds.jobComplete({ url: modelId, userId, results })],
-        components: [],
-      });
-      const outcome = jobOutcome(variants, results);
-      let completionNote;
-      if (outcome.allDone) {
-        completionNote = `<@${userId}> Your quantization is done! 🎉`;
-      } else if (outcome.status === 'completed') {
-        completionNote = `<@${userId}> Partly done -- ${outcome.failed.join(', ')} bpw failed.`;
-      } else {
-        completionNote = `<@${userId}> The quantization you asked for failed (${outcome.failed.join(', ')} bpw).`;
-      }
-      if (outcome.reason) completionNote += ` Reason: ${String(outcome.reason).slice(0, 300)}`;
-      if (!outcome.allDone) {
-        // A self-calibrated retry finds the donor on the hub and the finished
-        // stages in the cache, so it does not start over.
-        completionNote += ' Running the same command again picks up what finished.';
-      }
-      if (outcome.extras.length) {
-        completionNote += `\nAlso published: ${outcome.extras.join(', ')}`;
-      }
-      const actual = jobSpend(results);
-      if (actual) {
-        const q = job.quote;
-        completionNote += `\nRunPod: $${actual.cost.toFixed(2)} on ${actual.cards}`
-          + (q ? ` (quoted ~$${q.low.toFixed(2)}${q.high > q.low * 1.15 ? `, up to $${q.high.toFixed(2)}` : ''})` : '');
-      }
-      await thread.send(completionNote);
+  /**
+   * The job's one closing message. Posted new rather than edited in, because a
+   * mention only notifies on a new message, and the progress card is deleted
+   * so the thread ends on the result. Cross-linking runs first and quietly: its
+   * collection link goes on the card, and a failure there is the log's business.
+   */
+  async function finish(results, { error = null } = {}) {
+    renderParallel?.cancel();
+    const outcome = jobOutcome(variants, results);
+    const spend = jobSpend(results);
 
-      // Catbench: if a smoke-test reply was an SVG (e.g. "draw a kitten"),
-      // render it to PNG and post one per bpw so they can be compared. Static
-      // render, best-effort: a malformed/truncated SVG from the model is skipped.
+    let collectionUrl = null;
+    // Run for any exl3 job, whatever this run's tracking says: the finalizer
+    // finds the repos on HF, so it cross-links what landed even when a
+    // controller died after the upload.
+    if (format === 'exl3') {
       try {
-        const svgFiles = [];
-        for (const r of results) {
-          const svg = extractSvg(answerOf(r.sample));
-          if (!svg) continue;
-          try {
-            svgFiles.push({ attachment: renderSvgToPng(svg), name: `sample-${r.bpw}bpw.png` });
-          } catch (e) {
-            log.debug(`SVG render failed for ${r.bpw} bpw: ${e.message}`);
-          }
-        }
-        if (svgFiles.length) {
-          await thread.send({ content: '🎨 Rendered SVG replies:', files: svgFiles.slice(0, 10) });
-        }
+        const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
+        if (fin.ok && results.some((r) => r.pushed)) collectionUrl = fin.collectionUrl || null;
+        if (!fin.ok) log.warn(`cross-link for ${modelId} failed`);
       } catch (e) {
-        log.warn(`SVG attach skipped: ${e.message}`);
+        log.warn(`cross-link for ${modelId} failed: ${e.message}`);
       }
+    }
 
+    // A smoke-test reply that is an SVG goes up as a picture, one per bitrate.
+    const files = [];
+    for (const r of results) {
+      const svg = extractSvg(answerOf(r.sample));
+      if (!svg) continue;
+      try {
+        files.push({ attachment: renderSvgToPng(svg), name: `sample-${r.bpw}bpw.png` });
+      } catch (e) {
+        log.debug(`SVG render failed for ${r.bpw} bpw: ${e.message}`);
+      }
+    }
+
+    try {
+      const embed = cards.resultCard(job, { results, outcome, spend, startedAt, collectionUrl });
+      if (files.length) embed.setImage(`attachment://${files[0].name}`);
+      const msg = await thread.send({
+        content: `<@${userId}>`,
+        embeds: [embed],
+        files: files.slice(0, 10),
+        components: outcome.allDone ? [] : [retryButtons(jobId, outcome.failed, variants)],
+        allowedMentions: { users: [userId] },
+      });
+      await progressMsg.delete().catch((e) => log.debug(`progress card delete failed: ${e.message}`));
+      await db.patchJob(jobId, { resultMessageId: msg.id });
+    } catch (e) {
+      log.error('Could not post the result card', { error: e.message });
+    }
+
+    try {
       const models = await db.loadModels();
       models[modelId] = {
         url: modelId,
@@ -871,111 +916,86 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         completedAt: Date.now(),
       };
       await db.saveModels(models);
-
       await db.patchJob(jobId, {
         status: db.JOB_STATUS[outcome.status],
         // Against job.quote, to refit the quote from what jobs really cost.
-        actualCost: jobSpend(results),
+        actualCost: spend,
         completedAt: Date.now(),
         partialResults: results,
-      });
-    } catch (err) {
-      log.error('Completion callback error', { error: err.message });
-    }
-
-    // Re-sync ALL of this model's EXL3 cards + collection, so variants done in
-    // separate runs (or earlier) cross-reference each other. Run it for any
-    // exl3 job regardless of what THIS run's result tracking says: the finalizer
-    // discovers the actual uploaded repos from HF, so it cross-links whatever
-    // actually landed even when a controller died/was killed but the quant had
-    // already uploaded. Hoisted OUT of the try above (and the thread sends made
-    // non-fatal) so a dead thread / deleted progress message -- common when a
-    // job is force-cancelled, which is exactly when the cross-link was getting
-    // skipped -- can't stop the cross-link from running. Best-effort.
-    if (format === 'exl3') {
-      try {
-        await thread.send('Cross-linking model cards + collection...').catch(() => {});
-        const fin = await finalizeCollection({ modelId, hfOrg: config.HF_ORG });
-        await thread.send(
-          fin.ok
-            ? `Cards cross-linked${fin.collectionUrl ? ` · [collection](${fin.collectionUrl})` : ''}.`
-            : 'Cross-link/collection step had an issue (any uploaded quants are still on HF).'
-        ).catch(() => {});
-      } catch (e) {
-        log.debug(`finalize step failed: ${e.message}`);
-      }
-    }
-  }
-
-  async function handleError(err) {
-    try {
-      renderParallel?.cancel();
-      await progressMsg.edit({
-        embeds: [embeds.jobFailed({ url: modelId, userId, error: err.message })],
-        components: [],
-      });
-      await thread.send(`<@${userId}> Quantization failed.`);
-      await db.patchJob(jobId, {
-        status: db.JOB_STATUS.failed,
-        failedAt: Date.now(),
-        error: sanitizeErrorText(err.message),
+        ...(error ? { failedAt: Date.now(), error: sanitizeErrorText(error) } : {}),
       });
     } catch (e) {
-      log.error('Error callback error', { error: e.message });
+      log.error('Completion bookkeeping failed', { error: e.message });
     }
   }
+
+  const handleComplete = (results) => finish(results);
+  const handleError = (err) => finish(
+    variants.map((v) => ({ bpw: v, variant: v, url: null, pushed: false, reused: false, error: err.message })),
+    { error: err.message }
+  );
 
   // RunPod EXL3: one pod per variant, in parallel. Each run_runpod_job grabs
   // its own pod (unique name tag -> safe orphan cleanup) and quantizes a single
   // bpw, so per-pod volume is small (easier to find stock) and the variants
   // finish concurrently instead of one after another. Progress from all pods is
-  // aggregated into a single embed, one line per bpw.
+  // aggregated into a single card, one field per bpw.
   if (provider === 'runpod' && format === 'exl3') {
-    await db.patchJob(jobId, { status: db.JOB_STATUS.running, startedAt: Date.now() });
+    await db.patchJob(jobId, { status: db.JOB_STATUS.running, ...(resumeFrom ? {} : { startedAt }) });
 
     // Pod ids as the controllers announce them. /stop reads them back off the
     // job: the controller log is the other copy, and that one is only reachable
     // while the controller record still matches this job.
     const podIds = new Set(job.podIds ?? []);
+    // For "Cost so far": pods still up bill by the hour since they were seen,
+    // and the ones that are done by their [cost] lines.
+    const livePods = new Map();
+    let spentDone = 0;
 
     const pstate = {};
     variants.forEach((v) => {
-      pstate[v] = { stage: 'Provisioning', overall: 0, message: 'waiting for a GPU', startedAt: Date.now() };
+      pstate[v] = { variant: v, stage: 'Provisioning', overall: 0, provStep: 1 };
     });
-    // The rows the embed draws. Normally the requested bitrates, but a job that
-    // has to build its own donor first shows that too -- otherwise the embed
-    // sits on "Queued" for the whole donor conversion, which is the frozen
-    // embed this spent a long night getting rid of.
+    // The rows the card draws. Normally the requested bitrates, but a job that
+    // has to build its own donor first shows that too.
     let renderVariants = variants;
+    let lastFrame = '';
     renderParallel = throttle(async () => {
+      const now = Date.now();
+      let spent = spentDone;
+      for (const p of livePods.values()) spent += (p.rate * (now - p.at)) / 3_600_000;
+      const embed = cards.progressCard(job, {
+        rows: renderVariants.map((v) => pstate[v]),
+        startedAt,
+        spent: livePods.size || spentDone ? spent : null,
+        estimate,
+      });
+      // The cost ticks on its own, so compare the card without it: an edit only
+      // goes out when a row actually moved.
+      const frame = JSON.stringify(embed.toJSON().fields.filter((f) => f.name !== 'Cost so far'));
+      if (frame === lastFrame) return;
+      lastFrame = frame;
       try {
-        await progressMsg.edit({
-          embeds: [embeds.jobProgressParallel({
-            url: modelId, userId, variants: renderVariants, state: pstate,
-          })],
-        });
+        await progressMsg.edit({ embeds: [embed] });
       } catch (err) {
-        log.debug(`parallel embed edit failed: ${err.message}`);
+        log.debug(`progress card edit failed: ${err.message}`);
       }
     });
     renderParallel();
-    // Heartbeat: re-render every 15s so elapsed time ticks even during silent
-    // phases (the model download emits no events for ~10-15 min), so the embed
-    // never looks frozen.
-    const heartbeat = setInterval(() => renderParallel(), 15000);
 
     // Run one variant on its own pod, retrying the WHOLE thing on failure.
     // run_runpod_job can drop a variant to a transient post-create error
     // (SSH/API blip, rate limit) that spikes under concurrency; a fresh attempt
-    // almost always succeeds, and it self-heals in the embed instead of leaving
+    // almost always succeeds, and it self-heals in the card instead of leaving
     // a dead "Failed" line. Each attempt's pod self-terminates, so retries
     // never stack cost. The retry gate (err.retryable !== false) lives in
     // runVariantWithRetry: a signal-killed or pod-created failure is terminal,
     // so cancelling a broken model can't respawn a controller (the runaway).
     const MAX_ATTEMPTS = 3;
 
+    const ROW_KEYS = ['stage', 'overall', 'message', 'provStep', 'scStage', 'gpu', 'layer', 'layers', 'etaAt', 'dl'];
     // Progress handler shared by a fresh run and a resumed one, so a reattached
-    // job draws the same embed the original was drawing.
+    // job draws the same card the original was drawing.
     const onGroupProgress = (vs) => (d) => {
       if (d.podId && !podIds.has(d.podId)) {
         podIds.add(d.podId);
@@ -983,25 +1003,41 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
           log.debug(`could not record pod ${d.podId}: ${err.message}`)
         );
       }
+      if (d.podId && d.rate && !livePods.has(d.podId)) {
+        livePods.set(d.podId, { rate: d.rate, at: d.podAt || Date.now(), group: vs[0] });
+      }
       // Provisioning, download and calibration are one pod's work for the whole
-      // group, so every row in it shows them -- that is the truth, not a smear.
-      // Once the converter starts the stream names a bitrate, and only that row
-      // moves.
+      // group, so every row in it shows them. Once the converter starts the
+      // stream names a bitrate, and only that row moves.
       const targets = d.currentBPW && vs.includes(d.currentBPW) ? [d.currentBPW] : vs;
       for (const v of targets) {
-        pstate[v] = { ...pstate[v], stage: d.stage, overall: d.overall, message: d.message };
+        const row = { ...pstate[v] };
+        for (const k of ROW_KEYS) if (d[k] !== undefined && d[k] !== null) row[k] = d[k];
+        pstate[v] = row;
       }
       renderParallel();
     };
+
+    // A group's pods are done billing once it returns; what they cost is in
+    // its [cost] lines.
+    function settle(vs, costs) {
+      for (const [id, p] of livePods) if (p.group === vs[0]) livePods.delete(id);
+      spentDone += (costs || []).reduce((a, c) => a + c.cost, 0);
+    }
 
     // Each variant takes its own row's url/sample from the group's result.
     function markComplete(vs, res) {
       const byVariant = new Map((res || []).map((r) => [String(r.variant ?? r.bpw), r]));
       for (const x of vs) {
         const r = byVariant.get(String(x));
-        pstate[x] = { ...pstate[x], stage: 'Complete', overall: 100, message: 'done',
-                      url: r?.url ?? null, sample: r?.sample ?? null };
+        pstate[x] = { ...pstate[x], stage: r?.pushed ? 'Complete' : 'Failed', overall: r?.pushed ? 100 : pstate[x].overall,
+                      error: r?.error ?? null };
       }
+      renderParallel();
+    }
+
+    function markFailed(vs, err) {
+      for (const x of vs) pstate[x] = { ...pstate[x], stage: 'Failed', error: err.message };
       renderParallel();
     }
 
@@ -1014,13 +1050,12 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
       if (handle) {
         try {
           const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs), sc });
+          settle(vs, res[0]?.podCosts);
           markComplete(vs, res);
           return res;
         } catch (err) {
-          for (const x of vs) {
-            pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
-          }
-          renderParallel();
+          settle(vs, err.podCosts);
+          markFailed(vs, err);
           return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
         }
       }
@@ -1054,6 +1089,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               ngramBits,
               hq,
               donorRepo,
+              minVram,
               maxRuntimeH: podRuntimeHours({
                 sc: over.sc ?? sc, scLite: over.scLite ?? scLite, sizeGb, isMoe, nVariants: vs.length,
               }),
@@ -1061,9 +1097,11 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
               onProgress: onGroupProgress(vs),
             }).catch((err) => {
               if (err.podCosts) spent.push(...err.podCosts);
+              settle(vs, err.podCosts);
               throw err;
             });
             if (res[0]?.podCosts) spent.push(...res[0].podCosts);
+            settle(vs, res[0]?.podCosts);
             markComplete(vs, res);
             return res;
           },
@@ -1075,10 +1113,7 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
           },
         }));
       } catch (err) {
-        for (const x of vs) {
-          pstate[x] = { ...pstate[x], stage: 'Failed', overall: 0, message: err.message };
-        }
-        renderParallel();
+        markFailed(vs, err);
         return withSpend(vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message })));
       }
     }
@@ -1093,7 +1128,8 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     let donorResult = null;
     if (sc && !effDonorRepo && donorBpw) {
       renderVariants = [donorBpw, ...variants];
-      pstate[donorBpw] = { stage: 'Queued', overall: 0, message: 'donor for self-calibration' };
+      pstate[donorBpw] = { variant: donorBpw, label: `${donorBpw} bpw donor`, stage: 'Provisioning', overall: 0, provStep: 1 };
+      for (const v of variants) pstate[v] = { ...pstate[v], stage: 'Queued', message: 'Waiting for the donor' };
       renderParallel();
       // A plain build with exllamav3's defaults, whatever the job pinned: it is
       // published as a plain quant and found again by its plain name, and a
@@ -1105,13 +1141,14 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
         ? res[0].url.replace('https://huggingface.co/', '')
         : null;
       if (!effDonorRepo) {
-        const why = res?.[0]?.error || 'no upload URL';
-        await handleError(new Error(
-          `Could not build the ${donorBpw}bpw donor self-calibration needs: ${why}`));
+        const why = cards.errorLine(res?.[0]?.error || 'no upload URL seen');
+        await finish([{ ...res[0], donor: true },
+          ...variants.map((v) => ({ bpw: v, variant: v, url: null, pushed: false, reused: false,
+            error: `The ${donorBpw} bpw donor failed: ${why}` }))]);
         return { thread };
       }
       // It is a real published quant, not scaffolding, so it belongs in the
-      // completion embed alongside the variant that was asked for.
+      // result alongside the variant that was asked for.
       donorResult = { ...res[0], donor: true };
       log.info(`built SC donor ${effDonorRepo} for ${modelId}`);
       await db.patchJob(jobId, { donorRepo: effDonorRepo })
@@ -1119,30 +1156,31 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
     }
 
     const groups = podGroups(variants, sc);
-    let settled;
-    try {
-      settled = await Promise.all(
-        // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
-        groups.map((g, i) =>
-          new Promise((r) => setTimeout(r, i * 4000))
-            // The drafter rides on the first pod only; one copy is enough.
-            .then(() => runGroup(g, { donorRepo: effDonorRepo, draftModel: i === 0 ? draftModel : null }))
-        )
-      );
-    } finally {
-      clearInterval(heartbeat);
-    }
+    const settled = await Promise.all(
+      // Stagger starts so 3 controllers don't hit the RunPod API in lockstep.
+      groups.map((g, i) =>
+        new Promise((r) => setTimeout(r, i * 4000))
+          // The drafter rides on the first pod only; one copy is enough.
+          .then(() => runGroup(g, { donorRepo: effDonorRepo, draftModel: i === 0 ? draftModel : null }))
+      )
+    );
     // Killing the controllers fails every variant, so the normal completion
-    // path would write "Complete" over the stop card and patch the status back
-    // to completed. A stopped job is already final.
+    // path would post a failure over the stop. A stopped job is already final.
     const after = (await db.loadJobs().catch(() => ({})))[jobId];
+    const results = [...(donorResult ? [donorResult] : []), ...settled.flat()];
     if (after?.status === db.JOB_STATUS.stopped) {
       renderParallel.cancel();
       await progressMsg
-        .edit({ embeds: [stoppedEmbed(after)], components: [] })
-        .catch((err) => log.debug(`stopped embed edit failed: ${err.message}`));
+        .edit({
+          embeds: [cards.stoppedCard(after, {
+            where: whereNow(renderVariants.map((v) => pstate[v])), spend: jobSpend(results), startedAt,
+          })],
+          components: [],
+        })
+        .catch((err) => log.debug(`stopped card edit failed: ${err.message}`));
+      await db.patchJob(jobId, { actualCost: jobSpend(results), partialResults: results }).catch(() => {});
     } else {
-      await handleComplete([...(donorResult ? [donorResult] : []), ...settled.flat()]);
+      await finish(results);
     }
     return { thread };
   }
@@ -1214,4 +1252,76 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null }) {
   }
 
   return { thread };
+}
+
+// ── Retry ───────────────────────────────────────────────────────────────────
+
+const VRAM_TIERS = [24, 32, 48, 80, 96];
+const inFlightRetries = new Set();
+
+/**
+ * The floor a retry should rent at. Out of memory on one card means the next
+ * size up, whether it was the GPU or the pod's RAM that ran out: RunPod gives
+ * bigger cards bigger pods.
+ */
+export function retryMinVram(errors, prev = null) {
+  if (!errors.some((e) => /^Out of (GPU memory|system RAM)/.test(String(e || '')))) return prev;
+  const card = Math.max(prev || 24, ...errors.map((e) => Number(/\((\d+) GB card\)/.exec(e || '')?.[1] || 0)));
+  return VRAM_TIERS.find((t) => t > card) ?? 96;
+}
+
+// Fields a retry starts afresh rather than copies.
+const RUN_STATE = ['status', 'createdAt', 'approvedAt', 'approvedBy', 'startedAt', 'resumedAt', 'completedAt',
+  'failedAt', 'stoppedAt', 'stoppedBy', 'stoppedPods', 'rejectedAt', 'rejectedBy', 'error', 'threadId',
+  'progressMessageId', 'cardMessageId', 'resultMessageId', 'podIds', 'partialResults', 'actualCost', 'quote',
+  'retriedAs'];
+
+/**
+ * The Retry button on a failed or partial result: a new request for what did
+ * not land, posted for approval like any other. The requester or an admin.
+ */
+export async function handleRetry(interaction) {
+  const jobId = interaction.customId.split(':')[2];
+  const job = (await db.loadJobs())[jobId];
+  const reply = (content) => interaction.reply({ content, flags: MessageFlags.Ephemeral });
+  if (!job) return reply('That job is no longer on record.');
+  if (job.userId !== interaction.user.id && !config.ADMIN_IDS.includes(interaction.user.id)) {
+    return reply('Only the requester or an admin can retry this.');
+  }
+  if (job.retriedAs || inFlightRetries.has(jobId)) return reply('This job was already retried.');
+  inFlightRetries.add(jobId);
+  try {
+    const failed = (job.partialResults || []).filter((r) => !r.pushed && !r.donor && !r.drafter);
+    const variants = failed.length ? failed.map((r) => String(r.variant ?? r.bpw)) : job.variants;
+    const minVram = retryMinVram(failed.map((r) => r.error), job.minVram);
+    const id = randomUUID();
+    const fresh = Object.fromEntries(Object.entries(job).filter(([k]) => !RUN_STATE.includes(k)));
+    const next = {
+      ...fresh,
+      id,
+      status: db.JOB_STATUS.pending_approval,
+      createdAt: Date.now(),
+      variants,
+      bpws: variants.map(Number),
+      minVram,
+      alreadyUploaded: [],
+      retryOf: jobId,
+    };
+    const q = await quoteCost(variants.length, { ...(job.costOpts || {}), minVram: minVram || undefined })
+      .catch(() => null);
+    const bal = await getBalance().catch(() => null);
+    next.card = { ...(job.card || {}), ...quoteFacts(q), balance: bal?.balance ?? null, options: optionsLine(next),
+                  note: null };
+    if (q) next.quote = { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null };
+    await db.upsertJob(next);
+    await db.patchJob(jobId, { retriedAs: id });
+
+    const channel = await interaction.client.channels.fetch(job.channelId).catch(() => null);
+    if (!channel) return reply('The channel this job came from is gone.');
+    await postRequest({ channel, client: interaction.client, job: next });
+    // The button has done its job.
+    await interaction.update({ components: [] });
+  } finally {
+    inFlightRetries.delete(jobId);
+  }
 }

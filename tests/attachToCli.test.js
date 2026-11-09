@@ -99,6 +99,29 @@ describe('attachToCli', () => {
     expect(out[0].treeUrl).toBe(`https://huggingface.co/o/m-exl3-4.0bpw/tree/${sha}`);
   });
 
+  it('reads the card, layer, KL and size the result card shows', async () => {
+    const handle = fakeHandle();
+    const seen = [];
+    const p = attachToCli(handle, { variants: ['4.0'], onProgress: (d) => seen.push(d) });
+    fs.appendFileSync(handle.logPath,
+      '      Pod ID: nrx  (GPU: NVIDIA GeForce RTX 4090, SECURE, ~$0.89/hr)\n'
+      + '[download] 43% (31.0/55.6 GB)\n'
+      + '[progress] quantize 4.0 43% (layer 28/64) eta 24m\n'
+      + '[kl] 4.0 measuring KL vs fp16 ...\n'
+      + '[kl] 4.0 KL(fp16||quant) median 0.031500 mean 0.071600\n'
+      + '[upload] 4.0 size 15.9 GB\n'
+      + '[upload] 4.0 done -> https://huggingface.co/o/m-exl3-4.0bpw\n');
+    await new Promise((r) => setTimeout(r, 30));
+    h.finish(0, null);
+    const out = await p;
+    expect(out[0]).toMatchObject({ kl: 0.0315, sizeGb: 15.9, gpu: 'NVIDIA GeForce RTX 4090' });
+    expect(seen.find((d) => d.dl)?.dl).toEqual({ done: 31, total: 55.6 });
+    const q = seen.find((d) => d.layer);
+    expect(q).toMatchObject({ layer: 28, layers: 64, rate: 0.89 });
+    expect(Math.round((q.etaAt - Date.now()) / 60000)).toBe(24);
+    expect(seen.some((d) => d.stage === 'Measuring KL')).toBe(true);
+  });
+
   it('reports the controller error when it dies with no upload', async () => {
     const handle = fakeHandle();
     const p = attachToCli(handle, { variants: ['4.0'], onProgress: () => {} });

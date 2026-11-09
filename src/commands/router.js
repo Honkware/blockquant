@@ -1,6 +1,6 @@
 import { getLogger } from '../logger.js';
 import { MessageFlags } from 'discord.js';
-import { handleQuant } from './quant.js';
+import { handleQuant, handleRetry } from './quant.js';
 import { handleCatbench, autocompleteCatbench } from './catbench.js';
 import { handleApproval } from './approval.js';
 import { handleStop, handleStopButton } from './stop.js';
@@ -35,6 +35,7 @@ export async function routeCommand(interaction) {
   if (interaction.isButton()) {
     try {
       if (interaction.customId.startsWith('bq:stop:')) await handleStopButton(interaction);
+      else if (interaction.customId.startsWith('bq:retry:')) await handleRetry(interaction);
       else await handleApproval(interaction);
     } catch (err) {
       log.error('Error handling button', { error: err.message, stack: err.stack });

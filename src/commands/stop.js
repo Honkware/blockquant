@@ -4,6 +4,7 @@ import { getLogger } from '../logger.js';
 import config from '../config.js';
 import * as db from '../services/db.js';
 import * as embeds from '../utils/embeds.js';
+import { stoppedCard, threadRow } from '../utils/cards.js';
 import { list as listControllers } from '../services/detached.js';
 import { terminatePod } from '../services/runpod.js';
 import { isAdmin, isQuanter } from '../services/access.js';
@@ -33,20 +34,6 @@ export function stopButtons(jobId) {
   );
 }
 
-export function stoppedEmbed(job) {
-  return embeds.warning(
-    'Job stopped',
-    [
-      `**Model:** [\`${job.modelId}\`](https://huggingface.co/${job.modelId})`,
-      `**Variants:** ${(job.variants ?? []).join(', ') || '—'}`,
-      `**Requested by:** <@${job.userId}>`,
-      job.stoppedBy ? `**Stopped by:** <@${job.stoppedBy}>` : '',
-      job.stoppedPods?.length ? `**Pods terminated:** ${job.stoppedPods.join(', ')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n')
-  );
-}
 
 /** Admins stop anything; a quanter stops their own; nobody else stops at all. */
 export async function canStop({ userId, member, job }) {
@@ -139,27 +126,26 @@ export async function stopJob(
   return { pods: terminated, failedPods: failed, killed };
 }
 
-/** Rewrite the request card and the progress embed, and say so in the thread. */
+/**
+ * Turn the progress card into a stop card, and take the Stop button off the
+ * request card. No message: a stop is someone's own decision, so it pings
+ * nobody. The run's own completion rewrites the card again with what it cost,
+ * when the bot that started it is still alive to.
+ */
 async function announceStopped(client, jobId) {
   const job = (await db.loadJobs().catch(() => ({})))[jobId];
   if (!job) return;
-  const embed = stoppedEmbed(job);
+  const thread = job.threadId ? await client.channels.fetch(job.threadId).catch(() => null) : null;
 
   const channel = job.channelId ? await client.channels.fetch(job.channelId).catch(() => null) : null;
   if (channel && job.cardMessageId) {
     const card = await channel.messages.fetch(job.cardMessageId).catch(() => null);
-    await card?.edit({ embeds: [embed], components: [] }).catch(() => {});
+    await card?.edit({ components: thread ? [threadRow(thread.url)] : [] }).catch(() => {});
   }
-
-  const thread = job.threadId ? await client.channels.fetch(job.threadId).catch(() => null) : null;
-  if (!thread) return;
-  if (job.progressMessageId) {
+  if (thread && job.progressMessageId) {
     const msg = await thread.messages.fetch(job.progressMessageId).catch(() => null);
-    await msg?.edit({ embeds: [embed], components: [] }).catch(() => {});
+    await msg?.edit({ embeds: [stoppedCard(job)], components: [] }).catch(() => {});
   }
-  await thread
-    .send(`<@${job.userId}> this job was stopped by <@${job.stoppedBy}>. Its pods are terminated.`)
-    .catch(() => {});
 }
 
 function summary(result) {

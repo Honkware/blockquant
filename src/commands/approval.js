@@ -2,7 +2,7 @@ import { MessageFlags } from 'discord.js';
 import { getLogger } from '../logger.js';
 import config from '../config.js';
 import * as db from '../services/db.js';
-import * as embeds from '../utils/embeds.js';
+import { requestCard, threadRow } from '../utils/cards.js';
 import { runApprovedJob } from './quant.js';
 import { toUserMessage } from '../errors/taxonomy.js';
 
@@ -63,17 +63,9 @@ export async function handleApproval(interaction) {
   }
   inFlightApprovals.add(jobId);
 
-  // Lock the buttons immediately so a second admin can't double-act.
-  const decidedEmbed = (verb, color) =>
-    embeds[color](
-      `Request ${verb}`,
-      [
-        `**Model:** [\`${job.modelId}\`](https://huggingface.co/${job.modelId})`,
-        `**Variants:** ${job.variants.join(', ')}`,
-        `**Requested by:** <@${job.userId}>`,
-        `**${verb} by:** <@${interaction.user.id}>`,
-      ].join('\n')
-    );
+  // The same card, edited in place: who decided and when, buttons gone so a
+  // second admin can't double-act.
+  const decided = (state) => requestCard(job, { state, by: interaction.user.id, at: Date.now() });
 
   try {
     if (action === 'deny') {
@@ -82,7 +74,7 @@ export async function handleApproval(interaction) {
         rejectedAt: Date.now(),
         rejectedBy: interaction.user.id,
       });
-      await interaction.update({ embeds: [decidedEmbed('Denied', 'warning')], components: [] });
+      await interaction.update({ embeds: [decided('denied')], components: [] });
       log.info(`Request ${jobId} denied by ${interaction.user.tag}`);
       return true;
     }
@@ -106,10 +98,14 @@ export async function handleApproval(interaction) {
         approvedAt: Date.now(),
         approvedBy: interaction.user.id,
       });
-      await interaction.update({ embeds: [decidedEmbed('Approved', 'success')], components: [] });
+      await interaction.update({ embeds: [decided('approved')], components: [] });
       log.info(`Request ${jobId} approved by ${interaction.user.tag}`);
       try {
-        await runApprovedJob({ interaction, job });
+        await runApprovedJob({
+          interaction,
+          job,
+          onThread: (t) => interaction.message.edit({ components: [threadRow(t.url)] }).catch(() => {}),
+        });
       } catch (err) {
         log.error(`Failed to start approved job ${jobId}`, { error: err.message });
         await db.patchJob(jobId, {

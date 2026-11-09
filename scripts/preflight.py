@@ -69,6 +69,18 @@ def model_facts(cfg: dict) -> dict:
     }
 
 
+_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
+
+
+def _params_b(cfg: dict, size_gb: float) -> float | None:
+    """Parameters in billions, off the weight size and the dtype the config
+    declares, for the request card. None when the dtype says nothing useful."""
+    dt = (cfg.get("torch_dtype") or cfg.get("dtype")
+          or (cfg.get("text_config") or {}).get("torch_dtype"))
+    n = _DTYPE_BYTES.get(str(dt))
+    return round(size_gb / n, 1) if n and size_gb else None
+
+
 def _weight_gb(model_id: str, token: str, subfolder: str = "") -> float:
     """Total weight-file size in GB, or 0 when it cannot be read.
 
@@ -183,6 +195,7 @@ def main():
                                        f"so this model cannot be quantized to EXL3.")
                 result.update(model_facts(cfg))
                 result["sizeGb"] = _weight_gb(args.model, token)
+                result["paramsB"] = _params_b(cfg, result["sizeGb"])
                 if result.get("hasVision"):
                     result["visionBitsAuto"] = auto_vision_bits(arch)
             except GatedRepoError:
@@ -215,6 +228,7 @@ def main():
                     result.update({k: pick[k] for k in ("hasVision", "isMoe", "numExperts")})
                     # Without it the quote priced an unknown-size model.
                     result["sizeGb"] = _weight_gb(args.model, token, pick["path"])
+                    result["paramsB"] = _params_b(pick.get("config") or {}, result["sizeGb"])
                     if pick["hasVision"]:
                         result["visionBitsAuto"] = auto_vision_bits(pick["architecture"])
                 else:
