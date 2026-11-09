@@ -272,7 +272,8 @@ def _explain(lines: list[str], outcome: str, error: str = "", vram_gb: int | Non
         return f"Disk full {where}"
     if ex.get("code") == 137:
         if ex["oom"].isdigit() and int(ex["oom"]) > 0:
-            lim = f" ({int(ex['mem']) / 1e9:.0f} GB pod)" if ex["mem"].isdigit() else ""
+            gb = int(ex["mem"]) / 1e9 if ex["mem"].isdigit() else None
+            lim = f" ({gb:.0f} GB pod)" if gb and gb >= 10 else f" ({gb:.1f} GB pod)" if gb else ""
             return f"Out of system RAM {where}{lim}"
         return f"Killed by signal 9 {where}"
     if ex.get("code") == 139 or "Segmentation fault" in err:

@@ -43,6 +43,17 @@ def test_an_oom_kill_names_ram_and_the_module(explain):
     assert got == "Out of system RAM at lm_head (49 GB pod)"
 
 
+def test_a_small_limit_keeps_a_decimal(explain):
+    # What the runner printed in a 256 MB docker container on cgroup v2.
+    got = explain(KILLED_AT_HEAD + ["[exit] code=137 oom_kills=1 mem_limit=268435456"], "no_result")
+    assert got == "Out of system RAM at lm_head (0.3 GB pod)"
+
+
+def test_an_unlimited_container_names_no_size(explain):
+    got = explain(KILLED_AT_HEAD + ["[exit] code=137 oom_kills=1 mem_limit=max"], "no_result")
+    assert got == "Out of system RAM at lm_head"
+
+
 def test_a_kill_without_the_counter_says_only_what_is_known(explain):
     got = explain(KILLED_AT_HEAD + ["[exit] code=137 oom_kills=? mem_limit=?"], "no_result")
     assert got == "Killed by signal 9 at lm_head"
