@@ -1795,19 +1795,11 @@ def main() -> int:
         # download progress. Errors from the thread are re-raised on the main
         # thread so the normal failure path still runs.
         import threading
-        # Total repo size up front so the heartbeat can report a percent.
-        _want = f"{subfolder}/" if subfolder else ""
+        from weights import repo_weights
         # The base model's commit, resolved once and downloaded at, so what was
         # quantized is a fixed revision and not whatever main was at the time.
         # A push to the base mid-download would otherwise mix two of them.
         base_revision = None
-        try:
-            _info = HfApi(token=hf_token or None).model_info(model_id, files_metadata=True)
-            _total_gb = sum((s.size or 0) for s in (_info.siblings or [])
-                            if s.rfilename.startswith(_want)) / 1e9
-            base_revision = getattr(_info, "sha", None)
-        except Exception:
-            _total_gb = 0.0
         if kl_only_repos:
             # The commit the quants were built from: main may have moved since.
             try:
@@ -1818,6 +1810,19 @@ def main() -> int:
             except Exception as e:
                 print(f"[kl] WARN no blockquant.json to pin the base from ({type(e).__name__}); "
                       f"using main", flush=True)
+        # Only the files that make up the model (see weights.py), and their size
+        # up front so the heartbeat can report a percent.
+        _files = None
+        try:
+            _info, _files, _nbytes = repo_weights(model_id, hf_token, subfolder or "", base_revision)
+            _total_gb = _nbytes / 1e9
+            base_revision = base_revision or getattr(_info, "sha", None)
+        except Exception as e:
+            print(f"[download] WARN could not list the weights ({type(e).__name__}); "
+                  f"fetching the whole repo", flush=True)
+            _total_gb = 0.0
+        if not _files:
+            _files = [f"{subfolder}/*"] if subfolder else None
         _what = f"{model_id}/{subfolder}" if subfolder else model_id
         print(f"[download] {_what} ({_total_gb:.1f} GB) at {base_revision or 'main'} ...", flush=True)
         _dl_done = threading.Event()
@@ -1830,7 +1835,7 @@ def main() -> int:
                     revision=base_revision,
                     local_dir=str(model_dir),
                     token=hf_token or None,
-                    allow_patterns=[f"{subfolder}/*"] if subfolder else None,
+                    allow_patterns=_files,
                 )
             except Exception as exc:  # surfaced after join()
                 _dl_err["exc"] = exc

@@ -16,6 +16,7 @@ from pathlib import Path
 # hand-written copy that used to live here had drifted 16 architectures behind,
 # and every one of them was turned away with "exllamav3 does not support it".
 _ARCH_SUPPORT = Path(__file__).resolve().parent.parent / "backend" / "arch_support.json"
+_WEIGHTS = Path(__file__).resolve().parent.parent / "backend" / "src" / "blockquant" / "weights.py"
 
 
 def auto_vision_bits(arch: str) -> int:
@@ -73,21 +74,17 @@ def _weight_gb(model_id: str, token: str, subfolder: str = "") -> float:
 
     The bot needs this before a pod exists: the cost band was a flat per-variant
     number that knew nothing about the model, so a 0.8B and a 70B quoted the
-    same figure. Only the weights count -- tokenizer and config files are noise
-    at this scale.
+    same figure. Only the shards the pod will download count, which is what the
+    launcher sizes from too (backend/src/blockquant/weights.py).
     """
     try:
-        from huggingface_hub import HfApi
-        total = 0
-        for e in HfApi().list_repo_tree(model_id, token=token or None,
-                                        path_in_repo=subfolder or None, recursive=True):
-            if type(e).__name__ != "RepoFile":
-                continue
-            if e.path.endswith((".safetensors", ".bin", ".pt", ".gguf")):
-                total += getattr(e, "size", 0) or 0
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bq_weights", _WEIGHTS)
+        w = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(w)
         # GB, not GiB: the launcher sizes caps, floors and disk in 1e9, and the
         # quote has to agree with it about how big the model is.
-        return round(total / 1e9, 2)
+        return round(w.repo_weights(model_id, token, subfolder)[2] / 1e9, 2)
     except Exception:
         return 0.0
 
