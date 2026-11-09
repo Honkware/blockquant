@@ -68,7 +68,7 @@ Each published repo carries `blockquant.json` (the base model's commit, the exll
 
 ## Which card, and what it costs
 
-`backend/gpu_table.json` holds each card's fallback price and its conversion speed against an RTX 3090, measured where the file says so and estimated from the architecture otherwise. The launcher sorts candidates by price over speed and tries each on community before secure, under a per-size price cap. A plain job also needs enough VRAM to load the unquantized model for its KL number, so a 27B goes to an 80-96 GB card, not the cheapest 24 GB one.
+`backend/gpu_table.json` holds each card's fallback price and its conversion speed against an RTX 3090, measured where the file says so and estimated from the architecture otherwise. The launcher sorts candidates by price over speed and tries each on community before secure, under a per-size price cap. A plain job also needs enough VRAM to load the unquantized model for its KL number, so a 27B goes to an 80-96 GB card, not the cheapest 24 GB one. When converting on the cheapest card and renting the big one only for KL saves at least `kl_split_min_saving` (a big MoE, mostly), the launcher does that instead: the quant goes up from the first pod, and a second, short one adds the KL number and the card. `BLOCKQUANT_KL_SPLIT=0` turns it off. MoE conversions take `moe_factor` times what their size says.
 
 The bot's quote runs the same selection against RunPod's live prices and stock. Every pod reports what it actually cost when it exits, and the completion message puts that next to the quote.
 

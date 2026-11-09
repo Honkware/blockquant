@@ -898,3 +898,27 @@ def test_cfg_carries_gpu_count(mock_ensure_rp, mock_ensure_pk, mock_ssh_key):
     assert _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key)["gpu_count"] == 1
     cfg = _pipeline_cfg(mock_ensure_rp, mock_ensure_pk, mock_ssh_key, gpu_count=4)
     assert cfg["gpu_count"] == 4
+
+
+@patch("blockquant.providers.runpod.provider._ensure_paramiko")
+@patch("blockquant.providers.runpod.provider._ensure_runpod")
+def test_a_split_job_turns_kl_off_only_on_the_conversion_pod(mock_ensure_rp, mock_ensure_pk,
+                                                            mock_ssh_key, monkeypatch):
+    monkeypatch.setenv("BLOCKQUANT_KL_EVAL", "1")
+    provider, _ = _make_pipeline_provider_and_client(
+        mock_ensure_rp, mock_ensure_pk, mock_ssh_key
+    )
+    cfgs = []
+
+    def _capture(instance_id, data, remote_path, mode=None):
+        if remote_path == "/root/bq-config.json":
+            cfgs.append(json.loads(data))
+
+    with patch.object(provider, "_upload_bytes", side_effect=_capture):
+        for kw in ({}, {"kl_eval": False},
+                   {"kl_only_repos": ["o/M-exl3-4.0bpw"], "drafter_repo": "o/D"}):
+            provider.run_pipeline(instance_id="pod-abc123", model_id="foo/bar",
+                                  format="exl3", variants=["4.0"], **kw)
+    assert [c["kl_eval"] for c in cfgs] == [True, False, True]
+    assert [c["kl_only_repos"] for c in cfgs] == [[], [], ["o/M-exl3-4.0bpw"]]
+    assert cfgs[2]["drafter_repo"] == "o/D"

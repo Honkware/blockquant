@@ -1014,6 +1014,9 @@ class RunPodProvider(Provider):
         hq: int | None = None,
         draft_model: str = "",
         job_id: str = "",
+        kl_eval: bool | None = None,
+        kl_only_repos: list[str] | None = None,
+        drafter_repo: str = "",
     ) -> dict:
         """Start the remote quant script in the background. Returns immediately.
 
@@ -1027,8 +1030,11 @@ class RunPodProvider(Provider):
         # Forward KL(fp16||quant) runs for every job by default -- the fp16 is
         # already on the pod, so it's just one extra forward pass (best-effort:
         # skips if the fp16 won't fit the GPU, e.g. a big MoE like Mixtral). Set
-        # BLOCKQUANT_KL_EVAL=0 to turn it off globally.
-        kl_eval = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
+        # BLOCKQUANT_KL_EVAL=0 to turn it off globally. The launcher turns it
+        # off for a conversion it has sent to a card too small for the fp16,
+        # and runs it on a second pod (kl_only_repos) afterwards.
+        if kl_eval is None:
+            kl_eval = os.environ.get("BLOCKQUANT_KL_EVAL", "1").strip().lower() not in ("0", "false", "no", "")
         # Backfilling KL into existing sibling quants re-downloads each of them,
         # so that stays opt-in per base via BLOCKQUANT_KL_BACKFILL_MODELS.
         _bf_allow = {m.strip() for m in
@@ -1064,6 +1070,8 @@ class RunPodProvider(Provider):
             # Forward KL per new variant (default on); sibling backfill opt-in.
             "kl_eval": kl_eval,
             "backfill_kl": backfill_kl,
+            "kl_only_repos": list(kl_only_repos or []),
+            "drafter_repo": drafter_repo or "",
             # exllamav3's convert defaults to --devices 0, so without this the
             # extra cards on a multi-GPU pod sit idle and bill.
             "gpu_count": self.gpu_count,

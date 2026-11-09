@@ -68,16 +68,42 @@ export function planPods(gpuTypes, { sizeGb = 0, sc = false, kl = true, gpus = 1
 export function convertHoursOn(pod, { sizeGb = 0, isMoe = false, gpus = 1, kl = true } = {}) {
   const gb = Number(sizeGb) || 0;
   const scale = Math.max(1, gpus || 1) ** TABLE.gpu_scaling;
-  const convert = (gb * TABLE.base_min_per_gb) / 60 / (pod?.speed || 1) / scale;
+  // An MoE takes about 3.45x what its size says, on whatever card: two jobs
+  // on two cards agree (moe_note in gpu_table.json).
+  const convert = (gb * TABLE.base_min_per_gb) / 60 / (pod?.speed || 1) / scale
+    * (isMoe ? TABLE.moe_factor : 1);
   return {
     // ~4 min to boot, ~1 GB/s down, an upload in under a minute: the logs.
     overhead: 0.08 + gb / 3600,
     convert,
-    // Nothing has timed a MoE conversion on this build; they have many times
-    // the tensors, so the high end allows for three times as long.
-    convertHigh: isMoe ? convert * 3 : convert * 1.15,
+    convertHigh: convert * 1.15,
     kl: kl ? 0.03 : 0,
   };
+}
+
+/**
+ * Whether the launcher converts on the cheapest card and rents one that holds
+ * the fp16 only for the KL eval, and that card's VRAM floor. Mirrors the split
+ * in run_runpod_job.py's main and _kl_split_saving: static prices, cards ranked
+ * without the cap, one pod per bitrate.
+ */
+export function klSplit(gpuTypes, { sizeGb = 0, isMoe = false, sc = false, kl = true, gpus = 1,
+  split = true } = {}) {
+  if (!split || sc || !kl || gpus !== 1 || !sizeGb) return null;
+  const floor = vramFloor({ sizeGb });
+  if (floor <= MIN_VRAM) return null;
+  const ranked = (min) => (gpuTypes || [])
+    .filter((g) => g?.id && !excluded(g.id) && (g.memoryInGb || 0) >= min)
+    .sort((a, b) => staticPrice(a.id) / convertSpeed(a.id) - staticPrice(b.id) / convertSpeed(b.id)
+      || (b.memoryInGb || 0) - (a.memoryInGb || 0));
+  const [big] = ranked(floor);
+  const [small] = ranked(MIN_VRAM);
+  if (!big || !small || big.id === small.id) return null;
+  const b = convertHoursOn({ speed: convertSpeed(big.id) }, { sizeGb, isMoe });
+  const s = convertHoursOn({ speed: convertSpeed(small.id) }, { sizeGb, isMoe, kl: false });
+  const whole = (b.overhead + b.convert + b.kl) * staticPrice(big.id);
+  const twoPods = (s.overhead + s.convert) * staticPrice(small.id) + (b.overhead + b.kl) * staticPrice(big.id);
+  return whole - twoPods >= TABLE.kl_split_min_saving ? { floor, saving: whole - twoPods } : null;
 }
 
 // How far down the sweep the high end looks. RunPod's stock flag is per card,
@@ -92,13 +118,15 @@ const FALLBACK_DEPTH = 4;
  */
 export function quoteJob(gpuTypes, {
   variants = 1, sizeGb = 0, isMoe = false, sc = false, scLite = false,
-  needsDonor = false, gpus = 1, kl = true,
+  needsDonor = false, gpus = 1, kl = true, split = true,
 } = {}) {
   const n = Math.max(0, variants || 0);
-  const pods = planPods(gpuTypes, { sizeGb, sc, kl, gpus });
+  // A split job converts with KL off and pays a second, short pod for it.
+  const splitKl = klSplit(gpuTypes, { sizeGb, isMoe, sc, kl, gpus, split });
+  const pods = planPods(gpuTypes, { sizeGb, sc, kl: kl && !splitKl, gpus });
   if (!pods.length) return null;
   const best = pods[0];
-  const opts = { sizeGb, isMoe, gpus, kl };
+  const opts = { sizeGb, isMoe, gpus, kl: kl && !splitKl };
   const overhead = (pod) => convertHoursOn(pod, opts).overhead;
   const perVariant = (pod, high) => {
     const h = convertHoursOn(pod, opts);
@@ -129,8 +157,20 @@ export function quoteJob(gpuTypes, {
       high += donor.high;
     }
   }
+  let klPod = null;
+  if (splitKl) {
+    // Its own boot and fp16 download, then the eval.
+    const kp = planPods(gpuTypes, { sizeGb, kl: true, gpus });
+    const leg = (pod) => n * (convertHoursOn(pod, { sizeGb, gpus }).overhead + 0.03) * pod.rate;
+    if (kp.length) {
+      klPod = { pod: kp[0], low: leg(kp[0]),
+                high: Math.max(...kp.slice(0, FALLBACK_DEPTH).map(leg)) };
+      low += klPod.low;
+      high += klPod.high;
+    }
+  }
   return { low, high: Math.max(high, low), best, next: next === best ? null : next,
-           hours: { low: lowH, high: highH }, donor };
+           hours: { low: lowH, high: highH }, donor, klPod };
 }
 
 let cache = { at: 0, data: null };
@@ -166,7 +206,12 @@ export async function liveGpuTypes(gpus = 1) {
  */
 export async function quoteCost(variantCount, opts = {}) {
   const live = await liveGpuTypes(opts.gpuCount || 1);
-  const q = live && quoteJob(live, { ...opts, variants: variantCount, gpus: opts.gpuCount || 1 });
+  // The launcher's switches, read the way it reads them.
+  const on = (v) => !['0', 'false', 'no', ''].includes(String(v ?? '1').trim().toLowerCase());
+  const q = live && quoteJob(live, {
+    kl: on(process.env.BLOCKQUANT_KL_EVAL), split: on(process.env.BLOCKQUANT_KL_SPLIT),
+    ...opts, variants: variantCount, gpus: opts.gpuCount || 1,
+  });
   if (q) return { ...q, sc: !!opts.sc, donor: !!opts.needsDonor, live: true };
   return { ...estimateCost(variantCount, opts), live: false };
 }
@@ -178,7 +223,8 @@ export async function costPreflightLine(variantCount, opts = {}) {
   // which is most of what a self-calibrated 0.8B costs.
   const fmt = (v) => (v < 10 ? v.toFixed(2) : v.toFixed(0));
   const parts = est.sc ? [est.donor ? 'donor + calibration' : 'calibration'] : [];
-  const incl = parts.length ? ` (incl. ${parts[0]})` : '';
+  if (est.klPod) parts.push(`KL on ${est.klPod.pod.name} after`);
+  const incl = parts.length ? ` (incl. ${parts.join(', ')})` : '';
   const mins = (h) => (h >= 2 ? `${h.toFixed(1)} h` : `${Math.round(h * 60)} min`);
   // Say which card, because that is what the number rests on: a 27B is a
   // dollar on a Blackwell and three and a half on an A100 if the Blackwells

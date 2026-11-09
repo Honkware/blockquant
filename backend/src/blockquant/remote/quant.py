@@ -1535,6 +1535,116 @@ def _backfill_sibling_kl(*, outputs, model_id, model_name, owner, hf_token,
             print(f"[backfill] {v} card re-render failed: {e}", flush=True)
 
 
+def _kl_only(repos, variants, *, model_dir, scratch, model_id, model_name, owner, hf_token,
+             head_bits, cal_rows, codebook, kl_rows, drafter_repo=None) -> list[dict]:
+    """KL for quants a conversion on a smaller card already published.
+
+    That pod could not hold the fp16, so it converted with kl_eval off and the
+    launcher rented this one, which can. Each quant is scored as the conversion
+    pod would have scored it and gets the same bq_quality.json and quality block
+    in blockquant.json. The cards are re-rendered with the number, so
+    publish_quant's re-render after the job changes nothing, and the heads are
+    pinned last, so the pin holds all of it.
+    """
+    import shutil
+    from huggingface_hub import CommitOperationAdd, HfApi, snapshot_download
+
+    api = HfApi(token=hf_token)
+    outputs = []
+    for repo, variant in zip(repos, variants):
+        qdir = scratch / f"kl-{variant}bpw"
+        rec = {"variant": variant, "hf_repo_id": repo, "hf_url": f"https://huggingface.co/{repo}"}
+        try:
+            print(f"[kl] {variant} downloading {repo} ...", flush=True)
+            snapshot_download(repo, local_dir=str(qdir), token=hf_token,
+                              allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model",
+                                              "tokenizer*"])
+            prov_file = qdir / "blockquant.json"
+            prov = json.loads(prov_file.read_text(encoding="utf-8")) if prov_file.exists() else None
+            q = (prov or {}).get("quant") or {}
+            qc = _written_quant_config(qdir)
+            # What the conversion pod rendered its card from, read back off the repo.
+            rec.update({
+                "_size_gb": _dir_size_gb(qdir),
+                "_head_bits": qc.get("head_bits", head_bits),
+                "_codebook": qc.get("codebook", codebook),
+                "_cal_rows": (qc.get("calibration") or {}).get("rows", cal_rows),
+                "_vision_bits": qc.get("vision_bits"),
+                "_name_parts": {k: q[k] for k in ("mtp_bits", "ngram_bits", "hq")
+                                if q.get(k) is not None},
+            })
+            print(f"[kl] {variant} measuring KL vs fp16 ...", flush=True)
+            stats, kl_method = _kl_div_eval(qdir, model_dir, rows=kl_rows)
+            if stats is not None:
+                kl = stats["kld_median"]
+                rec.update(kl_div=kl, kl_stats=stats, kl_method=kl_method)
+                print(f"[kl] {variant} KL(fp16||quant) median {kl:.6f} "
+                      f"mean {stats['kld']:.6f}", flush=True)
+                ops = [CommitOperationAdd(path_in_repo="bq_quality.json", path_or_fileobj=json.dumps(
+                    {"kl_div": kl, "kl_rows": kl_rows, "kl_method": kl_method,
+                     "kl_stats": stats, "metric": "KL(fp16||quant) median"}).encode())]
+                if prov is not None:
+                    prov["quality"] = {"kl_median": kl, "method": kl_method,
+                                       "file": "bq_quality.json"}
+                    ops.append(CommitOperationAdd(path_in_repo="blockquant.json",
+                                                  path_or_fileobj=json.dumps(prov, indent=2).encode()))
+                api.create_commit(repo_id=repo, repo_type="model", operations=ops,
+                                  commit_message="Add the KL eval")
+        except Exception as e:
+            print(f"[kl] WARN {variant} KL failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            shutil.rmtree(qdir, ignore_errors=True)
+        outputs.append(rec)
+
+    if any(o.get("kl_div") is not None for o in outputs):
+        try:
+            _finalize_cards(outputs, model_id, model_name, owner, hf_token, head_bits,
+                            cal_rows, codebook, model_dir, drafter_repo=drafter_repo)
+        except Exception:
+            print("[card] WARN skipped:\n" + traceback.format_exc(), flush=True)
+    _pin_heads(api, outputs)
+    return outputs
+
+
+def _finish(cfg: dict, outputs: list, drafter_repo, t0: float) -> int:
+    """Report the result and arm the self-terminate backstop: how every successful job ends."""
+    emit_result({
+        "status": "complete",
+        "outputs": outputs,
+        "drafter_repo": drafter_repo,
+        "total_time": time.time() - t0,
+    })
+    print("[done]", flush=True)
+
+    # Self-terminate so we don't burn credit waiting for the local
+    # poll loop to clean up. Skip on --keep-pod (forensics path).
+    # Only fires on the success path; main's failure path leaves the pod
+    # alive for rescue_upload.py / debugging.
+    if not cfg.get("keep_pod"):
+        pid = cfg.get("pod_id", "")
+        key = cfg.get("runpod_api_key", "")
+        if pid and key:
+            # Arm a detached backstop and exit immediately. A live
+            # controller sees this process finish, drains the log, fetches
+            # bq-result.json, and terminates the pod itself, all well
+            # before the backstop fires. The backstop only matters if the
+            # controller has died, so it can't orphan the pod.
+            try:
+                grace = float(cfg.get("self_terminate_grace_seconds", 300))
+            except (TypeError, ValueError):
+                grace = 300.0
+            if grace < 0:
+                grace = 300.0
+            _arm_self_terminate_backstop(pid, key, grace)
+            print(f"[self-terminate] backstop armed ({grace:g}s)", flush=True)
+        else:
+            print("[self-terminate] skipped (missing pod_id or api_key)",
+                  flush=True)
+    else:
+        print("[self-terminate] skipped (--keep-pod)", flush=True)
+    return 0
+
+
 def main() -> int:
     try:
         cfg = json.loads(Path(CONFIG_PATH).read_text())
@@ -1608,6 +1718,9 @@ def main() -> int:
         kl_eval: bool = bool(cfg.get("kl_eval", True))
         kl_rows: int = int(cfg.get("kl_rows", 40))
         backfill_kl: bool = bool(cfg.get("backfill_kl", False))
+        # Quants a conversion on a smaller card already published, one per
+        # variant: this pod only measures their KL (see _kl_only).
+        kl_only_repos: list[str] = [r for r in cfg.get("kl_only_repos") or [] if r]
         # Optional smoke-test prompt: run on each finished quant so the requester
         # sees a real reply. The fp16 is already gone by here; we load the quant.
         test_prompt: str = (cfg.get("test_prompt") or "").strip()
@@ -1695,6 +1808,16 @@ def main() -> int:
             base_revision = getattr(_info, "sha", None)
         except Exception:
             _total_gb = 0.0
+        if kl_only_repos:
+            # The commit the quants were built from: main may have moved since.
+            try:
+                from huggingface_hub import hf_hub_download
+                _bq = json.loads(Path(hf_hub_download(kl_only_repos[0], "blockquant.json",
+                                                      token=hf_token or None)).read_text())
+                base_revision = (_bq.get("base_model") or {}).get("revision") or base_revision
+            except Exception as e:
+                print(f"[kl] WARN no blockquant.json to pin the base from ({type(e).__name__}); "
+                      f"using main", flush=True)
         _what = f"{model_id}/{subfolder}" if subfolder else model_id
         print(f"[download] {_what} ({_total_gb:.1f} GB) at {base_revision or 'main'} ...", flush=True)
         _dl_done = threading.Event()
@@ -1781,6 +1904,14 @@ def main() -> int:
         _disable_missing_mtp(model_dir)
         _vision_preprocessor_config(model_dir)
         _ensure_fast_tokenizer(model_dir)
+
+        if kl_only_repos:
+            drafter_repo = cfg.get("drafter_repo") or None
+            outputs = _kl_only(kl_only_repos, variants, model_dir=model_dir, scratch=quant_root,
+                               model_id=model_id, model_name=model_name, owner=owner,
+                               hf_token=hf_token, head_bits=head_bits, cal_rows=cal_rows,
+                               codebook=codebook, kl_rows=kl_rows, drafter_repo=drafter_repo)
+            return _finish(cfg, outputs, drafter_repo, t0)
 
         from exllamav3.conversion.convert_model import parser, main as exl_main, prepare
 
@@ -2170,41 +2301,7 @@ def main() -> int:
                     print("[backfill] WARN skipped:\n" + traceback.format_exc(),
                           flush=True)
 
-        emit_result({
-            "status": "complete",
-            "outputs": outputs,
-            "drafter_repo": drafter_repo,
-            "total_time": time.time() - t0,
-        })
-        print("[done]", flush=True)
-
-        # Self-terminate so we don't burn credit waiting for the local
-        # poll loop to clean up. Skip on --keep-pod (forensics path).
-        # Only fires on the success path; failure path below leaves the
-        # pod alive for rescue_upload.py / debugging.
-        if not cfg.get("keep_pod"):
-            pid = cfg.get("pod_id", "")
-            key = cfg.get("runpod_api_key", "")
-            if pid and key:
-                # Arm a detached backstop and exit immediately. A live
-                # controller sees this process finish, drains the log, fetches
-                # bq-result.json, and terminates the pod itself, all well
-                # before the backstop fires. The backstop only matters if the
-                # controller has died, so it can't orphan the pod.
-                try:
-                    grace = float(cfg.get("self_terminate_grace_seconds", 300))
-                except (TypeError, ValueError):
-                    grace = 300.0
-                if grace < 0:
-                    grace = 300.0
-                _arm_self_terminate_backstop(pid, key, grace)
-                print(f"[self-terminate] backstop armed ({grace:g}s)", flush=True)
-            else:
-                print("[self-terminate] skipped (missing pod_id or api_key)",
-                      flush=True)
-        else:
-            print("[self-terminate] skipped (--keep-pod)", flush=True)
-        return 0
+        return _finish(cfg, outputs, drafter_repo, t0)
 
     except Exception as e:
         traceback.print_exc()
