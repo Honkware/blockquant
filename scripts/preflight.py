@@ -75,8 +75,10 @@ _DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 def _params_b(cfg: dict, size_gb: float) -> float | None:
     """Parameters in billions, off the weight size and the dtype the config
     declares, for the request card. None when the dtype says nothing useful."""
-    dt = (cfg.get("torch_dtype") or cfg.get("dtype")
-          or (cfg.get("text_config") or {}).get("torch_dtype"))
+    # torch_dtype, or dtype since transformers renamed it, and under
+    # text_config on a multimodal repo.
+    scopes = [cfg, cfg.get("text_config") or {}]
+    dt = next((sc[k] for sc in scopes for k in ("torch_dtype", "dtype") if sc.get(k)), None)
     n = _DTYPE_BYTES.get(str(dt))
     return round(size_gb / n, 1) if n and size_gb else None
 
