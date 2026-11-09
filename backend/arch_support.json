@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-10-27T21:03:04+00:00",
+  "generated_at": "2026-11-09T17:59:04+00:00",
   "exllamav3": {
-    "ref": "cdc785db",
-    "version": "1.6.5"
+    "ref": "bd1f519",
+    "version": "1.6.6"
   },
   "architectures": [
     "AfmoeForCausalLM",
@@ -16,6 +16,7 @@
     "DFlashLagunaForCausalLM",
     "DeciLMForCausalLM",
     "DeepseekV3ForCausalLM",
+    "DeepseekV41ForCausalLM",
     "DeepseekV4ForCausalLM",
     "Dots1ForCausalLM",
     "Ernie4_5_ForCausalLM",
@@ -44,6 +45,8 @@
     "Lfm2ForCausalLM",
     "Lfm2MoeForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3ForCausalLM",
+    "Lfm3VlForConditionalGeneration",
     "LlamaForCausalLM",
     "MiMoForCausalLM",
     "MiMoV2ForCausalLM",
@@ -86,6 +89,7 @@
     "Glm4vMoeForConditionalGeneration": 6,
     "Glm5NextForConditionalGeneration": 6,
     "Lfm2VlForConditionalGeneration": 6,
+    "Lfm3VlForConditionalGeneration": 6,
     "MuseGlimmerForConditionalGeneration": 6,
     "NemotronHForCausalLM": 16,
     "NemotronH_Omni_Reasoning_V3": 16,
