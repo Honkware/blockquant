@@ -2002,6 +2002,10 @@ def main() -> int:
                 print(f"[upload] {variant} WARN upload returned no commit id", flush=True)
             rec["hf_url"] = f"https://huggingface.co/{repo_id}"
             repo_ids.append(repo_id)
+            # For the finished card in Discord.
+            _gb = _dir_size_gb(out_dir)
+            if _gb:
+                print(f"[upload] {variant} size {_gb:.1f} GB", flush=True)
             # Echo the URL so the dashboard's HF_URL parser rule can populate
             # state["hf_url"].
             print(f"[upload] {variant} done -> {rec['hf_url']}", flush=True)

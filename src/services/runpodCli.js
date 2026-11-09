@@ -15,6 +15,14 @@ const LOG_DIR = path.join(ROOT, 'backend', 'logs');
 
 const RE = {
   pod: /Pod ID:\s*(\S+)/,
+  // "Pod ID: x  (GPU: NVIDIA GeForce RTX 4090, SECURE, ~$0.89/hr)"
+  podCard: /Pod ID:\s*\S+\s+\(GPU:\s*(.+?),\s*(\w+),\s*~\$([0-9.]+)\/hr\)/,
+  // "[download] 43% (31.0/55.6 GB)"
+  downloadGb: /\[download\]\s*\d+%\s*\(([0-9.]+)\/([0-9.]+)\s*GB\)/,
+  klMeasuring: /\[kl\]\s*([0-9.]+)\s+measuring/,
+  klDone: /\[kl\]\s*([0-9.]+)\s+KL\(fp16\|\|quant\) median ([0-9.]+)/,
+  sampleStart: /\[sample\]\s*([0-9.]+)\s+generating/,
+  size: /\[upload\]\s*([0-9.]+)\s+size\s+([0-9.]+)\s*GB/,
   bootstrap: /Bootstrap complete/,
   download: /\[download\]\s*(.+)/,
   quantizeStart: /\[quantize\]\s*([0-9.]+)\s*bpw/,
@@ -129,6 +137,14 @@ export function scTraceFrac(message, target = SC_TRACE_TOKENS) {
  * non-zero exit before any pod, handled inside run_runpod_job.py), so it stays
  * retryable.
  */
+/** "24m", "1h05m", "40s" (quant.py's eta) in seconds, or null. */
+export function etaSeconds(s) {
+  if (!s) return null;
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(String(s).trim());
+  if (!m || !(m[1] || m[2] || m[3])) return null;
+  return (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0);
+}
+
 export function isControllerRetryable({ signal, podId }) {
   return signal == null && !podId;
 }
@@ -203,6 +219,8 @@ export function runViaCli({
   // ample for a conversion and thin for a big self-calibrated job: the trace
   // and the measurement run before a single weight is quantized.
   maxRuntimeH = null,
+  // Raised on a retry after the last attempt ran out of memory.
+  minVram = null,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -222,7 +240,7 @@ export function runViaCli({
       // CLI walks its own _PREFERRED_GPUS (H100s, then an A100) and dies fast
       // when none are free. Disk is auto-sized by the CLI (default).
       '--gpu', 'auto',
-      '--min-vram', '24',
+      '--min-vram', String(minVram ?? 24),
       // Cap $/hr scaled to model size, a safety rail rather than the choice:
       // the CLI orders candidates by price over measured conversion speed, so
       // a big model goes to an RTX PRO 6000 Blackwell when one is in stock.
@@ -343,6 +361,15 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
     let scStage = null;         // the one running now
     let scFrac = 0;             // how far into it, when it says
     let jobError = '';       // last [joberror] line, reported instead of the exit code
+    const kls = new Map();      // bpw -> KL median
+    const sizes = new Map();    // bpw -> GB on the hub
+    let gpu = null;             // the card, its rate, and when the pod was seen
+    let rate = null;
+    let podAt = null;
+    let layer = null;
+    let layers = null;
+    let etaAt = null;
+    let dl = null;
 
     // Each phase maps its REAL percent into a band of the overall bar, so the
     // bar climbs smoothly the whole run (download 4->25, quantize 25->90), and
@@ -362,6 +389,8 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         case 'Downloading':  overall = 10 + Math.round((curDownloadPct / 100) * (sc ? 5 : 15)); break;
         case 'Calibrating':  overall = 15 + Math.round(scProgress(scDone, scStage, scFrac) * 40); break;
         case 'Quantizing':   overall = qLow + Math.round((curQuantPct / 100) * (90 - qLow)); break;
+        case 'Measuring KL': overall = 92; break;
+        case 'Testing':      overall = 93; break;
         case 'Uploading':    overall = 95; break;
         case 'Complete':     overall = 100; break;
         default:             overall = 0;
@@ -376,6 +405,15 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         bpwIndex: Math.max(0, variants.indexOf(curBpw)),
         totalBPWs: total,
         podId,
+        provStep,
+        scStage,
+        gpu,
+        rate,
+        podAt,
+        layer,
+        layers,
+        etaAt,
+        dl,
       });
     };
 
@@ -394,6 +432,23 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
       }
       if ((m = RE.jobError.exec(line))) {
         jobError = m[1].trim().slice(0, 300);
+        return;
+      }
+      if ((m = RE.klDone.exec(line))) {
+        kls.set(m[1], Number(m[2]));
+        return;
+      }
+      if ((m = RE.klMeasuring.exec(line))) {
+        curBpw = m[1];
+        stage = 'Measuring KL';
+        return report('measuring KL');
+      }
+      if ((m = RE.sampleStart.exec(line))) {
+        stage = 'Testing';
+        return report('test prompt');
+      }
+      if ((m = RE.size.exec(line))) {
+        sizes.set(m[1], Number(m[2]));
         return;
       }
       if ((m = RE.pinned.exec(line))) {
@@ -457,6 +512,15 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
         curBpw = m[1];
         curQuantPct = pct;
         stage = 'Quantizing';
+        const lm = /layer\s+(\d+)\/(\d+)/.exec(m[3] || '');
+        if (lm) [layer, layers] = [Number(lm[1]), Number(lm[2])];
+        const secs = etaSeconds(m[4]);
+        // Absolute, for a <t:..:R> that ticks on its own. Only moved when it
+        // shifts by a minute, so the card is not re-edited for every line.
+        if (secs != null) {
+          const at = Date.now() + secs * 1000;
+          if (!etaAt || Math.abs(at - etaAt) > 60_000) etaAt = at;
+        }
         const eta = m[4] ? ` · eta ${m[4]}` : '';
         return report(`${pct}%${eta}`);
       }
@@ -471,6 +535,8 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
       }
       if ((m = RE.pod.exec(line))) {
         podId = m[1];
+        const c = RE.podCard.exec(line);
+        if (c) [gpu, rate, podAt] = [c[1], Number(c[3]), Date.now()];
         return report(`Pod ${podId}`);
       }
       if ((m = RE.download.exec(line))) {
@@ -481,6 +547,8 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
           if (dp < curDownloadPct) return; // stale reprint
           curDownloadPct = dp;
         }
+        const g = RE.downloadGb.exec(line);
+        if (g) dl = { done: Number(g[1]), total: Number(g[2]) };
         return report(m[1].slice(0, 80));
       }
       if ((m = RE.eta.exec(line))) {
@@ -531,6 +599,9 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
           reused: false,
           duration: '',
           sample: samples.get(v) || null,
+          kl: kls.get(v) ?? null,
+          sizeGb: sizes.get(v) ?? null,
+          gpu,
           error: url
             ? null
             : signal
