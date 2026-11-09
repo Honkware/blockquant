@@ -1,11 +1,9 @@
 """Which files in a model repo are the model.
 
-Repos carry more than the weights. OBLITERATUS/Qwen3.8-27B-OBLITERATED holds
-its 28 indexed shards, an older 18-shard set nobody deleted and 128 GB of GGUFs:
-240 GB for a 55.6 GB model. Everything that summed the repo or pulled it whole
-priced, sized and downloaded all of it, and the launcher dropped the KL eval
-because no card holds a 240 GB fp16. exllamav3 also loads every *.safetensors
-in the folder, so the two shard sets were two copies of every tensor.
+Repos carry more than the weights: GGUFs, or an older shard set left beside
+the current one. Summing or downloading the whole repo prices, sizes and pulls
+all of it, and exllamav3 loads every *.safetensors in the folder, so a second
+shard set is a second copy of every tensor.
 
 The index names the shards that make up the model, so that is the source of
 truth when there is one. Standalone on purpose: it is shipped next to quant.py

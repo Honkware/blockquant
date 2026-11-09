@@ -128,8 +128,8 @@ class RunPodProvider(Provider):
 
         Only the subfolder when there is one. Summing the whole repo priced and
         floored the nerkyor job as a 434 GB model and sized its disk to match,
-        when it pulled the 57 GB BF16 folder and nothing else. Only the indexed
-        shards, too: GGUFs and a stale shard set made a 55.6 GB model 240 GB.
+        when it pulled the 57 GB BF16 folder and nothing else. Only the shards
+        the index names, too (see weights.py).
         """
         try:
             from blockquant.weights import repo_weights
