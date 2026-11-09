@@ -223,24 +223,84 @@ def _last_exception(lines: list[str]) -> str:
     return msg[:600] if msg else " ".join(parts)[:600]
 
 
-def _drain_failure(provider, instance_id, outcome: str) -> str:
-    """Distill a one-line reason from the remote log for a non-done outcome, so a
-    failure surfaces as the real cause instead of a bare exit code."""
+def _where(lines: list[str]) -> str:
+    """Where the run was when it ended, in words: "at layer 41 of 64", "at
+    lm_head", "while downloading". The Discord card shows this, not a log line."""
+    total = module = phase = None
+    for ln in lines:
+        # The filtered poll tail only has these, not the converter's own lines.
+        if m := re.search(r"\[progress\] quantize \S+ \d+% \(layer (\d+)/(\d+)\)", ln):
+            total, phase = m.group(2), "quantize"
+            module = f"layers.{int(m.group(1)) - 1}"
+        elif m := re.search(r"Loading unquantized module: (\S+)", ln):
+            module, phase = m.group(1), "quantize"
+        elif ln.startswith("[download]"):
+            phase = "while downloading"
+        elif ln.startswith("[sc]"):
+            phase = "during self-calibration"
+        elif ln.startswith("[kl]") and "measuring" in ln:
+            phase = "during the KL eval"
+        elif ln.startswith("[sample]"):
+            phase = "during the smoke test"
+        elif ln.startswith("[upload]") and ("->" in ln or "pushing" in ln):
+            phase = "while uploading"
+    if phase == "quantize" and module:
+        if m := re.search(r"layers\.(\d+)$", module):
+            return f"at layer {int(m.group(1)) + 1}" + (f" of {total}" if total else "")
+        return f"at {module.rsplit('.', 1)[-1]}"
+    return phase or "before the quant started"
+
+
+def _exit_info(lines: list[str]) -> dict:
+    """The runner's last word (see RUNNER in the provider), or {} on an image
+    that predates it."""
+    for ln in reversed(lines):
+        if m := re.match(r"\[exit\] code=(\d+) oom_kills=(\S+) mem_limit=(\S+)", ln):
+            return {"code": int(m.group(1)), "oom": m.group(2), "mem": m.group(3)}
+    return {}
+
+
+def _explain(lines: list[str], outcome: str, error: str = "", vram_gb: int | None = None) -> str:
+    """One line for the Discord card that says what ended the run, and only
+    what is known. Raw log text never reaches the card."""
+    where = _where(lines)
+    err = error or _last_exception(lines)
+    ex = _exit_info(lines)
+    if "CUDA out of memory" in err or "OutOfMemoryError" in err:
+        return f"Out of GPU memory {where}" + (f" ({vram_gb} GB card)" if vram_gb else "")
+    if "No space left on device" in err or "Errno 28" in err:
+        return f"Disk full {where}"
+    if ex.get("code") == 137:
+        if ex["oom"].isdigit() and int(ex["oom"]) > 0:
+            lim = f" ({int(ex['mem']) / 1e9:.0f} GB pod)" if ex["mem"].isdigit() else ""
+            return f"Out of system RAM {where}{lim}"
+        return f"Killed by signal 9 {where}"
+    if ex.get("code") == 139 or "Segmentation fault" in err:
+        return f"Segfault {where}"
+    if ex.get("code") == 134:
+        return f"Aborted {where}"
+    if outcome == "stalled":
+        return f"No output for too long, stopped {where}"
+    if outcome == "max_runtime":
+        return f"Hit the runtime limit {where}"
+    if err:
+        # Drop the module path: "huggingface_hub.errors.HfHubHTTPError: ..."
+        err = re.sub(r"^[\w.]+\.(\w+(?:Error|Exception)\b)", r"\1", err)
+        return f"{err[:200]} ({where})"
+    if ex:
+        return f"Exited with code {ex['code']} {where}"
+    return f"Ended with no error message {where}"
+
+
+def _drain_failure(provider, instance_id, outcome: str, error: str = "",
+                   vram_gb: int | None = None) -> str:
+    """The one-line reason for a run that did not finish, from the remote log."""
     try:
         tail = provider.get_progress(instance_id, lines=500, raw=True) or ""
     except Exception:
         tail = ""
     lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
-    exc = _last_exception(lines)
-    if outcome == "failed":
-        return f"remote quant crashed: {exc or (lines[-1] if lines else 'see controller log')}"
-    if outcome == "no_result":
-        # The remote process ended on its own but left no bq-result.json, so it
-        # never reached its own except handler: a signal kill, not an exception.
-        # The last log line is where it stopped, which is the whole diagnosis.
-        return ("pod exited without a result file and nothing reached HF; remote log ends at: "
-                + (exc or (lines[-1][-200:] if lines else 'no output at all')))
-    return f"hit the '{outcome}' watchdog limit ({lines[-1] if lines else 'no output'})"
+    return _explain(lines, outcome, error, vram_gb)
 
 
 def _recommend_max_price(base_gb: float | None, sc: bool = False) -> float:
@@ -1116,6 +1176,9 @@ def main():
         print("      Bootstrap complete")
 
         print(f"[4/6] Starting remote quantization...")
+
+        def _vram():
+            return next((g.get("memoryInGb") for g in (_gpus or []) if g.get("id") == chosen_gpu), None)
         # Stock-outs can push the sweep down to a card that holds the fp16
         # after all. KL runs here then: a second pod would be the same card again.
         if split_kl and next((g.get("memoryInGb") or 0 for g in _gpus
@@ -1181,7 +1244,7 @@ def main():
             on_progress=_print_new,
         )
         if outcome != "done":
-            print(f"\n[joberror] {_drain_failure(provider, instance_id, outcome)}; terminating pod.",
+            print(f"\n[joberror] {_drain_failure(provider, instance_id, outcome, vram_gb=_vram())}",
                   flush=True)
             sys.exit(3)  # finally still terminates the pod
 
@@ -1227,11 +1290,9 @@ def main():
                       "-> treating as complete", flush=True)
                 sys.exit(0)
             if pod_gone:
-                seen = next((l.strip() for l in reversed(last_lines) if l.strip()), "nothing")
-                print("[joberror] the pod disappeared before finishing and nothing reached "
-                      f"HF; last progress seen: {seen[:200]}", flush=True)
+                print(f"[joberror] The pod disappeared {_where(last_lines)}", flush=True)
             else:
-                print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result')}",
+                print(f"[joberror] {_drain_failure(provider, instance_id, 'no_result', vram_gb=_vram())}",
                       flush=True)
             sys.exit(1)
         status = result.get("status", "unknown")
@@ -1243,8 +1304,8 @@ def main():
             print(f"      Remote time: {result.get('total_time', 0):.0f}s")
             print(f"      Total time (incl. pod lifecycle): {elapsed:.0f}s  ≈  ${cost:.2f}")
         else:
-            print(f"[joberror] remote quant reported {status}: "
-                  f"{result.get('error', 'unknown')}", flush=True)
+            print(f"[joberror] {_drain_failure(provider, instance_id, status, result.get('error') or '', _vram())}",
+                  flush=True)
             sys.exit(1)
 
     finally:

@@ -4,4 +4,5 @@
 REMOTE_SCRIPT = "/root/quant.py"
 REMOTE_LOG = "/root/bq.log"
 REMOTE_RESULT = "/root/bq-result.json"
+REMOTE_RUNNER = "/root/bq-run.sh"
 BOOTSTRAP_MARKER = "/root/.bq-bootstrapped"

@@ -28,7 +28,9 @@ import time
 from pathlib import Path
 
 from blockquant.providers.base import Provider
-from blockquant.providers.runpod.constants import BOOTSTRAP_MARKER, REMOTE_LOG, REMOTE_RESULT, REMOTE_SCRIPT
+from blockquant.providers.runpod.constants import (
+    BOOTSTRAP_MARKER, REMOTE_LOG, REMOTE_RESULT, REMOTE_RUNNER, REMOTE_SCRIPT,
+)
 from blockquant.providers.runpod.deps import _ensure_paramiko, _ensure_runpod
 from blockquant.providers.runpod.pricing import lookup_live_price, lookup_max_gpu_count, static_price
 from blockquant.utils.logger import get_logger
@@ -43,6 +45,28 @@ logger = get_logger(__name__)
 # convert time with the pod already billing.
 _MIN_EXLLAMAV3 = (1, 6, 5)
 
+
+
+# Runs quant.py and writes how it ended as the last log line. A kill from
+# outside, usually the kernel's OOM killer, leaves Python nothing to print and
+# the log just stops. The container's own cgroup counts OOM kills, so read it
+# before and after.
+# "?" when this kernel exposes neither the v2 nor the v1 file.
+RUNNER = r"""
+oom() {
+  for f in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.oom_control; do
+    [ -r "$f" ] && { awk '$1=="oom_kill"{print $2; exit}' "$f"; return; }
+  done
+  echo "?"
+}
+mem() { cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "?"; }
+b=$(oom)
+"$@"
+rc=$?
+a=$(oom)
+case "$a$b" in *[!0-9]*|"") k="?" ;; *) k=$((a - b)) ;; esac
+echo "[exit] code=$rc oom_kills=$k mem_limit=$(mem)"
+"""
 
 class RunPodProvider(Provider):
     name = "runpod"
@@ -1117,9 +1141,11 @@ class RunPodProvider(Provider):
             logger.warning(f"Could not ship card renderer to pod: {exc}")
 
         # 3. Fire-and-forget. setsid so the process survives our SSH channel.
+        # Under the runner, so a kill from outside still says how it ended.
+        self._upload_bytes(instance_id, RUNNER.encode(), REMOTE_RUNNER)
         launch_cmd = (
             f"rm -f {REMOTE_RESULT} {REMOTE_LOG} && "
-            f"nohup setsid {self._remote_py} {script_path} "
+            f"nohup setsid sh {REMOTE_RUNNER} {self._remote_py} -X faulthandler {script_path} "
             f"> {REMOTE_LOG} 2>&1 < /dev/null & echo $!"
         )
         # Detached: a normal run() here blocks on recv_exit_status until the

@@ -36,7 +36,7 @@ def test_a_gone_pod_still_checks_hf_before_failing():
     # from here; the variant on HF is what tells them apart.
     _, src = _main()
     fetch = src[src.index("[6/6] Fetching result"):]
-    assert fetch.index("_variant_uploaded(") < fetch.index("the pod disappeared")
+    assert fetch.index("_variant_uploaded(") < fetch.index("The pod disappeared")
 
 
 def test_printed_is_bound_in_main_not_in_the_closure():
