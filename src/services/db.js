@@ -18,21 +18,25 @@ async function ensureDir() {
   await mkdir(dataDir, { recursive: true });
 }
 
+// Every write is a read-modify-write of the whole file, so reading a broken
+// file as {} would replace it with one record on the next patch. A file that
+// does not parse is moved aside first; one that cannot be read throws.
 async function load(filename) {
+  const file = path.join(dataDir, filename);
   let raw;
   try {
-    raw = await readFile(path.join(dataDir, filename), 'utf8');
+    raw = await readFile(file, 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT') return {};
-    log.error(`Failed to read ${filename}, treating as empty`, { error: err.message });
-    return {};
+    throw err;
   }
-  // An empty or truncated file must never crash startup; treat it as empty.
   if (!raw.trim()) return {};
   try {
     return JSON.parse(raw);
   } catch (err) {
-    log.error(`Corrupt ${filename}, treating as empty`, { error: err.message });
+    const kept = `${file}.corrupt-${Date.now()}`;
+    await rename(file, kept);
+    log.error(`Corrupt ${filename}, moved to ${kept}`, { error: err.message });
     return {};
   }
 }
