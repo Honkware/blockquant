@@ -763,11 +763,11 @@ export async function handleQuant(interaction) {
  * completion path (cards, collection, the thread's final message) stays shared
  * with a normal run rather than being reimplemented here and drifting.
  */
-export function resumeJob({ client, job, resumeFrom }) {
-  return runApprovedJob({ interaction: { channel: null, client }, job, resumeFrom });
+export function resumeJob({ client, job, resumeFrom, lost = null }) {
+  return runApprovedJob({ interaction: { channel: null, client }, job, resumeFrom, lost });
 }
 
-export async function runApprovedJob({ interaction, job, resumeFrom = null, onThread = null }) {
+export async function runApprovedJob({ interaction, job, resumeFrom = null, lost = null, onThread = null }) {
   const {
     id: jobId,
     userId,
@@ -935,6 +935,13 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null, onTh
     { error: err.message }
   );
 
+  // A resume with no controller left to read: the card is still counting, so
+  // end it with the reason.
+  if (lost) {
+    await handleError(new Error(lost));
+    return { thread };
+  }
+
   // RunPod EXL3: one pod per variant, in parallel. Each run_runpod_job grabs
   // its own pod (unique name tag -> safe orphan cleanup) and quantizes a single
   // bpw, so per-pod volume is small (easier to find stock) and the variants
@@ -1043,22 +1050,6 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null, onTh
 
     async function runGroup(vs, over = {}) {
       const v = vs[0];
-      // Resuming: the controller is already running and owns the pod. Attach to
-      // its log instead of spawning a second one, and do not retry -- a retry
-      // here would rent a pod alongside the one still working.
-      const handle = resumeFrom?.get(v);
-      if (handle) {
-        try {
-          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs), sc });
-          settle(vs, res[0]?.podCosts);
-          markComplete(vs, res);
-          return res;
-        } catch (err) {
-          settle(vs, err.podCosts);
-          markFailed(vs, err);
-          return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
-        }
-      }
       // Every pod this group rented, retries included, so the completion can
       // say what the job really cost.
       const spent = [];
@@ -1068,6 +1059,31 @@ export async function runApprovedJob({ interaction, job, resumeFrom = null, onTh
         }
         return res;
       };
+      // Resuming: the controller is already running and owns the pod. Attach to
+      // its log instead of spawning a second one, and do not retry -- a retry
+      // here would rent a pod alongside the one still working.
+      const handle = resumeFrom?.get(v);
+      if (handle) {
+        try {
+          const res = await attachToCli(handle, { variants: vs, onProgress: onGroupProgress(vs), sc });
+          if (res[0]?.podCosts) spent.push(...res[0].podCosts);
+          settle(vs, res[0]?.podCosts);
+          markComplete(vs, res);
+          return withSpend(res);
+        } catch (err) {
+          if (err.podCosts) spent.push(...err.podCosts);
+          settle(vs, err.podCosts);
+          markFailed(vs, err);
+          return withSpend(vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message })));
+        }
+      }
+      // A resumed bitrate with no controller left has no log to read, and
+      // starting it over would rent a pod nobody approved twice.
+      if (resumeFrom) {
+        const err = new Error('Interrupted by a bot restart');
+        markFailed(vs, err);
+        return vs.map((x) => ({ bpw: x, variant: x, url: null, pushed: false, reused: false, duration: '', error: err.message }));
+      }
       try {
         return withSpend(await runVariantWithRetry(v, {
           maxAttempts: MAX_ATTEMPTS,
@@ -1289,6 +1305,13 @@ export async function handleRetry(interaction) {
     return reply('Only the requester or an admin can retry this.');
   }
   if (job.retriedAs || inFlightRetries.has(jobId)) return reply('This job was already retried.');
+  // The quote and the balance below can take longer than the 3 seconds
+  // Discord gives a button to answer.
+  await interaction.deferUpdate();
+  const channel = await interaction.client.channels.fetch(job.channelId).catch(() => null);
+  if (!channel) {
+    return interaction.followUp({ content: 'The channel this job came from is gone.', flags: MessageFlags.Ephemeral });
+  }
   inFlightRetries.add(jobId);
   try {
     const failed = (job.partialResults || []).filter((r) => !r.pushed && !r.donor && !r.drafter);
@@ -1315,12 +1338,9 @@ export async function handleRetry(interaction) {
     if (q) next.quote = { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null };
     await db.upsertJob(next);
     await db.patchJob(jobId, { retriedAs: id });
-
-    const channel = await interaction.client.channels.fetch(job.channelId).catch(() => null);
-    if (!channel) return reply('The channel this job came from is gone.');
     await postRequest({ channel, client: interaction.client, job: next });
     // The button has done its job.
-    await interaction.update({ components: [] });
+    await interaction.editReply({ components: [] });
   } finally {
     inFlightRetries.delete(jobId);
   }

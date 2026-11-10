@@ -132,9 +132,12 @@ export async function reapOrphans({ listPods, terminatePod, now = Date.now, dryR
       log.warn(`WOULD reap ${p.id} (controller pid ${tag.pid} gone, age ${Math.round(ageMs / 60000)}m)`);
       continue;
     }
-    const ok = await terminatePod(p.id);
+    if (!(await terminatePod(p.id))) {
+      log.error(`Could not terminate orphan pod ${p.id} (dead controller pid ${tag.pid})`);
+      continue;
+    }
     reaped.push(p.id);
-    log.warn(`Reaped orphan pod ${p.id} (dead controller pid ${tag.pid}): ${ok ? 'terminated' : 'FAILED'}`);
+    log.warn(`Reaped orphan pod ${p.id} (dead controller pid ${tag.pid})`);
   }
   return reaped;
 }

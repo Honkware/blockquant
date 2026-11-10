@@ -17,7 +17,7 @@
 // when the work finishes. So the wrapper records the run in files instead --
 // a pid to poll and an exit status to read -- and wait() polls those. Those
 // files outlive the bot too, which is what lets a fresh bot see that a run it
-// never started is still going (list/sweep, `npm run status`).
+// never started is still going (list, `npm run status`).
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -76,7 +76,8 @@ function paths(id) {
   };
 }
 
-function drop(handle) {
+/** Forget a run: its pid, status and record files. The log stays. */
+export function drop(handle) {
   for (const p of [handle.pidPath, handle.statusPath, handle.recordPath]) {
     try {
       fs.unlinkSync(p);
@@ -186,22 +187,4 @@ export function list() {
     out.push({ ...rec, status, running: !status && alive(rec.pid) });
   }
   return out.sort((a, b) => a.startedAt - b.startedAt);
-}
-
-/**
- * Boot-time tidy: forget the runs that ended, keep the ones still going.
- * Returns both, because a run that finished while the bot was down wrote a
- * result nobody has looked at.
- */
-export function sweep() {
-  const live = [];
-  const finished = [];
-  for (const rec of list()) {
-    if (rec.running) live.push(rec);
-    else {
-      finished.push(rec);
-      drop(rec);
-    }
-  }
-  return { live, finished };
 }

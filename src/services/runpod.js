@@ -4,13 +4,19 @@ const log = getLogger('runpod');
 
 const GRAPHQL = 'https://api.runpod.io/graphql';
 const REST_PODS = 'https://rest.runpod.io/v1/pods';
+// fetch has no timeout of its own. /quant waits on the balance before it
+// answers, and /stop on the terminate, so a hung request would hang those.
+const TIMEOUT_MS = 15_000;
 
 /** List all pods via the REST API. Best-effort: [] on any failure. */
 export async function listPods() {
   const key = process.env.RUNPOD_API_KEY;
   if (!key) return [];
   try {
-    const resp = await fetch(REST_PODS, { headers: { Authorization: `Bearer ${key}` } });
+    const resp = await fetch(REST_PODS, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
     if (!resp.ok) return [];
     const data = await resp.json();
     return Array.isArray(data) ? data : data.pods || [];
@@ -28,6 +34,7 @@ export async function terminatePod(id) {
     const resp = await fetch(`${REST_PODS}/${id}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     return resp.ok;
   } catch (err) {
@@ -173,6 +180,7 @@ export async function getBalance() {
       body: JSON.stringify({
         query: 'query { myself { clientBalance currentSpendPerHr } }',
       }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!resp.ok) {
       log.debug(`RunPod balance lookup HTTP ${resp.status}`);
