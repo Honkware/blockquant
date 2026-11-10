@@ -645,12 +645,17 @@ export function attachToCli(handle, { variants, onProgress, sc = false }) {
  * Quants table, and adds them all to the collection. Idempotent, so it's safe
  * to call after every job. Resolves { ok, collectionUrl }.
  */
+// The result card waits on this, so a hung hub call must not hold it forever.
+// TODO: 10 minutes is a guess; no run of publish_quant.py has been timed.
+const FINALIZE_TIMEOUT_MS = 600_000;
+
 export function finalizeCollection({ modelId, hfOrg }) {
   return new Promise((resolve) => {
     const args = [PUBLISH, '--base', modelId];
     if (hfOrg) args.push('--hf-org', hfOrg);
     log.info(`finalize: ${PYTHON} ${args.join(' ')}`);
-    const child = spawn(PYTHON, args, { cwd: ROOT, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+    const child = spawn(PYTHON, args, { cwd: ROOT, env: { ...process.env, PYTHONUNBUFFERED: '1' },
+                                        timeout: FINALIZE_TIMEOUT_MS });
     let collectionUrl = '';
     let buf = '';
     child.stdout.on('data', (c) => {
@@ -667,6 +672,9 @@ export function finalizeCollection({ modelId, hfOrg }) {
       log.error(`finalize failed to spawn: ${err.message}`);
       resolve({ ok: false, collectionUrl: '' });
     });
-    child.on('close', (code) => resolve({ ok: code === 0, collectionUrl }));
+    child.on('close', (code, signal) => {
+      if (signal) log.warn(`finalize for ${modelId} killed by ${signal}`);
+      resolve({ ok: code === 0, collectionUrl });
+    });
   });
 }
