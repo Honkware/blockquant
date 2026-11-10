@@ -9,7 +9,7 @@ import { getJobStatus, pollJob } from './services/api-client.js';
 import * as embeds from './utils/embeds.js';
 import { listPods, terminatePod } from './services/runpod.js';
 import { reapOrphans as reap } from './services/reaper.js';
-import { sweep as sweepControllers } from './services/detached.js';
+import { recoverJobs } from './services/recover.js';
 import { resumeJob } from './commands/quant.js';
 import { registerChat } from './chat/index.js';
 import { remindPending } from './services/approvalNotify.js';
@@ -176,52 +176,6 @@ async function start() {
   jobQueue.init();
   // /pause is persisted, so a restart does not quietly resume.
   if ((await db.loadSettings().catch(() => ({}))).paused) jobQueue.pause();
-  // Controllers outlive the bot (services/detached.js), so a restart does not
-  // kill the work -- but it used to kill the Discord half, freezing the embed
-  // and marking a job that was still quantizing "failed". Everything needed to
-  // reconnect is on disk: detached.list() gives the log and the pid, and the
-  // job record kept threadId + progressMessageId. Pick those back up.
-  const { live, finished } = sweepControllers();
-  for (const c of finished) {
-    const out = c.meta?.resultPath ? `, result ${c.meta.resultPath}` : '';
-    log.warn(`${c.kind} ${c.meta?.modelId || c.id} finished while the bot was down: ${c.logPath}${out}`);
-  }
-
-  // jobId -> variant -> handle. Controllers spawned before jobId was recorded
-  // have no way back to their message; they still get the old warning.
-  const byJob = new Map();
-  for (const c of live) {
-    const jobId = c.meta?.jobId;
-    if (c.kind !== 'quant' || !jobId) {
-      log.warn(`${c.kind} ${c.meta?.modelId || c.id} survived the restart (pid ${c.pid}) but carries no job id; its embed stays dead. Watch ${c.logPath}`);
-      continue;
-    }
-    if (!byJob.has(jobId)) byJob.set(jobId, new Map());
-    for (const v of c.meta.variants || []) byJob.get(jobId).set(v, c);
-  }
-
-  const stale = await db.listRecoverableJobs();
-  for (const job of stale) {
-    const handles = byJob.get(job.id);
-    if (handles && job.threadId && job.progressMessageId) {
-      log.info(`reattaching job ${job.id} (${job.modelId}) to ${handles.size} live controller(s)`);
-      // Fire and forget: this resolves only when the quant does, hours later.
-      resumeJob({ client, job, resumeFrom: handles }).catch((err) =>
-        log.error(`reattach failed for ${job.id}: ${err.message}`)
-      );
-      continue;
-    }
-    // Nothing to attach to. Do NOT re-run: the old recover path re-enqueued to
-    // the LOCAL quantizer, which is a 70GB download onto the host.
-    await db.patchJob(job.id, {
-      status: db.JOB_STATUS.failed,
-      error: handles
-        ? 'bot restarted; controller still running but its progress thread is gone'
-        : 'interrupted by bot restart',
-      failedAt: Date.now(),
-    });
-    log.info(`marked ${job.id} interrupted (not re-run)`);
-  }
 
   // 3. Recover API jobs (so restart doesn't orphan running Celery tasks)
   const apiRecovered = await recoverApiJobs();
@@ -232,12 +186,16 @@ async function start() {
   // 4. Login
   await client.login(config.BOT_TOKEN);
 
-  // 5. Orphan reaper: sweep on startup (catches pods leaked by a crashed
+  // 5. Pick up the jobs a restart cut off. After login: it fetches threads and
+  // cards over REST, and the client has no token for that before.
+  await recoverJobs({ client, resume: resumeJob });
+
+  // 6. Orphan reaper: sweep on startup (catches pods leaked by a crashed
   // previous session) and every 2 min thereafter.
   reapOrphans().catch(() => {});
   setInterval(() => reapOrphans().catch(() => {}), 120_000);
 
-  // 6. Requests nobody has approved. Hourly tick; each job is reminded about
+  // 7. Requests nobody has approved. Hourly tick; each job is reminded about
   // at most every 12h, starting 6h after it was made.
   setInterval(() => remindPending(client).catch((e) => log.warn(`reminder failed: ${e.message}`)), 3_600_000);
 }
