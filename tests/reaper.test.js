@@ -112,6 +112,15 @@ describe('reapOrphans', () => {
     vi.restoreAllMocks();
   });
 
+  it('does not count a pod it failed to terminate', async () => {
+    vi.spyOn(process, 'kill').mockImplementation(gone);
+    const out = await reapOrphans({
+      listPods: async () => [pod], terminatePod: async () => false, now: nowAfter(60),
+    });
+    expect(out).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
   it('leaves a young pod alone even with a dead pid', async () => {
     // Provisioning and bootstrap take minutes; a retried controller inside that
     // window is a job starting, not a leak.
