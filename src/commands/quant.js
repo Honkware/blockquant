@@ -1305,6 +1305,13 @@ export async function handleRetry(interaction) {
     return reply('Only the requester or an admin can retry this.');
   }
   if (job.retriedAs || inFlightRetries.has(jobId)) return reply('This job was already retried.');
+  // The quote and the balance below can take longer than the 3 seconds
+  // Discord gives a button to answer.
+  await interaction.deferUpdate();
+  const channel = await interaction.client.channels.fetch(job.channelId).catch(() => null);
+  if (!channel) {
+    return interaction.followUp({ content: 'The channel this job came from is gone.', flags: MessageFlags.Ephemeral });
+  }
   inFlightRetries.add(jobId);
   try {
     const failed = (job.partialResults || []).filter((r) => !r.pushed && !r.donor && !r.drafter);
@@ -1331,12 +1338,9 @@ export async function handleRetry(interaction) {
     if (q) next.quote = { low: q.low, high: q.high, live: q.live, card: q.best?.id ?? null };
     await db.upsertJob(next);
     await db.patchJob(jobId, { retriedAs: id });
-
-    const channel = await interaction.client.channels.fetch(job.channelId).catch(() => null);
-    if (!channel) return reply('The channel this job came from is gone.');
     await postRequest({ channel, client: interaction.client, job: next });
     // The button has done its job.
-    await interaction.update({ components: [] });
+    await interaction.editReply({ components: [] });
   } finally {
     inFlightRetries.delete(jobId);
   }
